@@ -1,0 +1,46 @@
+# Core data science libraries
+pandas>=1.5.0
+numpy>=1.24.0
+scipy>=1.10.0
+matplotlib>=3.6.0
+seaborn>=0.12.0
+plotly>=5.15.0
+
+# Machine learning libraries
+scikit-learn>=1.3.0
+xgboost>=1.7.0
+lightgbm>=3.3.0
+catboost>=1.2.0
+
+# Deep learning
+tensorflow>=2.13.0
+torch>=2.0.0
+torchvision>=0.15.0
+
+# Healthcare and medical data
+pydicom>=2.4.0
+nibabel>=5.1.0
+SimpleITK>=2.2.0
+
+# Federated learning
+flwr>=1.5.0
+pysyft>=0.8.0
+
+# Data validation and quality
+great-expectations>=0.17.0
+pandera>=0.15.0
+
+# Visualization and reporting
+jupyter>=1.0.0
+ipywidgets>=8.0.0
+streamlit>=1.25.0
+
+# Privacy and security
+cryptography>=41.0.0
+differential-privacy>=1.1.0
+
+# Utilities
+pyyaml>=6.0
+python-dotenv>=1.0.0
+tqdm>=4.65.0
+joblib>=1.3.0

@@ -1,0 +1,102 @@
+# Default Configuration for Sustainable AI Healthcare Pipeline
+
+# Data Configuration
+data:
+  raw_path: "data/raw"
+  processed_path: "data/processed"
+  external_path: "data/external"
+  validation_split: 0.2
+  test_split: 0.15
+  random_seed: 42
+
+# Data Collection
+data_collection:
+  supported_formats: ["csv", "json", "parquet", "dicom", "nifti"]
+  quality_checks:
+    - missing_values
+    - duplicates
+    - data_types
+    - outliers
+  privacy_compliance: true
+  
+# Preprocessing Configuration
+preprocessing:
+  missing_value_strategy: "median"  # median, mean, mode, drop
+  outlier_detection: "iqr"  # iqr, zscore, isolation_forest
+  normalization: "standard"  # standard, minmax, robust
+  categorical_encoding: "onehot"  # onehot, label, target
+  
+# EDA Configuration  
+eda:
+  generate_plots: true
+  plot_formats: ["png", "html"]
+  statistical_tests: true
+  correlation_threshold: 0.8
+  
+# Feature Engineering
+feature_engineering:
+  selection_methods: ["univariate", "recursive", "lasso"]
+  feature_importance: true
+  interaction_features: false
+  polynomial_features: false
+  
+# Model Development
+models:
+  output_path: "models"
+  algorithms:
+    - name: "random_forest"
+      hyperparameters:
+        n_estimators: [100, 200, 300]
+        max_depth: [10, 20, 30]
+        min_samples_split: [2, 5, 10]
+    - name: "xgboost" 
+      hyperparameters:
+        learning_rate: [0.01, 0.1, 0.2]
+        max_depth: [3, 6, 10]
+        n_estimators: [100, 200, 300]
+    - name: "neural_network"
+      hyperparameters:
+        hidden_layers: [64, 128, 256]
+        dropout_rate: [0.2, 0.3, 0.5]
+        learning_rate: [0.001, 0.01]
+  
+# Evaluation Configuration
+evaluation:
+  metrics: ["accuracy", "precision", "recall", "f1", "auc", "specificity", "sensitivity"]
+  cross_validation_folds: 5
+  stratified: true
+  generate_reports: true
+  confusion_matrix: true
+  roc_curves: true
+  
+# Federated Learning
+federated_learning:
+  framework: "flower"  # flower, pysyft
+  num_clients: 3
+  rounds: 10
+  client_selection: "random"
+  aggregation_strategy: "fedavg"
+  privacy:
+    differential_privacy: true
+    privacy_budget: 1.0
+    noise_multiplier: 1.1
+  
+# Interpretation and Insights
+interpretation:
+  explainability_methods: ["shap", "lime", "permutation"]
+  generate_insights: true
+  sustainability_metrics: true
+  bias_analysis: true
+  
+# Logging Configuration
+logging:
+  level: "INFO"  # DEBUG, INFO, WARNING, ERROR
+  log_path: "logs/pipeline.log"
+  console_output: true
+  
+# Sustainability Configuration
+sustainability:
+  track_energy_consumption: true
+  carbon_footprint_estimation: true
+  model_efficiency_metrics: true
+  green_computing_practices: true
