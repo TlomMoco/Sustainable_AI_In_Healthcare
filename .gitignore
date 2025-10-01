@@ -1,5 +1,12 @@
-# Ignore dataset (too large for Git, use local copy or DVC)
-dataset/
+# Ignore dataset (too large for Git, use local copy or DVC) and heavy ECG signal files
+dataset/**/*.dat
+dataset/**/*.hea
+
+# Keep metadata (CSV, LICENSE, TXT, PY)
+!dataset/**/*.csv
+!dataset/**/*.txt
+!dataset/**/*.py
+
 
 # Ignore IDE/project configs
 .idea/
