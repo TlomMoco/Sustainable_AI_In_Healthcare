@@ -1,0 +1,19 @@
+# Ignore dataset (too large for Git, use local copy or DVC)
+dataset/
+
+# Ignore IDE/project configs
+.idea/
+.vscode/
+*.iml
+
+# Ignore Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Ignore Jupyter checkpoints
+.ipynb_checkpoints/
+
+# Ignore OS junk files
+.DS_Store
+Thumbs.db
