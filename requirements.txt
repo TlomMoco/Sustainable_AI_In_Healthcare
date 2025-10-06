@@ -1,0 +1,12 @@
+numpy
+pandas
+scikit-learn
+wfdb
+matplotlib
+seaborn
+scipy
+pyarrow
+torch
+flwr
+rich
+tqdm

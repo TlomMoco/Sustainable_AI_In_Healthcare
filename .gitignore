@@ -1,26 +1,54 @@
-# Ignore dataset (too large for Git, use local copy or DVC) and heavy ECG signal files
+# ============================================================
+# DATA & ARTIFACTS
+# ============================================================
+
+# Ignore raw ECG signal files (too large for Git)
+data/**/*.dat
+data/**/*.hea
 dataset/**/*.dat
 dataset/**/*.hea
 
-# Keep metadata (CSV, LICENSE, TXT, PY)
+# Keep only small metadata / scripts
+!data/**/*.csv
+!data/**/*.txt
+!data/**/*.py
 !dataset/**/*.csv
 !dataset/**/*.txt
 !dataset/**/*.py
 
+# Ignore experiment outputs
+results/
+checkpoints/
+*.pt
+*.pth
+*.ckpt
+*.log
 
-# Ignore IDE/project configs
+# ============================================================
+# PYTHON / ENVIRONMENT
+# ============================================================
+
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual environments
+.venv/
+.env/
+
+# Jupyter notebooks
+.ipynb_checkpoints/
+
+# ============================================================
+# IDE / OS FILES
+# ============================================================
+
+# IDE configs
 .idea/
 .vscode/
 *.iml
 
-# Ignore Python cache
-__pycache__/
-*.pyc
-*.pyo
-
-# Ignore Jupyter checkpoints
-.ipynb_checkpoints/
-
-# Ignore OS junk files
+# OS junk
 .DS_Store
 Thumbs.db
