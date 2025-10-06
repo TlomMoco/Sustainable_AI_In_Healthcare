@@ -1,0 +1,3 @@
+test/artifacts/lr_best.joblib
+test/artifacts/svm_calibrated.joblib
+test/artifacts/rf_best.joblib
