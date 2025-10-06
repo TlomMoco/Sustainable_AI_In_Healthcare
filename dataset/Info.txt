@@ -1,7 +1,0 @@
-I have added all the .dat and .hea files from PTB-XL dataset to
-the .gitignore file to avoid uploading large files to the repository.
-
-You can download the dataset from the official PTB-XL website:
-https://physionet.org/content/ptb-xl/1.0.1/
-
-All the other files in this directory are necessary for the functioning of the project.

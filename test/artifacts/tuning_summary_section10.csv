@@ -1,0 +1,5 @@
+Model,CV F1w (best),CV F1w std,Search time (s),Best params
+LogReg,0.6696744958470844,0.007282866849587621,3917.0477371660018,"{""clf__C"": 1}"
+LinearSVM (search),0.71321306867012,0.006473895281891571,330.84538862499903,"{""svm__C"": 0.1, ""svm__tol"": 0.001}"
+LinearSVM (calibrated),,,170.9832020419999,calibration cv=3
+RandomForest,0.6172407672090934,0.005202596777298921,25.627965540999867,"{""clf__class_weight"": ""balanced_subsample"", ""clf__max_depth"": 20, ""clf__max_features"": ""sqrt"", ""clf__max_samples"": 0.7, ""clf__min_samples_leaf"": 1, ""clf__min_samples_split"": 2, ""clf__n_estimators"": 300}"

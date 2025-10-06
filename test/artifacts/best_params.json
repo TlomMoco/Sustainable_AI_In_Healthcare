@@ -1,0 +1,31 @@
+{
+  "time": "2025-10-06 13:02:35",
+  "cfg": {
+    "PTBXL_ROOT": "PTB-XL2022/ptb-xl-a-large-publicly-available-electrocardiography-dataset-1.0.3",
+    "RECORD_FILE_COL": "filename_lr",
+    "LABEL_MODE": "5class",
+    "FAST_RUN": false,
+    "MAX_RECORDS": null,
+    "USE_FEATURE_CACHE": true,
+    "ART_DIR": "test/artifacts",
+    "CACHE_DIR": "./sk_cache",
+    "SEED": 42,
+    "EDA_SKIP_HEAVY": false
+  },
+  "lr_best_params": {
+    "clf__C": 1
+  },
+  "rf_best_params": {
+    "clf__class_weight": "balanced_subsample",
+    "clf__max_depth": 20,
+    "clf__max_features": "sqrt",
+    "clf__max_samples": 0.7,
+    "clf__min_samples_leaf": 1,
+    "clf__min_samples_split": 2,
+    "clf__n_estimators": 300
+  },
+  "svm_best_params": {
+    "svm__C": 0.1,
+    "svm__tol": 0.001
+  }
+}
