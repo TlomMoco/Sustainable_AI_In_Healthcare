@@ -15,8 +15,6 @@ class Shapes:
 
 
 # ===== ML baseline =====
-
-
 def create_logistic_baseline() -> Pipeline:
     return Pipeline([
         ("scaler", StandardScaler()),
