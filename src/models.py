@@ -40,10 +40,10 @@ class TinyECGCNN(nn.Module):
             nn.Linear(128, 64), nn.ReLU(), nn.Dropout(0.2),
             nn.Linear(64, n_classes)
         )
-        def forward(self, x):
-            # x: (B, 12, T)
-            z = self.features(x)
-            return self.head(z)
+    def forward(self, x):
+        # x: (B, 12, T)
+        z = self.features(x)
+        return self.head(z)
 
 def create_cnn_model(n_classes: int) -> nn.Module:
     return TinyECGCNN(n_classes)

@@ -115,7 +115,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--cid", type=int, required=True, help="Client ID (0..3)")
     args = parser.parse_args()
-    fl.client.start_numpy_client(server_address="0.0.0.0:8080", client=PTBClient(args.cid))
+    fl.client.start_numpy_client(server_address="127.0.0.1:8080", client=PTBClient(args.cid))
 
 
 if __name__ == "__main__":

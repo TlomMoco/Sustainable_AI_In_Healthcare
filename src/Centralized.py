@@ -25,4 +25,4 @@ if __name__ == "__main__":
     for name, clf in {"LogReg": logreg, "RF": rf}.items():
         ypred = clf.predict(Xte)
         print(f"\n== {name} ==")
-        print(classification_report(yte, ypred, target_names=classes, digits=3)
+        print(classification_report(yte, ypred, target_names=classes, digits=3))

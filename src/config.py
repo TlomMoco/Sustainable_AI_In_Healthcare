@@ -31,10 +31,3 @@ LR = 1e-3
 FREEZE_THRESHOLD = 600 # small clients freeze backbone
 FEDPROX_MU = 0.01 # proximal term
 
-"""
-if __name__ == "__main__":
-    print("PROJ_ROOT:", PROJ_ROOT)
-    print("PTBXL_CSV exists:", PTBXL_CSV.exists())
-    print("SCP_CSV exists:", SCP_CSV.exists())
-    print("records100 exists:", (DATA_ROOT / "records100").exists())
-"""
