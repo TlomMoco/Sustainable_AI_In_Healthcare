@@ -28,7 +28,7 @@ class TinyECGCNN(nn.Module):
 
         super().__init__()
         self.features = nn.Sequential(
-            nn.Conv1d(12, 32, kernel_size=7, stride=1, padding=3),
+            nn.Conv1d(12, 32, kernel_size=7, stride=2, padding=3),
             nn.BatchNorm1d(32), nn.ReLU(), nn.MaxPool1d(2),
             nn.Conv1d(32, 64, kernel_size=5, stride=1, padding=2),
             nn.BatchNorm1d(64), nn.ReLU(), nn.MaxPool1d(2),

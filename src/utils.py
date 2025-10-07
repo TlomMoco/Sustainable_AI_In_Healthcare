@@ -39,8 +39,6 @@ def plot_signal(sig: np.ndarray, title: str = "ECG (12xT)", save: str | None = N
     plt.close()
 
 
-
-
 def compute_metrics(y_true, y_prob, labels):
     y_pred = y_prob.argmax(axis=1)
     acc = float(accuracy_score(y_true, y_pred))
@@ -50,3 +48,35 @@ def compute_metrics(y_true, y_prob, labels):
     except Exception:
         auc = float("nan")
     return {"accuracy": acc, "f1_macro": f1m, "roc_auc_ovr": auc}
+
+
+def summarize_dataset(df, sample_rate: int = 100, title: str = "Global Dataset") -> None:
+    """
+    Prints a concise summary of the PTB-XL dataframe.
+
+    Args:
+        df : DataFrame returned by load_metadata/map_superclasses/filter_single_label
+        sample_rate : current SAMPLE_RATE (100 or 500)
+        title : header label for the summary block
+    """
+    print(f"\n===== {title} =====")
+    n_records = len(df)
+    n_patients = df.patient_id.nunique()
+    recs_per_patient = df.groupby("patient_id").size()
+
+    # Basic stats
+    mean_rpp = recs_per_patient.mean()
+    med_rpp = recs_per_patient.median()
+    max_rpp = recs_per_patient.max()
+
+    # Compute data volume
+    samples_per_record = 10 * sample_rate   # 10 s × Fs
+    total_samples = n_records * samples_per_record
+    hours = (total_samples / sample_rate) / 3600.0
+
+    print(f"Records: {n_records:,}")
+    print(f"Unique patients: {n_patients:,}")
+    print(f"Records per patient – mean {mean_rpp:.2f}, median {med_rpp:.0f}, max {max_rpp}")
+    print(f"Sampling rate: {sample_rate} Hz  →  {samples_per_record:,} samples / record")
+    print(f"Total waveform samples: {total_samples:,}  ({hours:.1f} h of ECG data)")
+    print("==============================\n")

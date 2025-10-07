@@ -11,17 +11,23 @@ def weighted_average(metrics: List[Tuple[int, Dict[str, float]]]) -> Dict[str, f
     )
     return {"accuracy": avg_accuracy}
 
+
 def start_server():
+    def on_fit_config_fn(rnd: int):
+        return {"round": rnd, "unfreeze_after": 3}  # unfreeze after 3 rounds
+
     strategy = fl.server.strategy.FedAvg(
         min_fit_clients=2,
         min_available_clients=2,
         evaluate_metrics_aggregation_fn=weighted_average,
+        on_fit_config_fn=on_fit_config_fn,
     )
     fl.server.start_server(
         server_address="0.0.0.0:8080",
         strategy=strategy,
-        config=fl.server.ServerConfig(num_rounds=3),
+        config=fl.server.ServerConfig(num_rounds=6),
     )
+
 
 if __name__ == "__main__":
     start_server()

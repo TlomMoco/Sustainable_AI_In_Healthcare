@@ -5,13 +5,15 @@ from rich import print
 
 from .config import SAMPLE_RATE
 from .data_loader import load_metadata, map_superclasses, filter_single_label, load_waveform
-from .utils import plot_signal
+from .utils import plot_signal, summarize_dataset
 
 
 if __name__ == "__main__":
     ptb = load_metadata()
     df = map_superclasses(ptb)
     one = filter_single_label(df)
+
+    summarize_dataset(one, sample_rate=SAMPLE_RATE, title="PTB-XL (Filtered Single-Label)")
 
 
     print(f"Total records: {len(df):,}")
@@ -29,9 +31,9 @@ if __name__ == "__main__":
     print("Age — mean (excluding 300):", ages.mean())
     print(one["sex"].value_counts())
 
-
+"""
     # Plot a few example signals
     for i, (_, row) in enumerate(one.sample(3, random_state=7).iterrows()):
         sig = load_waveform(row, sampling_rate=SAMPLE_RATE)
         plot_signal(sig, title=f"ecg_id={row.ecg_id} class={row.y}", save=f"example_{i+1}.png")
-        print("Saved example plots to results/.")
+        print("Saved example plots to results/.")"""
