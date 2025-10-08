@@ -1,17 +1,17 @@
 from __future__ import annotations
-import argparse
 from collections import OrderedDict
 from typing import List, Tuple
 
-
+import argparse
+import csv, time
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
 import flwr as fl
+from pathlib import Path
 
-
-from .config import LR, BATCH_SIZE, EPOCHS_LOCAL, FREEZE_THRESHOLD, FEDPROX_MU, SEED
+from .config import LR, BATCH_SIZE, EPOCHS_LOCAL, FREEZE_THRESHOLD, FEDPROX_MU, SEED, RESULTS_DIR
 from .data_loader import load_metadata, map_superclasses, filter_single_label, stratified_patient_split, load_waveform
 from .models import create_cnn_model
 from .utils import set_seed
@@ -97,7 +97,6 @@ class PTBClient(fl.client.NumPyClient):
     def get_parameters(self, config):
         return [val.cpu().numpy() for _, val in self.model.state_dict().items()]
 
-
     def set_parameters(self, parameters: List[np.ndarray]):
         params_dict = zip(self.model.state_dict().keys(), parameters)
         state_dict = OrderedDict({k: torch.tensor(v) for k, v in params_dict})
@@ -105,19 +104,40 @@ class PTBClient(fl.client.NumPyClient):
 
     def fit(self, parameters, config):
         self.set_parameters(parameters)
-
-        # --- Dynamic layer freezing ---
         round_num = config.get("round", 1)
-        if len(self.train_df) < FREEZE_THRESHOLD:
-            freeze_now = round_num < config.get("unfreeze_after", 3)
+        unfreeze_after = config.get("unfreeze_after", 8)
+
+        # ===== Graduated + dynamic freezing (works even with 3 or 5 conv blocks) =====
+        total_layers = len(list(self.model.features))
+        n_train = len(self.train_df)
+        frozen_layers = 0
+
+        if n_train < FREEZE_THRESHOLD:
+            freeze_ratio = max(0.0, 1.0 - round_num / max(1, unfreeze_after))
+            n_to_freeze = int(total_layers * freeze_ratio)
+            frozen_layers = n_to_freeze
+            for i, layer in enumerate(self.model.features):
+                for p in layer.parameters():
+                    p.requires_grad = (i >= n_to_freeze)
+        elif n_train < 2 * FREEZE_THRESHOLD:
+            n_to_freeze = total_layers // 2
+            frozen_layers = n_to_freeze
+            for i, layer in enumerate(self.model.features):
+                for p in layer.parameters():
+                    p.requires_grad = (i >= n_to_freeze)
+        else:
             for p in self.model.features.parameters():
-                p.requires_grad = not (freeze_now)
-            print(f"[Client {self.cid}] Round {round_num}: freeze_now={freeze_now}")
+                p.requires_grad = True
+
+        print(f"[Client {self.cid}] Round {round_num}: {n_train} samples, frozen_layers={frozen_layers}/{total_layers}")
+
+        # ===== Timing start =====
+        t0 = time.perf_counter()
 
         train_loader = get_loaders(self.train_df)
         opt = optim.Adam(filter(lambda p: p.requires_grad, self.model.parameters()), lr=LR)
 
-        # Save global params for FedProx proximal term
+        # Save global params for FedProx
         global_params = [p.detach().clone() for p in self.model.parameters()]
 
         self.model.train()
@@ -126,18 +146,51 @@ class PTBClient(fl.client.NumPyClient):
                 opt.zero_grad()
                 logits = self.model(xb)
                 loss = self.ce(logits, yb)
-
-                # FedProx term
                 if FEDPROX_MU > 0:
                     prox = sum(torch.sum((w - w0) ** 2) for w, w0 in zip(self.model.parameters(), global_params))
                     loss = loss + (FEDPROX_MU / 2.0) * prox
-
-                # Backprop & step
                 loss.backward()
                 opt.step()
 
-        # return AFTER training loop
-        return self.get_parameters({}), len(self.train_df), {}
+        # ===== Timing end + local eval =====
+        wall_s = time.perf_counter() - t0
+        loss_local, acc_local = self.evaluate_local()
+        self._log_local_metrics_csv(round_num, acc_local, loss_local, frozen_layers, total_layers, wall_s)
+        print(f"[Client {self.cid}] Round {round_num}: local acc={acc_local:.4f}, loss={loss_local:.4f}, time={wall_s:.1f}s")
+
+        return self.get_parameters({}), len(self.train_df), {"local_time": wall_s}
+
+
+    def evaluate_local(self) -> Tuple[float, float]:
+        """Evaluate the model on the local validation subset."""
+        loader = get_loaders(self.test_df, batch_size=128)
+        self.model.eval()
+        correct, total, loss_sum = 0, 0, 0.0
+        with torch.no_grad():
+            for xb, yb in loader:
+                logits = self.model(xb)
+                loss_sum += float(self.ce(logits, yb).item()) * len(yb)
+                pred = logits.argmax(dim=1)
+                correct += int((pred == yb).sum().item())
+                total += int(len(yb))
+        acc = correct / total if total > 0 else 0.0
+        loss_mean = loss_sum / total if total > 0 else 0.0
+        return loss_mean, acc
+
+    def _log_local_metrics_csv(self, round_num: int, acc: float, loss: float, frozen_layers: int, total_layers: int,
+                               wall_s: float):
+        RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+        path = RESULTS_DIR / "not_frozen_client_metrics.csv"
+        header = ["client_id", "round", "local_accuracy", "local_loss", "frozen_layers", "total_layers",
+                  "wall_time_sec", "trainable_params"]
+        write_header = not path.exists()
+        trainable_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+        with open(path, "a", newline="") as f:
+            w = csv.writer(f)
+            if write_header:
+                w.writerow(header)
+            w.writerow([self.cid, round_num, f"{acc:.4f}", f"{loss:.4f}", frozen_layers, total_layers, f"{wall_s:.2f}",
+                        trainable_params])
 
     def evaluate(self, parameters, config):
         self.set_parameters(parameters)
