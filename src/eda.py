@@ -3,9 +3,9 @@ import pandas as pd
 import numpy as np
 from rich import print
 
-from .config import SAMPLE_RATE
-from .data_loader import load_metadata, map_superclasses, filter_single_label, load_waveform
-from .utils import plot_signal, summarize_dataset
+from src.config import SAMPLE_RATE
+from src.data_loader import load_metadata, map_superclasses, filter_single_label, load_waveform
+from src.utils import plot_signal, summarize_dataset
 
 
 if __name__ == "__main__":

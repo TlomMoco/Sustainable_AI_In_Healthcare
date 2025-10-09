@@ -11,17 +11,17 @@ import torch.optim as optim
 import flwr as fl
 from dataclasses import dataclass
 
-from config import (
+from src.config import (
     LR, BATCH_SIZE, EPOCHS_LOCAL, FREEZE_THRESHOLD, FEDPROX_MU, SEED, RESULTS_DIR, FREEZE_CFG,
     SPLITS, NORM, MODEL
 )
-from data_loader import (
+from src.data_loader import (
     load_metadata, map_superclasses, filter_single_label,
     stratified_patient_split_3way, load_waveform,
     compute_perlead_norm_stats, normalize_signal, stratified_patient_split
 )
-from models import create_model
-from utils import set_seed
+from src.models import create_model
+from src.utils import set_seed
 
 
 def make_tensor_dataset(df, mu=None, sigma=None, eps=1e-6) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -59,6 +59,8 @@ class FreezeState:
 
 class PTBClient(fl.client.NumPyClient):
     def __init__(self, cid: int):
+        self.cid = cid
+        set_seed(SEED + cid)
         ptb = load_metadata()
         df = filter_single_label(map_superclasses(ptb))
 
@@ -69,12 +71,12 @@ class PTBClient(fl.client.NumPyClient):
 
         # Partition clients from *global train* patients (uneven)
         patients = train_global.patient_id.unique()
-        np.random.seed(SEED);
+        np.random.seed(SEED)
         np.random.shuffle(patients)
-        ratios = np.array([0.5, 0.33, 0.15, 0.02]);
+        ratios = np.array([0.5, 0.33, 0.15, 0.02])
         ratios = ratios / ratios.sum()
         sizes = [int(r * len(patients)) for r in ratios]
-        clients = [];
+        clients = []
         start = 0
         for s in sizes:
             pids = patients[start:start + s]
@@ -115,6 +117,9 @@ class PTBClient(fl.client.NumPyClient):
         if len(self.train_df) < FREEZE_THRESHOLD:
             for p in self.model.features.parameters():
                 p.requires_grad = False
+
+        # initialize improvement tracking state
+        self.state = FreezeState()
 
 
 

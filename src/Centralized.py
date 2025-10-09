@@ -4,9 +4,9 @@ from sklearn.metrics import classification_report
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.model_selection import train_test_split
 
-from .data_loader import load_metadata, map_superclasses, filter_single_label, stratified_patient_split, make_feature_table
-from .models import create_logistic_baseline
-from .config import SEED
+from src.data_loader import load_metadata, map_superclasses, filter_single_label, stratified_patient_split, make_feature_table
+from src.models import create_logistic_baseline
+from src.config import SEED
 
 
 if __name__ == "__main__":

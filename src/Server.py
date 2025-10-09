@@ -1,7 +1,7 @@
 from __future__ import annotations
 import flwr as fl
 from typing import Dict, List, Tuple
-from .config import CLIENTS, FREEZE_CFG
+from src.config import CLIENTS, FREEZE_CFG
 
 # aggregate client metrics (weighted by number of examples)
 def weighted_average(metrics: List[Tuple[int, Dict[str, float]]]) -> Dict[str, float]:

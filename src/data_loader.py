@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from typing import Dict, List, Tuple
 
 # Config variable imports
-from config import (PTBXL_CSV, SCP_CSV, DATA_ROOT, SAMPLE_RATE, N_CLASSES, SUPERCLASSES)
+from src.config import (PTBXL_CSV, SCP_CSV, DATA_ROOT, SAMPLE_RATE, N_CLASSES, SUPERCLASSES)
 
 
 @dataclass
