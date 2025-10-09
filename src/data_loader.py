@@ -2,16 +2,13 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 import wfdb
-from pathlib import Path
 import ast
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+from typing import Dict, List, Tuple
 
 # Config variable imports
-from .config import PTBXL_CSV, SCP_CSV, DATA_ROOT, SAMPLE_RATE, N_CLASSES
+from config import (PTBXL_CSV, SCP_CSV, DATA_ROOT, SAMPLE_RATE, N_CLASSES, SUPERCLASSES)
 
-
-SUPERCLASSES = ["CD", "HYP", "MI", "NORM", "STTC"]
 
 @dataclass
 class PTBXL:
@@ -80,6 +77,28 @@ def stratified_patient_split(df: pd.DataFrame, test_size: float = 0.2, seed: int
     return train, test
 
 
+def stratified_patient_split_3way(df: pd.DataFrame, splits: Tuple[float, float, float] = (0.70, 0.15, 0.15), seed: int = 42) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """
+    Patient-aware 3-way split into (train, val, test).
+    Guarantees disjoint patients and approximates label balance by patient-majority label.
+
+    We implement as a two-step split to reuse stratified_patient_split:
+    1) train vs temp
+    2) val vs test from temp
+    """
+    assert abs(sum(splits) - 1.0) < 1e-6, "splits must sum to 1.0"
+    train_frac, val_frac, test_frac = splits
+    # step 1: train vs temp
+    train_df, temp_df = stratified_patient_split(df, test_size=(1.0 - train_frac), seed=seed)
+    # step 2: val vs test
+    # val proportion within temp:
+    if len(temp_df) == 0:
+        raise ValueError("Temp split is empty; dataset too small for requested ratios.")
+    val_prop_within_temp = val_frac / (val_frac + test_frac)
+    val_df, test_df = stratified_patient_split(temp_df, test_size=(1.0 - val_prop_within_temp), seed=seed + 1)
+    return train_df, val_df, test_df
+
+
 def load_waveform(row: pd.Series, sampling_rate: int = SAMPLE_RATE) -> np.ndarray:
     """ Load a single ECG (12xT) using wfdb based on PTB‑XL metadata row.
     Returns np.ndarray shape (12, T). """
@@ -109,3 +128,26 @@ def make_feature_table(df: pd.DataFrame, limit: int | None = None) -> Tuple[np.n
         X.append(basic_features(sig))
         y.append(classes.index(row["y"]))
     return np.vstack(X), np.array(y), classes
+
+
+def compute_perlead_norm_stats(df: pd.DataFrame, sampling_rate: int = SAMPLE_RATE) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Compute per-lead mean/std using only the provided df (train split).
+    Returns (mu[12], sigma[12]) for z-scoring.
+    """
+    means, stds, n = [], [], 0
+    for _, row in df.iterrows():
+        sig = load_waveform(row, sampling_rate)
+        # per-record per-lead stats
+        means.append(sig.mean(axis=1))
+        stds.append(sig.std(axis=1))
+        n += 1
+    mu = np.stack(means).mean(axis=0) if n > 0 else np.zeros(12)
+    sigma = np.stack(stds).mean(axis=0) if n > 0 else np.ones(12)
+    sigma = np.maximum(sigma, 1e-6)
+    return mu, sigma
+
+
+def normalize_signal(sig: np.ndarray, mu: np.ndarray, sigma: np.ndarray, eps: float = 1e-6) -> np.ndarray:
+    """Z-score per lead: (12, T) -> (12, T)."""
+    return (sig - mu[:, None]) / (sigma[:, None] + eps)

@@ -1,7 +1,7 @@
 from __future__ import annotations
 import flwr as fl
 from typing import Dict, List, Tuple
-from .config import CLIENTS
+from .config import CLIENTS, FREEZE_CFG
 
 # aggregate client metrics (weighted by number of examples)
 def weighted_average(metrics: List[Tuple[int, Dict[str, float]]]) -> Dict[str, float]:
@@ -15,7 +15,7 @@ def weighted_average(metrics: List[Tuple[int, Dict[str, float]]]) -> Dict[str, f
 
 def start_server():
     def on_fit_config_fn(rnd: int):
-        return {"round": rnd, "unfreeze_after": 10}  # unfreeze after 10 rounds
+        return {"round": rnd, "unfreeze_after": FREEZE_CFG["unfreeze_after"]}
 
     strategy = fl.server.strategy.FedAvg(
         min_fit_clients=CLIENTS,

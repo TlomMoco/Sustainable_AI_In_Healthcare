@@ -62,6 +62,59 @@ class TinyECGCNN(nn.Module):
         z = self.features(x)
         return self.head(z)
 
-def create_cnn_model(n_classes: int) -> nn.Module:
-    return TinyECGCNN(n_classes)
+
+# ===== Simple LSTM for 12‑lead ECG =====
+class TinyECGLSTM(nn.Module):
+    """
+    A lightweight LSTM classifier for 12-lead ECG.
+    Exposes `self.features` as a ModuleList:
+      [optional_conv_stem, lstm_block]  -> so the freeze policy can freeze by block.
+    """
+    def __init__(self, n_classes: int, hidden: int = 128, layers: int = 1, bidir: bool = True, use_stem: bool = False):
+        super().__init__()
+        self.use_stem = use_stem
+        if use_stem:
+            self.stem = nn.Sequential(
+                nn.Conv1d(12, 32, kernel_size=7, stride=2, padding=3),
+                nn.BatchNorm1d(32), nn.ReLU(),
+                nn.MaxPool1d(2),
+            )
+            rnn_in = 32
+        else:
+            self.stem = nn.Identity()
+            rnn_in = 12
+
+        self.rnn = nn.LSTM(
+            input_size=rnn_in,
+            hidden_size=hidden,
+            num_layers=layers,
+            batch_first=True,
+            bidirectional=bidir,
+        )
+        rnn_out = hidden * (2 if bidir else 1)
+
+        self.head = nn.Sequential(
+            nn.Linear(rnn_out, 96), nn.ReLU(), nn.Dropout(0.5),
+            nn.Linear(96, n_classes),
+        )
+
+        # Expose blocks for freezing
+        self.features = nn.ModuleList([self.stem, self.rnn])
+
+    def forward(self, x):
+        # x: (B, 12, T)
+        z = self.stem(x)                 # (B, C, T)
+        z = z.permute(0, 2, 1)           # (B, T, C)
+        z, _ = self.rnn(z)               # (B, T, H)
+        z = z.mean(dim=1)                # temporal average pooling
+        return self.head(z)
+
+
+def create_model(n_classes: int, model_type: str = "cnn", **kwargs) -> nn.Module:
+    if model_type == "cnn":
+        return TinyECGCNN(n_classes)
+    elif model_type == "lstm":
+        return TinyECGLSTM(n_classes, **kwargs)
+    else:
+        raise ValueError(f"Unknown model_type: {model_type}")
 
