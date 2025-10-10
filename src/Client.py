@@ -6,10 +6,12 @@ Implements a single federated learning (FL) client for ECG classification
 under the Sustainable AI in Healthcare project (DSP5100).
 
 Each client:
-  • Loads its local patient subset from PTB-XL (unevenly partitioned)
+  • Loads a patient-specific PTB-XL subset (uneven split)
   • Builds a CNN or LSTM model depending on config.py
   • Trains locally using FedAvg (with optional FedProx term)
-  • Applies dynamic layer freezing to save compute
+  • Applies dynamic & reactive layer freezing
+  • Logs sustainability metrics per round
+  • Communicates with the Flower server (FedAvg)
   • Logs per-round metrics (accuracy, loss, time, #trainable params)
 
 This setup simulates data heterogeneity and sustainability-oriented
@@ -21,7 +23,6 @@ from __future__ import annotations
 from collections import OrderedDict
 from typing import List, Tuple
 from dataclasses import dataclass
-
 import argparse
 import csv
 import time
@@ -33,29 +34,41 @@ import flwr as fl
 
 from src.config import (
     LR, BATCH_SIZE, EPOCHS_LOCAL, FREEZE_THRESHOLD, FEDPROX_MU,
-    SEED, RESULTS_DIR, FREEZE_CFG, SPLITS, NORM, MODEL
+    SEED, RESULTS_DIR, FREEZE_CFG, SPLITS, NORM, MODEL, EXPERIMENT, SAMPLE_RATE, N_CLASSES
 )
 from src.data_loader import (
     load_metadata, map_superclasses, filter_single_label,
     stratified_patient_split_3way, load_waveform,
-    compute_perlead_norm_stats, normalize_signal, stratified_patient_split
+    compute_perlead_norm_stats, normalize_signal
 )
 from src.models import create_model
-from src.utils import set_seed
+from src.utils import set_seed, ensure_dir
 
+
+# -------------------------------------------------------------------------
+# Freeze state tracker
+# -------------------------------------------------------------------------
+@dataclass
+class FreezeState:
+    best_loss: float = float("inf")
+    best_acc: float = 0.0
+    no_improve: int = 0
+    patience: int = FREEZE_CFG["patience"]
+    min_delta: float = FREEZE_CFG["min_delta"]
+    last_frozen: int = 0
 
 
 # -------------------------------------------------------------------------
 # Helper functions
 # -------------------------------------------------------------------------
-def make_tensor_dataset(df, mu=None, sigma=None, eps=1e-6) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Convert a dataframe of PTB-XL rows into (X, y) tensors."""
+def make_tensor_dataset(df, mu=None, sigma=None, eps=1e-6):
+    """Convert a PTB-XL dataframe to tensors (X, y)."""
     X, y = [], []
     classes = ["NORM", "MI", "STTC", "HYP", "CD"]
     for _, row in df.iterrows():
-        sig = load_waveform(row)  # (12, T)
+        sig = load_waveform(row)
         if mu is not None and sigma is not None and NORM["enabled"]:
-            sig = normalize_signal(sig, mu, sigma, eps=NORM.get("eps", 1e-6))
+            sig = normalize_signal(sig, mu, sigma, eps=NORM["eps"])
         X.append(sig)
         y.append(classes.index(row["y"]))
     X = torch.tensor(np.stack(X), dtype=torch.float32)
@@ -64,193 +77,227 @@ def make_tensor_dataset(df, mu=None, sigma=None, eps=1e-6) -> Tuple[torch.Tensor
 
 
 def get_loaders(df, batch_size=BATCH_SIZE, mu=None, sigma=None):
-    """Return DataLoader for given dataframe."""
-    X, y = make_tensor_dataset(df, mu=mu, sigma=sigma)
+    """Return a DataLoader for the given DataFrame."""
+    X, y = make_tensor_dataset(df, mu, sigma)
     ds = torch.utils.data.TensorDataset(X, y)
     return torch.utils.data.DataLoader(ds, batch_size=batch_size, shuffle=True)
 
 
 # -------------------------------------------------------------------------
-# Freeze state dataclass
-# -------------------------------------------------------------------------
-@dataclass
-class FreezeState:
-    """Tracks per-client improvement-gated freezing dynamics."""
-    best_loss: float = float("inf")
-    no_improve: int = 0
-    patience: int = FREEZE_CFG["patience"]
-    min_delta: float = FREEZE_CFG["min_delta"]
-    last_frozen: int = 0
-
-
-# -------------------------------------------------------------------------
-# Federated client implementation
+# Federated Client
 # -------------------------------------------------------------------------
 class PTBClient(fl.client.NumPyClient):
-    """Federated learning client for PTB-XL."""
+    """Federated learning client with reactive layer freezing."""
 
     def __init__(self, cid: int):
-        # --- Basic setup --------------------------------------------------
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        # --- Setup -------------------------------------------------------
         self.cid = cid
         set_seed(SEED + cid)
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        # --- Load and prepare data --------------------------------------
         ptb = load_metadata()
         df = filter_single_label(map_superclasses(ptb))
 
-        # --- Global 70/15/15 split (patient-wise) -------------------------
-        train_global, val_global, test_global = stratified_patient_split_3way(
-            df, splits=(SPLITS["train"], SPLITS["val"], SPLITS["test"]), seed=SEED
+        # Explicit split tuple to ensure consistent order
+        train_g, val_g, test_g = stratified_patient_split_3way(
+            df,
+            splits=(SPLITS["train"], SPLITS["val"], SPLITS["test"]),
+            seed=SEED,
         )
 
-        # --- Partition clients unevenly ----------------------------------
-        patients = train_global.patient_id.unique()
+        # Uneven client splits (by patient) ------------------------------
+        patients = train_g.patient_id.unique()
         np.random.seed(SEED)
         np.random.shuffle(patients)
+
         ratios = np.array([0.5, 0.33, 0.15, 0.02])
         ratios /= ratios.sum()
-        sizes = [int(r * len(patients)) for r in ratios]
+        sizes = (ratios * len(patients)).astype(int)
+        sizes[-1] = len(patients) - sizes[:-1].sum()  # assign remainder to last client
+
         clients, start = [], 0
         for s in sizes:
             pids = patients[start:start + s]
-            clients.append(train_global[train_global.patient_id.isin(pids)])
+            client_df = train_g[train_g.patient_id.isin(pids)]
+            clients.append(client_df)
             start += s
 
-        self.train_df = clients[int(cid)]
+        self.train_df = clients[cid]
+        self.val_df, self.test_df = val_g, test_g
 
-        # --- Local validation set ----------------------------------------
-        val_candidates = val_global[val_global.patient_id.isin(self.train_df.patient_id.unique())]
-        if len(val_candidates) >= 1:
-            self.val_df = val_candidates
-        else:
-            local_train, local_val = stratified_patient_split(self.train_df, test_size=0.15, seed=SEED)
-            self.train_df, self.val_df = local_train, local_val
+        # --- Visibility: true training volume ----------------------------
+        n_records = len(self.train_df)
+        samples_per_record = 10 * SAMPLE_RATE * 12  # 10s * Hz * 12 leads
+        total_samples = n_records * samples_per_record
+        hours = (n_records * 10.0) / 3600.0  # 10 seconds per record -> hours
 
-        # --- Global test set ---------------------------------------------
-        self.test_df = test_global
+        print(
+            f"[Client {cid}] train records={n_records:,} "
+            f"≈ {hours:.1f} h ECG | samples={total_samples:,} @ {SAMPLE_RATE} Hz"
+        )
 
-        # --- Normalization statistics ------------------------------------
+        # --- Per-lead normalization (local stats) ------------------------
         self.mu, self.sigma = compute_perlead_norm_stats(self.train_df)
 
-        # --- Model setup --------------------------------------------------
-        if MODEL["type"] == "cnn":
-            self.model = create_model(5, model_type="cnn").to(self.device)
-        else:
-            self.model = create_model(
-                5, model_type="lstm",
-                hidden=MODEL.get("lstm_hidden", 128),
-                layers=MODEL.get("lstm_layers", 1),
-                bidir=MODEL.get("bidirectional", True),
-                use_stem=False,
-            ).to(self.device)
+        # --- Model setup -------------------------------------------------
+        self.model = create_model(
+            n_classes=N_CLASSES,
+            model_type=MODEL["type"],
+            hidden=MODEL.get("lstm_hidden", 128),
+            layers=MODEL.get("lstm_layers", 1),
+            bidir=MODEL.get("bidirectional", True),
+        ).to(self.device)
+
         self.ce = nn.CrossEntropyLoss()
-
-        # Optional initial freezing for small clients
-        if len(self.train_df) < FREEZE_THRESHOLD:
-            for p in self.model.features.parameters():
-                p.requires_grad = False
-
-        # Initialize improvement-tracking state
         self.state = FreezeState()
 
-        print(f"[Client {self.cid}] initialized with {len(self.train_df)} records.")
+        # Static/head-only start for very small clients (only when freezing is enabled)
+        if EXPERIMENT["freeze_enabled"] and len(self.train_df) < FREEZE_THRESHOLD:
+            print(f"[Client {cid}] Head-only training to start (small client).")
+            # 1) freeze backbone (features)
+            for p in self.model.features.parameters():
+                p.requires_grad = False
+            # 2) within the head, train ONLY the last Linear (keep other head layers frozen)
+            for j, m in enumerate(self.model.head):
+                req_grad = (j == len(self.model.head) - 1)  # last module is Linear(96->N_CLASSES) in your CNN
+                for p in getattr(m, "parameters", lambda: [])():
+                    p.requires_grad = req_grad
+
+        print(f"[Client {cid}] Initialized model: {MODEL['type']} on {self.device}")
+
 
     # ---------------------------------------------------------------------
-    # Flower interface methods
+    # Federated API
     # ---------------------------------------------------------------------
     def get_parameters(self, config):
-        """Return model weights as a list of numpy arrays."""
-        return [val.detach().cpu().numpy() for _, val in self.model.state_dict().items()]
+        return [v.cpu().numpy() for _, v in self.model.state_dict().items()]
 
     def set_parameters(self, parameters: List[np.ndarray]):
-        """Load global weights into local model."""
         params_dict = zip(self.model.state_dict().keys(), parameters)
-        state_dict = OrderedDict({k: torch.tensor(v) for k, v in params_dict})
-        self.model.load_state_dict(state_dict, strict=True)
+        self.model.load_state_dict(OrderedDict({k: torch.tensor(v) for k, v in params_dict}), strict=True)
+
 
     # ---------------------------------------------------------------------
-    # Freezing utilities
+    # Freezing logic (hybrid: size + reactive)
     # ---------------------------------------------------------------------
-    def _base_freeze_target(self, n_train, total_layers, round_num):
-        """Baseline freezing rule: fewer samples → more frozen layers."""
+    def _apply_freeze_policy(self, round_num: int, loss_local: float, acc_local: float):
+        """Adjust layer freezing based on client size and performance."""
+
+        # Global toggle — disable all freezing if requested
+        if not EXPERIMENT["freeze_enabled"]:
+            for p in self.model.parameters():
+                p.requires_grad = True
+            if hasattr(self, "state"):
+                self.state.last_frozen = 0
+            return {"policy": "disabled", "frozen_layers": 0}
+
+        total = len(list(self.model.features))
+        n_train = len(self.train_df)
+
+        # Base: size-aware target (static baseline)
         if n_train >= 2 * FREEZE_THRESHOLD:
-            return 0
-        if n_train < FREEZE_THRESHOLD:
-            return int(total_layers * max(0.0, 1 - round_num / FREEZE_CFG["unfreeze_after"]))
-        return total_layers // 2
+            target = 0
+        elif n_train < FREEZE_THRESHOLD:
+            target = int(total * max(0.0, 1 - round_num / FREEZE_CFG["unfreeze_after"]))
+        else:
+            target = total // 4  # gentle mid-size default
 
-    def _apply_freeze_policy(self, round_num, n_train, total_layers):
-        """Combine base freeze with improvement-gated adjustment."""
-        base = self._base_freeze_target(n_train, total_layers, round_num)
-        gated = max(0, base - self.state.no_improve)
-        n_to_freeze = min(gated, total_layers - 1)
+        # Reactive adjustment based on performance trends
+        improved = (self.state.best_loss - loss_local) > self.state.min_delta or (acc_local > self.state.best_acc)
+        degraded = (loss_local - self.state.best_loss) > self.state.min_delta or (
+                acc_local < self.state.best_acc - 1e-3
+        )
+
+        if degraded:
+            self.state.no_improve += 1
+        elif improved:
+            self.state.no_improve = max(0, self.state.no_improve - 1)
+
+        # Every `patience` steps without improvement: adjust one layer
+        adjust = (self.state.no_improve // self.state.patience)
+        if degraded:
+            target = min(total - 1, target + adjust)  # freeze more
+        elif improved:
+            target = max(0, target - adjust)  # unfreeze
+
+        if len(self.train_df) < FREEZE_THRESHOLD and improved and self.state.no_improve == 0:
+            # allow the Linear(160->96) to train too
+            for p in self.model.head[1].parameters():  # head[1] is Linear(160->96)
+                p.requires_grad = True
+
+        # Apply the actual freezing pattern
         for i, layer in enumerate(self.model.features):
             for p in layer.parameters():
-                p.requires_grad = (i >= n_to_freeze)
-        return n_to_freeze
+                p.requires_grad = (i >= target)
+
+        # Update internal state
+        self.state.last_frozen = target
+        self.state.best_loss = min(self.state.best_loss, loss_local)
+        self.state.best_acc = max(self.state.best_acc, acc_local)
+
+        # Return summary
+        return {
+            "policy": "dynamic",
+            "frozen_layers": target,
+            "improved": improved,
+            "degraded": degraded,
+            "no_improve": self.state.no_improve,
+        }
+
 
     # ---------------------------------------------------------------------
-    # Local training
+    # Training
     # ---------------------------------------------------------------------
     def fit(self, parameters, config):
-        """Perform one federated training round."""
         self.set_parameters(parameters)
         round_num = config.get("round", 1)
 
-        total_layers = len(list(self.model.features))
-        n_train = len(self.train_df)
-        frozen_layers = self._apply_freeze_policy(round_num, n_train, total_layers)
+        # Pre-evaluate to determine freeze adjustment
+        loss_before, acc_before = self._evaluate_dataset(self.val_df)
+        self._apply_freeze_policy(round_num, loss_before, acc_before)
 
-        print(f"[Client {self.cid}] Round {round_num}: {n_train} samples, frozen_layers={frozen_layers}/{total_layers}")
-
-        # --- Local training loop ----------------------------------------
+        # Local training with optional FedProx term
         t0 = time.perf_counter()
-        train_loader = get_loaders(self.train_df, mu=self.mu, sigma=self.sigma)
-        opt = optim.Adam(filter(lambda p: p.requires_grad, self.model.parameters()),
-                         lr=LR, weight_decay=1e-4)
-
-        # FedProx global weights snapshot
-        global_params = [p.detach().clone() for p in self.model.parameters()]
+        loader = get_loaders(self.train_df, mu=self.mu, sigma=self.sigma)
+        opt = optim.Adam(filter(lambda p: p.requires_grad, self.model.parameters()), lr=LR, weight_decay=1e-4)
+        global_params = [p.detach().clone() for p in self.model.parameters()]  # FedProx snapshot
 
         self.model.train()
         for _ in range(EPOCHS_LOCAL):
-            for xb, yb in train_loader:
+            for xb, yb in loader:
                 xb, yb = xb.to(self.device), yb.to(self.device)
                 opt.zero_grad()
                 logits = self.model(xb)
                 loss = self.ce(logits, yb)
                 if FEDPROX_MU > 0:
-                    prox = sum(torch.sum((w - w0) ** 2)
-                               for w, w0 in zip(self.model.parameters(), global_params))
+                    prox = sum(torch.sum((w - w0) ** 2) for w, w0 in zip(self.model.parameters(), global_params))
                     loss += (FEDPROX_MU / 2.0) * prox
                 loss.backward()
                 opt.step()
 
         wall_s = time.perf_counter() - t0
-        loss_local, acc_local = self.evaluate_local()
+        loss_after, acc_after = self._evaluate_dataset(self.val_df)
 
-        # --- Update freeze-gating state ---------------------------------
-        if self.state.best_loss - loss_local > self.state.min_delta:
-            self.state.best_loss = loss_local
-            self.state.no_improve = 0
-        else:
-            self.state.no_improve += 1
+        # Update state for next round
+        if loss_after < self.state.best_loss:
+            self.state.best_loss = loss_after
+        if acc_after > self.state.best_acc:
+            self.state.best_acc = acc_after
 
-        # --- Log and print ----------------------------------------------
-        self._log_local_metrics_csv(round_num, acc_local, loss_local,
-                                    frozen_layers, total_layers, wall_s)
-        print(f"[Client {self.cid}] R{round_num}: acc={acc_local:.4f} "
-              f"loss={loss_local:.4f} time={wall_s:.1f}s "
-              f"freeze={frozen_layers}/{total_layers} "
-              f"(no_improve={self.state.no_improve})")
+        self._log_metrics(round_num, acc_after, loss_after, wall_s)
+        print(f"[Client {self.cid}] R{round_num}: acc={acc_after:.4f}, loss={loss_after:.4f}, "
+              f"time={wall_s:.1f}s, frozen_layers={self.state.last_frozen}")
 
-        return self.get_parameters({}), len(self.train_df), {"local_time": wall_s}
+        return self.get_parameters({}), len(self.train_df), {"accuracy": acc_after}
+
 
     # ---------------------------------------------------------------------
-    # Evaluation helpers
+    # Evaluation
     # ---------------------------------------------------------------------
-    def evaluate_local(self) -> Tuple[float, float]:
-        """Evaluate model on local validation set."""
-        loader = get_loaders(self.val_df, batch_size=128, mu=self.mu, sigma=self.sigma)
+    # -- helper to evaluate on a given dataset ----------------------------
+    def _evaluate_dataset(self, df) -> Tuple[float, float]:
+        loader = get_loaders(df, 128, mu=self.mu, sigma=self.sigma)
         self.model.eval()
         correct, total, loss_sum = 0, 0, 0.0
         with torch.no_grad():
@@ -261,46 +308,62 @@ class PTBClient(fl.client.NumPyClient):
                 pred = logits.argmax(dim=1)
                 correct += int((pred == yb).sum())
                 total += len(yb)
-                mean_loss = loss_sum / total
-                acc = correct / total
         return loss_sum / total, correct / total
 
+    # -- main evaluation method (called by server) ----------------------
     def evaluate(self, parameters, config):
-        """Evaluate on local test data (used by Flower server)."""
         self.set_parameters(parameters)
-        loader = get_loaders(self.test_df, batch_size=128, mu=self.mu, sigma=self.sigma)
+
+        # Compute metrics + confusion counts on TEST split
+        loader = get_loaders(self.test_df, 128, mu=self.mu, sigma=self.sigma)
         self.model.eval()
         correct, total, loss_sum = 0, 0, 0.0
+
+        # Confusion matrix: rows=true, cols=pred
+        cm = np.zeros((N_CLASSES, N_CLASSES), dtype=np.int64)
+
         with torch.no_grad():
             for xb, yb in loader:
                 xb, yb = xb.to(self.device), yb.to(self.device)
                 logits = self.model(xb)
-                loss = self.ce(logits, yb)
-                loss_sum += float(loss.item()) * len(yb)
+                loss_sum += float(self.ce(logits, yb).item()) * len(yb)
                 pred = logits.argmax(dim=1)
-                correct += int((pred == yb).sum().item())
-                total += int(len(yb))
-        return float(loss_sum / total), total, {"accuracy": correct / total}
+
+                correct += int((pred == yb).sum())
+                total += len(yb)
+
+                # update confusion counts
+                for t, p in zip(yb.view(-1).cpu().numpy(), pred.view(-1).cpu().numpy()):
+                    cm[int(t), int(p)] += 1
+
+        loss = (loss_sum / total) if total > 0 else 0.0
+        acc = (correct / total) if total > 0 else 0.0
+
+        # Flower expects flat dict[str,float]
+        metrics = {"accuracy": acc}
+        for i in range(N_CLASSES):
+            for j in range(N_CLASSES):
+                metrics[f"cm_{i}_{j}"] = float(cm[i, j])
+
+        return loss, len(self.test_df), metrics
+
 
     # ---------------------------------------------------------------------
-    # Logging utilities
+    # Logging
     # ---------------------------------------------------------------------
-    def _log_local_metrics_csv(self, round_num: int, acc: float, loss: float,
-                               frozen_layers: int, total_layers: int, wall_s: float):
-        """Append per-round metrics to CSV."""
-        RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-        filename = "frozen_client_metrics.csv" if frozen_layers > 0 else "not_frozen_client_metrics.csv"
-        path = RESULTS_DIR / filename
+    def _log_metrics(self, round_num: int, acc: float, loss: float, wall_s: float):
+        ensure_dir(RESULTS_DIR)
+        path = RESULTS_DIR / f"{EXPERIMENT['run_name']}.csv"
         write_header = not path.exists()
         trainable_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+        is_frozen = self.state.last_frozen > 0
         with open(path, "a", newline="") as f:
             w = csv.writer(f)
             if write_header:
-                w.writerow(["client_id", "round", "local_accuracy", "local_loss",
-                            "frozen_layers", "total_layers", "wall_time_sec",
-                            "trainable_params"])
+                w.writerow(["client_id", "round", "accuracy", "loss",
+                            "frozen_layers", "is_frozen", "wall_time_sec", "trainable_params"])
             w.writerow([self.cid, round_num, f"{acc:.4f}", f"{loss:.4f}",
-                        frozen_layers, total_layers, f"{wall_s:.2f}", trainable_params])
+                        self.state.last_frozen, int(is_frozen), f"{wall_s:.2f}", trainable_params])
 
 
 # -------------------------------------------------------------------------
@@ -308,9 +371,13 @@ class PTBClient(fl.client.NumPyClient):
 # -------------------------------------------------------------------------
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--cid", type=int, required=True, help="Client ID (0..3)")
+    parser.add_argument("--cid", type=int, required=True)
     args = parser.parse_args()
-    fl.client.start_numpy_client(server_address="127.0.0.1:8080", client=PTBClient(args.cid))
+    client = PTBClient(args.cid)
+    fl.client.start_client(
+        server_address="127.0.0.1:8080",
+        client=client.to_client(),
+    )
 
 
 if __name__ == "__main__":

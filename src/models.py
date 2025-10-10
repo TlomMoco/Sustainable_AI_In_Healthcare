@@ -15,7 +15,6 @@ and output logits corresponding to the 5 diagnostic superclasses:
 """
 
 from __future__ import annotations
-from dataclasses import dataclass
 import torch
 import torch.nn as nn
 from sklearn.pipeline import Pipeline

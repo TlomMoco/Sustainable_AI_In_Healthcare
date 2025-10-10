@@ -39,11 +39,10 @@ DATA_ROOT = DATA_DIR
 # -------------------------------------------------------------------------
 # 2. Data and Split Settings
 # -------------------------------------------------------------------------
-SEED = 42               # Global random seed for reproducibility
-SAMPLE_RATE = 100       # Hz, choose 100 for low-res or 500 for high-res
-N_CLASSES = 5           # NORM, MI, STTC, HYP, CD
+SEED = 42                   # Global random seed for reproducibility
+SAMPLE_RATE = 100           # Hz, choose 100 for low-res or 500 for high-res
+N_CLASSES = 5               # NORM, MI, STTC, HYP, CD
 SUPERCLASSES = ["NORM", "MI", "STTC", "HYP", "CD"]
-
 
 # Patient-level splits (fractions must sum to 1.0)
 SPLITS = {"train": 0.70, "val": 0.15, "test": 0.15}
@@ -52,21 +51,27 @@ SPLITS = {"train": 0.70, "val": 0.15, "test": 0.15}
 # -------------------------------------------------------------------------
 # 3. Federated Learning (FL) Settings
 # -------------------------------------------------------------------------
-CLIENTS = 4             # Number of participating clients
-EPOCHS_LOCAL = 2        # Local epochs per client per round
+CLIENTS = 4                 # Number of participating clients
+EPOCHS_LOCAL = 2            # Local epochs per client per round
 BATCH_SIZE = 64
-LR = 1e-3               # Learning rate for Adam optimizer
-FEDPROX_MU = 0.01       # FedProx proximal term (0 to disable)
+LR = 1e-3                   # Learning rate for Adam optimizer
+FEDPROX_MU = 0.01           # FedProx proximal term (0 to disable)
+ROUNDS = 4                 # Total federated training rounds
 
 # Freezing configuration (sustainability-driven compute reduction)
-FREEZE_THRESHOLD = 100  # Clients with fewer samples freeze early layers
+FREEZE_THRESHOLD = 600      # Clients with fewer samples freeze early layers
 FREEZE_CFG = {
     "patience": 2,          # Rounds without improvement before unfreezing
     "min_delta": 1e-3,      # Minimum improvement to reset patience
     "unfreeze_after": 10,   # Base schedule factor for gradual unfreezing
     "freeze_mode": "gated", # "gated" or "static"
 }
-
+# For logging (results/[name].csv) frozen layers vs not (True/False) manually
+FREEZE_ENABLED = False       # toggle this for frozen/non-frozen run
+EXPERIMENT = {
+    "freeze_enabled": FREEZE_ENABLED,
+    "run_name": "frozen_run" if FREEZE_ENABLED else "non_frozen_run",
+}
 
 # -------------------------------------------------------------------------
 # 4. Normalization Parameters
