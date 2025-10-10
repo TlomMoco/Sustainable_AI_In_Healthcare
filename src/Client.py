@@ -34,7 +34,8 @@ import flwr as fl
 
 from src.config import (
     LR, BATCH_SIZE, EPOCHS_LOCAL, FREEZE_THRESHOLD, FEDPROX_MU,
-    SEED, RESULTS_DIR, FREEZE_CFG, SPLITS, NORM, MODEL, EXPERIMENT, SAMPLE_RATE, N_CLASSES
+    SEED, RESULTS_DIR, FREEZE_CFG, SPLITS, NORM, MODEL, EXPERIMENT,
+    SAMPLE_RATE, N_CLASSES, TUNING, GRIDSEARCH
 )
 from src.data_loader import (
     load_metadata, map_superclasses, filter_single_label,
@@ -152,6 +153,12 @@ class PTBClient(fl.client.NumPyClient):
         self.ce = nn.CrossEntropyLoss()
         self.state = FreezeState()
 
+        # --- Per Client hyperparams (for tuning experiments) -----------
+        self.lr = LR
+        self.batch_size = BATCH_SIZE
+        self.local_epochs = EPOCHS_LOCAL
+        self.fedprox_mu = FEDPROX_MU
+
         # Static/head-only start for very small clients (only when freezing is enabled)
         if EXPERIMENT["freeze_enabled"] and len(self.train_df) < FREEZE_THRESHOLD:
             print(f"[Client {cid}] Head-only training to start (small client).")
@@ -259,20 +266,21 @@ class PTBClient(fl.client.NumPyClient):
 
         # Local training with optional FedProx term
         t0 = time.perf_counter()
-        loader = get_loaders(self.train_df, mu=self.mu, sigma=self.sigma)
-        opt = optim.Adam(filter(lambda p: p.requires_grad, self.model.parameters()), lr=LR, weight_decay=1e-4)
+        loader = get_loaders(self.train_df, batch_size=self.batch_size, mu=self.mu, sigma=self.sigma)
+        opt = optim.Adam(filter(lambda p: p.requires_grad, self.model.parameters()),
+                         lr=self.lr, weight_decay=1e-4)
         global_params = [p.detach().clone() for p in self.model.parameters()]  # FedProx snapshot
 
         self.model.train()
-        for _ in range(EPOCHS_LOCAL):
+        for _ in range(self.local_epochs):
             for xb, yb in loader:
                 xb, yb = xb.to(self.device), yb.to(self.device)
                 opt.zero_grad()
                 logits = self.model(xb)
                 loss = self.ce(logits, yb)
-                if FEDPROX_MU > 0:
+                if self.fedprox_mu > 0:
                     prox = sum(torch.sum((w - w0) ** 2) for w, w0 in zip(self.model.parameters(), global_params))
-                    loss += (FEDPROX_MU / 2.0) * prox
+                    loss += (self.fedprox_mu / 2.0) * prox
                 loss.backward()
                 opt.step()
 

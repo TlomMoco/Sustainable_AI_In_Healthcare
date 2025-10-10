@@ -17,7 +17,7 @@ from pathlib import Path
 
 
 # -------------------------------------------------------------------------
-# 1. Project Paths
+# Project Paths
 # -------------------------------------------------------------------------
 # Root directory of the project
 PROJ_ROOT = Path(__file__).resolve().parent.parent
@@ -37,7 +37,7 @@ DATA_ROOT = DATA_DIR
 
 
 # -------------------------------------------------------------------------
-# 2. Data and Split Settings
+# Data and Split Settings
 # -------------------------------------------------------------------------
 SEED = 42                   # Global random seed for reproducibility
 SAMPLE_RATE = 100           # Hz, choose 100 for low-res or 500 for high-res
@@ -49,7 +49,7 @@ SPLITS = {"train": 0.70, "val": 0.15, "test": 0.15}
 
 
 # -------------------------------------------------------------------------
-# 3. Federated Learning (FL) Settings
+# Federated Learning (FL) Settings
 # -------------------------------------------------------------------------
 CLIENTS = 4                 # Number of participating clients
 EPOCHS_LOCAL = 2            # Local epochs per client per round
@@ -74,7 +74,7 @@ EXPERIMENT = {
 }
 
 # -------------------------------------------------------------------------
-# 4. Normalization Parameters
+# Normalization Parameters
 # -------------------------------------------------------------------------
 NORM = {
     "enabled": True,
@@ -84,11 +84,27 @@ NORM = {
 
 
 # -------------------------------------------------------------------------
-# 5. Model Selection
+# Model Selection & Tuning / CV
 # -------------------------------------------------------------------------
 MODEL = {
     "type": "cnn",          # "cnn" or "lstm"
     "lstm_hidden": 128,     # Hidden units for LSTM
     "lstm_layers": 1,       # Number of LSTM layers
     "bidirectional": True,  # Bidirectional LSTM
+}
+# Hyperparameter tuning via grid search
+TUNING = {
+    "enabled": False,          # turn on/off
+    "timing": "pre",           # "pre" (before round 1) or "mid"
+    "warmup_rounds": 5,        # used if timing == "mid"
+    "log_phase": True,         # add 'phase' column to CSV
+}
+# Grid search settings
+GRIDSEARCH = {
+    "cv": 5,                   # Number of cross-validation folds
+    "grid": [
+        {"lr":1e-4,"batch":32,"epochs":1,"fedprox":0.0},
+        {"lr":5e-4,"batch":64,"epochs":2,"fedprox":0.0},
+        {"lr":1e-3,"batch":64,"epochs":2,"fedprox":0.001},
+    ],
 }
