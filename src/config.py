@@ -56,7 +56,7 @@ EPOCHS_LOCAL = 2            # Local epochs per client per round
 BATCH_SIZE = 64
 LR = 1e-3                   # Learning rate for Adam optimizer
 FEDPROX_MU = 0.01           # FedProx proximal term (0 to disable)
-ROUNDS = 20                 # Total federated training rounds
+ROUNDS = 15                 # Total federated training rounds
 
 # Freezing configuration (sustainability-driven compute reduction)
 FREEZE_THRESHOLD = 600      # Clients with fewer samples freeze early layers
@@ -67,7 +67,7 @@ FREEZE_CFG = {
     "freeze_mode": "gated", # "gated" or "static"
 }
 # For logging (results/[name].csv) frozen layers vs not (True/False) manually
-FREEZE_ENABLED = True       # toggle this for frozen/non-frozen run
+FREEZE_ENABLED = False       # toggle this for frozen/non-frozen run
 EXPERIMENT = {
     "freeze_enabled": FREEZE_ENABLED,
     "run_name": "frozen_run" if FREEZE_ENABLED else "non_frozen_run",
@@ -94,13 +94,15 @@ MODEL = {
 }
 
 TUNING = {
-    "enabled": True,             # toggle HPT/CV on/off
-    "log_phase": True,           # add a 'phase' label to rows
-    "log_mode": "same",          # "same" -> write into <run>.csv with 'phase'
-                                 # "separate" -> write <run>_<phase>.csv (no 'phase' col)
-    "phase_labels": {            # labels used in CSVs/plots
-        "enabled":  "post_cv",   # training happens after CV
-        "disabled": "no_cv"
+    "enabled": False,                   # run CV now?
+    "reuse_cached_if_exists": False,
+    "use_cached_best": False,            # if enabled=False, load best params from disk if available
+    "log_phase": True,                  # log tuning phase in results?
+    "log_mode": "same",                 # "same" or "separate" CSV for tuning vs non-tuning
+    "phase_labels": {
+        "enabled":  "post_cv",          # tuning enabled
+        "disabled": "no_cv",            # tuning disabled
+        "cached":   "cached_cv"         # tuning disabled but cached params used
     },
 }
 
@@ -110,5 +112,7 @@ GRIDSEARCH = {
         {"lr":1e-4,"batch":32,"epochs":1,"fedprox":0.0},
         {"lr":5e-4,"batch":64,"epochs":2,"fedprox":0.0},
         {"lr":1e-3,"batch":64,"epochs":2,"fedprox":0.001},
+        {"lr": 1e-3, "batch": 128, "epochs": 4, "fedprox": 0.0},
+        {"lr": 2e-3, "batch": 128, "epochs": 4, "fedprox": 0.001},
     ],
 }

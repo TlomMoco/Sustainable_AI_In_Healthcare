@@ -42,7 +42,7 @@ from src.data_loader import (
     stratified_patient_split_3way, load_waveform,
     compute_perlead_norm_stats, normalize_signal
 )
-from src.tuning import run_client_cv, default_grid
+from src.tuning import run_client_cv
 from src.models import create_model
 from src.utils import set_seed, ensure_dir
 
@@ -63,7 +63,7 @@ class FreezeState:
 # -------------------------------------------------------------------------
 # Helper functions
 # -------------------------------------------------------------------------
-def make_tensor_dataset(df, mu=None, sigma=None, eps=1e-6):
+def make_tensor_dataset(df, mu=None, sigma=None):
     """Convert a PTB-XL dataframe to tensors (X, y)."""
     X, y = [], []
     classes = ["NORM", "MI", "STTC", "HYP", "CD"]
@@ -125,6 +125,7 @@ class PTBClient(fl.client.NumPyClient):
             clients.append(client_df)
             start += s
 
+        assert 0 <= cid < len(clients), f"cid {cid} out of range (have {len(clients)} clients)"
         self.train_df = clients[cid]
         self.val_df, self.test_df = val_g, test_g
 
@@ -159,35 +160,66 @@ class PTBClient(fl.client.NumPyClient):
         self.local_epochs = EPOCHS_LOCAL
         self.fedprox_mu = FEDPROX_MU  # proximal term (not normalization μ)
 
+        # ----------------------------------------------------------------
+        # Hyperparameter tuning via CV (pre-flight) + cached reuse
+        # ----------------------------------------------------------------
+        import json
 
-        # ----------------------------------------------------------------
-        # Hyperparameter tuning via CV (pre-flight, if enabled)
-        # ----------------------------------------------------------------
         self.cv_done = False
+        self.hp_source = "default"  # "default" | "cached" | "tuned"
+
+        outdir = RESULTS_DIR / "tuning" / EXPERIMENT["run_name"]
+        best_path = outdir / f"client{self.cid}_best.json"
+
+        def _apply_hparams(hp: dict, src: str):
+            self.lr = float(hp["lr"])
+            self.batch_size = int(hp["batch"])
+            self.local_epochs = int(hp["epochs"])
+            self.fedprox_mu = float(hp.get("fedprox", 0.0))
+            self.hp_source = src
+
         if TUNING.get("enabled", False):
-            outdir = RESULTS_DIR / "tuning" / EXPERIMENT["run_name"]
-            out_csv = outdir / f"client{self.cid}_cv.csv"
-            out_json = outdir / f"client{self.cid}_best.json"
             outdir.mkdir(parents=True, exist_ok=True)
 
-            print(f"[Client {self.cid}] Starting pre-flight CV: grid={len(GRIDSEARCH.get('grid', []))}, k={GRIDSEARCH.get('cv', 5)}")
-            res = run_client_cv(self.train_df,
-                                k=GRIDSEARCH.get("cv"),
-                                grid=GRIDSEARCH.get("grid"),
-                                device=self.device,
-                                save_csv=out_csv,
-                                save_json=out_json)
-            best = res.get("best") or {}
+            # Reuse cached best if allowed and present
+            if TUNING.get("reuse_cached_if_exists", True) and best_path.exists():
+                with open(best_path, "r", encoding="utf-8") as f:
+                    best = (json.load(f) or {}).get("params", {})
+                if best:
+                    _apply_hparams(best, "cached")
+                    print(f"[Client {self.cid}] Using cached tuned HPs → "
+                          f"lr={self.lr}, batch={self.batch_size}, epochs={self.local_epochs}, μ={self.fedprox_mu}")
+            else:
+                # Run CV now
+                print(f"[Client {self.cid}] Starting pre-flight CV: grid={len(GRIDSEARCH.get('grid', []))}, "
+                      f"k={GRIDSEARCH.get('cv', 5)}")
+                res = run_client_cv(
+                    self.train_df,
+                    k=GRIDSEARCH.get("cv"),
+                    grid=GRIDSEARCH.get("grid"),
+                    device=self.device,
+                    save_csv=outdir / f"client{self.cid}_cv.csv",
+                    save_json=best_path,
+                )
+                best = (res or {}).get("best") or {}
+                if best:
+                    _apply_hparams(best, "tuned")
+                    print(f"[Client {self.cid}] CV best={res.get('best_mean_acc', 0):.4f} → "
+                          f"lr={self.lr}, batch={self.batch_size}, epochs={self.local_epochs}, μ={self.fedprox_mu}")
+                else:
+                    print(f"[Client {self.cid}] CV skipped/insufficient groups; using defaults.")
 
-            if best:
-                self.lr = float(best["lr"])
-                self.batch_size = int(best["batch"])
-                self.local_epochs = int(best["epochs"])
-                self.fedprox_mu = float(best.get("fedprox", 0.0))
-                print(f"[Client {self.cid}] CV best={res.get('best_mean_acc', 0):.4f} → "
-                      f"lr={self.lr}, batch={self.batch_size}, epochs={self.local_epochs}, μ={self.fedprox_mu}")
             print(f"[Client {self.cid}] Pre-flight CV finished.")
             self.cv_done = True
+
+        # If CV is OFF but we want to reuse cached best from a previous run
+        elif TUNING.get("use_cached_best", True) and best_path.exists():
+            with open(best_path, "r", encoding="utf-8") as f:
+                best = (json.load(f) or {}).get("params", {})
+            if best:
+                _apply_hparams(best, "cached")
+                print(f"[Client {self.cid}] Reusing cached tuned HPs (CV off) → "
+                      f"lr={self.lr}, batch={self.batch_size}, epochs={self.local_epochs}, μ={self.fedprox_mu}")
 
 
         # Static/head-only start for very small clients (only when freezing is enabled)
@@ -208,8 +240,9 @@ class PTBClient(fl.client.NumPyClient):
     # ---------------------------------------------------------------------
     # Federated API
     # ---------------------------------------------------------------------
-    def get_parameters(self, config):
-        return [v.cpu().numpy() for _, v in self.model.state_dict().items()]
+    # Flower calls this with a config kwarg — accept it even if unused
+    def get_parameters(self, config: dict | None = None):
+        return [v.detach().cpu().numpy() for _, v in self.model.state_dict().items()]
 
     def set_parameters(self, parameters: List[np.ndarray]):
         params_dict = zip(self.model.state_dict().keys(), parameters)
@@ -336,6 +369,8 @@ class PTBClient(fl.client.NumPyClient):
     # ---------------------------------------------------------------------
     # -- helper to evaluate on a given dataset ----------------------------
     def _evaluate_dataset(self, df) -> Tuple[float, float]:
+        if len(df) == 0:
+            return 0.0, 0.0
         loader = get_loaders(df, 128, mu=self.mu, sigma=self.sigma)
         self.model.eval()
         correct, total, loss_sum = 0, 0, 0.0
