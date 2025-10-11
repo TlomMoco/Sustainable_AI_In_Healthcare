@@ -158,3 +158,142 @@ def run_client_cv(
             json.dump({"best_mean_val_acc": best_score, "params": best_hp}, f, indent=2)
 
     return {"best": best_hp, "best_mean_acc": best_score}
+
+
+
+
+
+
+
+
+
+# ---------
+# ## 13b) Tiny Random Search & 13c) Small Grid (from notebook)
+# ---------
+import itertools, copy, math, numpy as np, torch
+from torch import nn, optim
+from torch.utils.data import DataLoader
+from . import config as CFG
+from .models import create_model
+from .utils import torch_loader_kwargs
+
+def _criterion(binary: bool, ce_weights=None, bce_pos_weight=None):
+    if binary:
+        if bce_pos_weight:
+            return nn.BCEWithLogitsLoss(pos_weight=torch.tensor([float(bce_pos_weight)]))
+        return nn.BCEWithLogitsLoss()
+    else:
+        if ce_weights is not None:
+            w = torch.tensor(ce_weights, dtype=torch.float32)
+            return nn.CrossEntropyLoss(weight=w)
+        return nn.CrossEntropyLoss()
+
+def _eval_epoch(model, loader, binary, device):
+    model.eval()
+    total, correct, loss_sum = 0, 0, 0.0
+    crit = _criterion(binary)
+    with torch.no_grad():
+        for xb, yb in loader:
+            xb = xb.to(device); yb = yb.to(device)
+            logits = model(xb)
+            loss = crit(logits.view(-1), yb.float()) if binary else crit(logits, yb)
+            loss_sum += loss.item() * xb.size(0)
+            preds = (torch.sigmoid(logits.view(-1)) >= 0.5).long() if binary else logits.argmax(1)
+            correct += (preds == yb).sum().item()
+            total   += xb.size(0)
+    return (loss_sum/total if total else math.nan), (correct/total if total else math.nan)
+
+def random_search_models(build_loaders_fn, n_classes, is_binary, device, trials=8, epochs=4):
+    rng = np.random.RandomState(CFG.SEED)
+    search_space = {
+        "batch":        [16, 24, 32],
+        "lr":           [1e-4, 2e-4, 3e-4, 5e-4, 1e-3],
+        "weight_decay": [0.0, 1e-5, 5e-5, 1e-4],
+        "patience":     [2, 3],
+        "grad_clip":    [None, 1.0],
+    }
+    combos = list(itertools.product(search_space["batch"], search_space["lr"],
+                                    search_space["weight_decay"], search_space["patience"],
+                                    search_space["grad_clip"]))
+    rng.shuffle(combos); combos = combos[:int(trials)]
+
+    def _try_one(model_name):
+        best = {"val_acc": -1.0, "cfg": None, "state": None}
+        for (batch, lr, wd, pat, gclip) in combos:
+            dl_tr, dl_va = build_loaders_fn(batch)
+            model = create_model(model_name, n_classes, binary=is_binary)
+            crit = _criterion(is_binary)
+            opt  = optim.Adam(model.parameters(), lr=lr, weight_decay=wd)
+            sch  = optim.lr_scheduler.ReduceLROnPlateau(opt, mode="min", factor=0.5, patience=1, min_lr=1e-5)
+            best_state, best_val = None, float("inf"); bad = 0
+            for _ in range(int(epochs)):
+                model.train()
+                for xb, yb in dl_tr:
+                    xb=xb.to(device); yb=yb.to(device)
+                    opt.zero_grad(set_to_none=True)
+                    logits = model(xb)
+                    loss = crit(logits.view(-1), yb.float()) if is_binary else crit(logits, yb)
+                    loss.backward()
+                    if gclip: nn.utils.clip_grad_norm_(model.parameters(), float(gclip))
+                    opt.step()
+                val_loss, _ = _eval_epoch(model, dl_va, is_binary, device)
+                sch.step(val_loss)
+                if val_loss < best_val:
+                    best_val = val_loss; best_state = copy.deepcopy(model.state_dict()); bad = 0
+                else:
+                    bad += 1
+                    if pat and bad >= pat: break
+            _, val_acc = _eval_epoch(model, dl_va, is_binary, device)
+            if val_acc > best["val_acc"]:
+                best.update(val_acc=float(val_acc),
+                            cfg={"batch":int(batch),"lr":float(lr),"weight_decay":float(wd),
+                                 "patience":int(pat),"grad_clip":(None if gclip is None else float(gclip))},
+                            state=copy.deepcopy(best_state))
+        return best
+
+    picked = {}
+    for name, flag in [("cnn", CFG.RUN_TORCH_CNN), ("rnn", CFG.RUN_TORCH_RNN),
+                       ("lstm", CFG.RUN_TORCH_LSTM), ("ann", CFG.RUN_TORCH_ANN)]:
+        if not flag: continue
+        picked[name] = _try_one(name)
+    return picked
+
+def grid_search_ann(build_loaders_fn, n_classes, is_binary, device, epochs=3):
+    import itertools
+    from .models import ANNpooled
+    grid = {"batch":[24,32], "lr":[1e-4,2e-4,3e-4], "dropout":[0.10,0.20,0.35], "grad_clip":[None,1.0]}
+    combos = list(itertools.product(grid["batch"], grid["lr"], grid["dropout"], grid["grad_clip"]))
+    best = {"score": -1.0, "cfg": None, "state": None}
+    for (b, lr, dp, gc) in combos:
+        dl_tr, dl_va = build_loaders_fn(b)
+        model = ANNpooled(n_classes, binary=is_binary)
+        crit = _criterion(is_binary)
+        opt  = optim.Adam(model.parameters(), lr=float(lr))
+        best_state, best_acc = None, -1.0
+        for _ in range(int(epochs)):
+            model.train()
+            for xb, yb in dl_tr:
+                xb=xb.to(device); yb=yb.to(device)
+                opt.zero_grad(set_to_none=True)
+                logits = model(xb)
+                loss = crit(logits.view(-1), yb.float()) if is_binary else crit(logits, yb)
+                loss.backward()
+                if gc: nn.utils.clip_grad_norm_(model.parameters(), float(gc))
+                opt.step()
+            _, va_acc = _eval_epoch(model, dl_va, is_binary, device)
+            if va_acc > best_acc:
+                best_acc = va_acc; best_state = copy.deepcopy(model.state_dict())
+        if best_acc > best["score"]:
+            best.update(score=float(best_acc),
+                        cfg={"batch":int(b),"lr":float(lr),"dropout":float(dp),"grad_clip":gc},
+                        state=copy.deepcopy(best_state))
+    return best
+
+def run_client_cv(build_loaders_fn, n_classes, is_binary, device):
+    trials = 8 if not CFG.FAST_RUN else 2
+    epochs = 4 if not CFG.FAST_RUN else 2
+    best_states = random_search_models(build_loaders_fn, n_classes, is_binary, device, trials=trials, epochs=epochs)
+    if CFG.RUN_TORCH_ANN:
+        gbest = grid_search_ann(build_loaders_fn, n_classes, is_binary, device, epochs=(2 if CFG.FAST_RUN else 3))
+        best_states["ann_grid"] = {"val_acc": gbest["score"], "cfg": gbest["cfg"], "state": gbest["state"]}
+    return best_states

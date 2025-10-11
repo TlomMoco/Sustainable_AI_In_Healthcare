@@ -182,3 +182,103 @@ def create_model(n_classes: int, model_type: str = "cnn", **kwargs) -> nn.Module
         return TinyECGLSTM(n_classes, **kwargs)
     else:
         raise ValueError(f"Unknown model_type: {model_type}")
+
+
+
+
+
+
+
+
+# ---------
+# ## 12) Models + Heads (from notebook)
+# ---------
+import torch
+from torch import nn
+from . import config as CFG
+
+def _head(in_features: int, n_classes: int, binary: bool = False):
+    return nn.Linear(in_features, 1 if binary else n_classes)
+
+class TinyECGCNN(nn.Module):
+    def __init__(self, n_classes: int, input_c: int = 12, binary: bool = False):
+        super().__init__()
+        self.binary = binary
+        self.avg2 = nn.AvgPool1d(2)
+        self.body = nn.Sequential(
+            nn.Conv1d(input_c, 32, 7, padding=3), nn.BatchNorm1d(32), nn.ReLU(), nn.MaxPool1d(2),
+            nn.Conv1d(32, 64, 5, padding=2),     nn.BatchNorm1d(64), nn.ReLU(), nn.MaxPool1d(2),
+            nn.Conv1d(64,128, 3, padding=1),     nn.BatchNorm1d(128), nn.ReLU(),
+            nn.AdaptiveAvgPool1d(1)
+        )
+        self.fc = _head(128, n_classes, binary)
+    def forward(self, x):              # x: [N, T, C]
+        x = x.permute(0,2,1)           # → [N, C, T]
+        x = self.avg2(x)
+        x = self.body(x).squeeze(-1)   # [N, 128]
+        return self.fc(x)
+
+class TinyECGLSTM(nn.Module):
+    def __init__(self, n_classes: int, input_c: int = 12, binary: bool = False):
+        super().__init__()
+        self.binary = binary
+        self.l1 = nn.LSTM(input_c, 128, batch_first=True)
+        self.drop = nn.Dropout(0.15)
+        self.l2 = nn.LSTM(128, 64, batch_first=True)
+        self.fc1 = nn.Linear(64, 96)
+        self.fc2 = _head(96, n_classes, binary)
+    def forward(self, x):
+        x = x[:, ::2, :]
+        x, _ = self.l1(x); x = self.drop(x)
+        x, _ = self.l2(x)
+        x = x[:, -1, :]
+        x = torch.relu(self.fc1(x))
+        return self.fc2(x)
+
+class RNNsimple(nn.Module):
+    # ---------
+    # ## 12) Models — RNN (from notebook)
+    # ---------
+    def __init__(self, n_classes: int, input_c: int = 12, binary: bool = False):
+        super().__init__()
+        self.binary = binary
+        self.rnn1 = nn.RNN(input_c, 128, batch_first=True)
+        self.drop = nn.Dropout(0.15)
+        self.rnn2 = nn.RNN(128, 64, batch_first=True)
+        self.fc1  = nn.Linear(64, 96)
+        self.fc2  = _head(96, n_classes, binary)
+    def forward(self, x):
+        x = x[:, ::2, :]
+        x, _ = self.rnn1(x); x = self.drop(x)
+        x, _ = self.rnn2(x)
+        x = x[:, -1, :]
+        x = torch.relu(self.fc1(x))
+        return self.fc2(x)
+
+class ANNpooled(nn.Module):
+    # ---------
+    # ## 12) Models — ANN (from notebook)
+    # ---------
+    def __init__(self, n_classes: int, input_c: int = 12, binary: bool = False):
+        super().__init__()
+        self.binary = binary
+        self.fc = nn.Sequential(
+            nn.Linear(input_c, 256), nn.ReLU(), nn.Dropout(0.20),
+            nn.Linear(256, 128),     nn.ReLU()
+        )
+        self.out = _head(128, n_classes, binary)
+    def forward(self, x):
+        x = x.mean(dim=1)              # global mean over time
+        x = self.fc(x)
+        return self.out(x)
+
+# ---------
+# ## 12) Factory (extended)
+# ---------
+def create_model(model_type: str, n_classes: int, *, input_c: int = 12, binary: bool = False):
+    mt = str(model_type).lower()
+    if mt == "cnn":  return TinyECGCNN(n_classes, input_c=input_c, binary=binary)
+    if mt == "lstm": return TinyECGLSTM(n_classes, input_c=input_c, binary=binary)
+    if mt == "rnn":  return RNNsimple(n_classes, input_c=input_c, binary=binary)
+    if mt == "ann":  return ANNpooled(n_classes, input_c=input_c, binary=binary)
+    raise ValueError(f"Unknown model_type: {model_type}")
