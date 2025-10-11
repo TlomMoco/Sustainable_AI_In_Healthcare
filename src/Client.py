@@ -42,6 +42,7 @@ from src.data_loader import (
     stratified_patient_split_3way, load_waveform,
     compute_perlead_norm_stats, normalize_signal
 )
+from src.tuning import run_client_cv, default_grid
 from src.models import create_model
 from src.utils import set_seed, ensure_dir
 
@@ -132,9 +133,8 @@ class PTBClient(fl.client.NumPyClient):
         samples_per_record = 10 * SAMPLE_RATE * 12  # 10s * Hz * 12 leads
         total_samples = n_records * samples_per_record
         hours = (n_records * 10.0) / 3600.0  # 10 seconds per record -> hours
-
         print(
-            f"[Client {cid}] train records={n_records:,} "
+            f"[Client {self.cid}] train records={n_records:,} "
             f"≈ {hours:.1f} h ECG | samples={total_samples:,} @ {SAMPLE_RATE} Hz"
         )
 
@@ -157,11 +157,42 @@ class PTBClient(fl.client.NumPyClient):
         self.lr = LR
         self.batch_size = BATCH_SIZE
         self.local_epochs = EPOCHS_LOCAL
-        self.fedprox_mu = FEDPROX_MU
+        self.fedprox_mu = FEDPROX_MU  # proximal term (not normalization μ)
+
+
+        # ----------------------------------------------------------------
+        # Hyperparameter tuning via CV (pre-flight, if enabled)
+        # ----------------------------------------------------------------
+        self.cv_done = False
+        if TUNING.get("enabled", False):
+            outdir = RESULTS_DIR / "tuning" / EXPERIMENT["run_name"]
+            out_csv = outdir / f"client{self.cid}_cv.csv"
+            out_json = outdir / f"client{self.cid}_best.json"
+            outdir.mkdir(parents=True, exist_ok=True)
+
+            print(f"[Client {self.cid}] Starting pre-flight CV: grid={len(GRIDSEARCH.get('grid', []))}, k={GRIDSEARCH.get('cv', 5)}")
+            res = run_client_cv(self.train_df,
+                                k=GRIDSEARCH.get("cv"),
+                                grid=GRIDSEARCH.get("grid"),
+                                device=self.device,
+                                save_csv=out_csv,
+                                save_json=out_json)
+            best = res.get("best") or {}
+
+            if best:
+                self.lr = float(best["lr"])
+                self.batch_size = int(best["batch"])
+                self.local_epochs = int(best["epochs"])
+                self.fedprox_mu = float(best.get("fedprox", 0.0))
+                print(f"[Client {self.cid}] CV best={res.get('best_mean_acc', 0):.4f} → "
+                      f"lr={self.lr}, batch={self.batch_size}, epochs={self.local_epochs}, μ={self.fedprox_mu}")
+            print(f"[Client {self.cid}] Pre-flight CV finished.")
+            self.cv_done = True
+
 
         # Static/head-only start for very small clients (only when freezing is enabled)
         if EXPERIMENT["freeze_enabled"] and len(self.train_df) < FREEZE_THRESHOLD:
-            print(f"[Client {cid}] Head-only training to start (small client).")
+            print(f"[Client {self.cid}] Head-only training to start (small client).")
             # 1) freeze backbone (features)
             for p in self.model.features.parameters():
                 p.requires_grad = False
@@ -171,7 +202,7 @@ class PTBClient(fl.client.NumPyClient):
                 for p in getattr(m, "parameters", lambda: [])():
                     p.requires_grad = req_grad
 
-        print(f"[Client {cid}] Initialized model: {MODEL['type']} on {self.device}")
+        print(f"[Client {self.cid}] Initialized model: {MODEL['type']} on {self.device}")
 
 
     # ---------------------------------------------------------------------
@@ -361,17 +392,40 @@ class PTBClient(fl.client.NumPyClient):
     # ---------------------------------------------------------------------
     def _log_metrics(self, round_num: int, acc: float, loss: float, wall_s: float):
         ensure_dir(RESULTS_DIR)
-        path = RESULTS_DIR / f"{EXPERIMENT['run_name']}.csv"
+        exp = EXPERIMENT["run_name"]
+
+        # Determine phase label (simple: tuned vs no_cv)
+        if TUNING.get("log_phase"):
+            phase = (TUNING["phase_labels"]["enabled"] if TUNING.get("enabled") else
+                     TUNING["phase_labels"]["disabled"])
+        else:
+            phase = ""
+
+        # Choose file path depending on log mode
+        if TUNING.get("log_phase") and TUNING.get("log_mode") == "separate":
+            path = RESULTS_DIR / f"{exp}_{phase or 'no_cv'}.csv"
+            header = ["client_id", "round", "accuracy", "loss",
+                      "frozen_layers", "is_frozen", "wall_time_sec", "trainable_params"]
+            write_phase = False
+        else:
+            path = RESULTS_DIR / f"{exp}.csv"
+            header = ["client_id", "round", "accuracy", "loss",
+                      "frozen_layers", "is_frozen", "wall_time_sec", "trainable_params", "phase"]
+            write_phase = True
+
         write_header = not path.exists()
         trainable_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
         is_frozen = self.state.last_frozen > 0
+
         with open(path, "a", newline="") as f:
             w = csv.writer(f)
             if write_header:
-                w.writerow(["client_id", "round", "accuracy", "loss",
-                            "frozen_layers", "is_frozen", "wall_time_sec", "trainable_params"])
-            w.writerow([self.cid, round_num, f"{acc:.4f}", f"{loss:.4f}",
-                        self.state.last_frozen, int(is_frozen), f"{wall_s:.2f}", trainable_params])
+                w.writerow(header)
+            row = [self.cid, round_num, f"{acc:.4f}", f"{loss:.4f}",
+                   self.state.last_frozen, int(is_frozen), f"{wall_s:.2f}", trainable_params]
+            if write_phase:
+                row.append(phase)
+            w.writerow(row)
 
 
 # -------------------------------------------------------------------------

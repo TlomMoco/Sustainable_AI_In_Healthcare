@@ -77,7 +77,7 @@ EXPERIMENT = {
 # Normalization Parameters
 # -------------------------------------------------------------------------
 NORM = {
-    "enabled": True,
+    "enabled": True,        # toggle normalization on/off
     "mode": "zscore",       # Currently only 'zscore' is implemented
     "eps": 1e-6,            # Numerical stability
 }
@@ -87,21 +87,25 @@ NORM = {
 # Model Selection & Tuning / CV
 # -------------------------------------------------------------------------
 MODEL = {
-    "type": "cnn",          # "cnn" or "lstm"
-    "lstm_hidden": 128,     # Hidden units for LSTM
-    "lstm_layers": 1,       # Number of LSTM layers
-    "bidirectional": True,  # Bidirectional LSTM
+    "type": "cnn",              # "cnn" or "lstm"
+    "lstm_hidden": 128,
+    "lstm_layers": 1,
+    "bidirectional": True,
 }
-# Hyperparameter tuning via grid search
+
 TUNING = {
-    "enabled": False,          # turn on/off
-    "timing": "pre",           # "pre" (before round 1) or "mid"
-    "warmup_rounds": 5,        # used if timing == "mid"
-    "log_phase": True,         # add 'phase' column to CSV
+    "enabled": False,             # toggle HPT/CV on/off
+    "log_phase": True,           # add a 'phase' label to rows
+    "log_mode": "same",          # "same" -> write into <run>.csv with 'phase'
+                                 # "separate" -> write <run>_<phase>.csv (no 'phase' col)
+    "phase_labels": {            # labels used in CSVs/plots
+        "enabled":  "post_cv",   # training happens after CV
+        "disabled": "no_cv"
+    },
 }
-# Grid search settings
+
 GRIDSEARCH = {
-    "cv": 5,                   # Number of cross-validation folds
+    "cv": 5,
     "grid": [
         {"lr":1e-4,"batch":32,"epochs":1,"fedprox":0.0},
         {"lr":5e-4,"batch":64,"epochs":2,"fedprox":0.0},

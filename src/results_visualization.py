@@ -23,6 +23,11 @@ CONFUSION = {
 OUT = RESULTS_DIR / "viz"
 ensure_dir(OUT)
 
+PHASE_ENABLED  = "post_cv"
+PHASE_DISABLED = "no_cv"
+
+
+# --- Load CSVs with numeric columns coerced to numbers (NaN if invalid) ---
 def load_numeric_csv(path: Path):
     if not path.exists():
         print(f"Missing: {path}")
@@ -33,6 +38,7 @@ def load_numeric_csv(path: Path):
             df[col] = pd.to_numeric(df[col], errors="coerce")
     return df
 
+# --- Load all dataframes (calling load_numeric_csv) ---------------------
 dfs      = {name: load_numeric_csv(p) for name, p in FILES.items()}
 percls   = {name: load_numeric_csv(p) for name, p in PERCLASS.items()}
 conf_long= {name: load_numeric_csv(p) for name, p in CONFUSION.items()}
@@ -40,6 +46,7 @@ conf_long= {name: load_numeric_csv(p) for name, p in CONFUSION.items()}
 dfs      = {k:v for k,v in dfs.items() if v is not None}
 percls   = {k:v for k,v in percls.items() if v is not None}
 conf_long= {k:v for k,v in conf_long.items() if v is not None}
+
 
 # -------------------------------------------------------------------------
 # Plotting
@@ -55,6 +62,8 @@ plt.xlabel("Round"); plt.ylabel("Accuracy"); plt.title("Global Accuracy per Roun
 plt.legend(); plt.grid(True); plt.tight_layout()
 plt.savefig(OUT / "global_accuracy.png", dpi=150); plt.close()
 
+
+
 # -- Client accuracies vs round ---------------------------------
 for name, df in dfs.items():
     plt.figure()
@@ -68,6 +77,8 @@ for name, df in dfs.items():
     plt.title(f"Client vs Global Accuracy — {name}")
     plt.legend(ncol=2); plt.grid(True); plt.tight_layout()
     plt.savefig(OUT / f"clients_vs_global_{name}.png", dpi=150); plt.close()
+
+
 
 # -- Wall-time per round (total across clients) -------------------
 for name, df in dfs.items():
@@ -86,6 +97,8 @@ for name, df in dfs.items():
     plt.grid(True); plt.tight_layout()
     plt.savefig(OUT / f"walltime_{name}.png", dpi=150); plt.close()
 
+
+
 # -- Per-client trajectories (frozen vs non-frozen, one figure) ---
 if all(k in dfs for k in ("frozen", "non_frozen")):
     plt.figure()
@@ -103,6 +116,8 @@ if all(k in dfs for k in ("frozen", "non_frozen")):
     plt.legend(ncol=2); plt.grid(True); plt.tight_layout()
     plt.savefig(OUT / "per_client_trajectories.png", dpi=150); plt.close()
 
+
+
 # -- Per-class accuracy over rounds (line plot) -------------------
 if percls:
     plt.figure()
@@ -118,6 +133,8 @@ if percls:
     plt.title("Per-class Accuracy per Round")
     plt.legend(ncol=2); plt.grid(True); plt.tight_layout()
     plt.savefig(OUT / "perclass_over_rounds.png", dpi=150); plt.close()
+
+
 
 # -- Final-round per-class accuracy (bar) -------------------------
 if percls:
@@ -135,6 +152,8 @@ if percls:
     plt.title("Final-Round Per-class Accuracy")
     plt.legend(); plt.tight_layout()
     plt.savefig(OUT / "perclass_final_bar.png", dpi=150); plt.close()
+
+
 
 # -- Confusion heatmaps (last round of each run) ------------------
 for name, dfc in conf_long.items():
@@ -165,5 +184,48 @@ for name, dfc in conf_long.items():
     plt.tight_layout()
     plt.savefig(OUT / f"confusion_{name}_r{r:02d}.png", dpi=150)
     plt.close()
+
+
+
+# -- Global accuracy by phase (within each run) ---------------------------
+for name, df in dfs.items():
+    if "phase" not in df.columns:
+        continue
+    g = df[df["client_id"] == "GLOBAL"].copy()
+    pre = g[g["phase"].eq(PHASE_DISABLED)].sort_values(by="round")
+    post = g[g["phase"].eq(PHASE_ENABLED)].sort_values(by="round")
+    if pre.empty and post.empty:
+        continue
+    plt.figure()
+    if not pre.empty:
+        plt.plot(pre["round"], pre["accuracy"], label=f"{name} (pre-CV)")
+    if not post.empty:
+        plt.plot(post["round"], post["accuracy"], label=f"{name} (post-CV)")
+    plt.xlabel("Round"); plt.ylabel("Global Accuracy")
+    plt.title(f"Global Accuracy by Phase — {name}")
+    plt.legend(); plt.grid(True); plt.tight_layout()
+    plt.savefig(OUT / f"global_by_phase_{name}.png", dpi=150); plt.close()
+
+
+
+# -- Per-client accuracy by phase (overlay pre/post) ---------------------
+for name, df in dfs.items():
+    if "phase" not in df.columns:
+        continue
+    plt.figure()
+    sub = df[df["client_id"] != "GLOBAL"].copy()
+    for phase, style in [("pre_cv","-"), ("post_cv","--")]:
+        grp = sub[sub["phase"].eq(phase)]
+        if grp.empty:
+            continue
+        for cid, g in grp.groupby("client_id"):
+            g = g.sort_values(by="round")
+            plt.plot(g["round"], g["accuracy"], linestyle=style, alpha=0.7,
+                     label=f"Client {cid} ({name}, {phase})")
+    plt.xlabel("Round"); plt.ylabel("Local Accuracy")
+    plt.title(f"Per-Client Accuracy by Phase — {name}")
+    plt.legend(ncol=2); plt.grid(True); plt.tight_layout()
+    plt.savefig(OUT / f"clients_by_phase_{name}.png", dpi=150); plt.close()
+
 
 print(f"Saved plots to: {OUT.resolve()}")

@@ -26,8 +26,7 @@ import csv
 import flwr as fl
 import numpy as np
 import matplotlib.pyplot as plt
-from src.config import CLIENTS, FREEZE_CFG, ROUNDS, RESULTS_DIR, EXPERIMENT, N_CLASSES
-
+from src.config import CLIENTS, FREEZE_CFG, ROUNDS, RESULTS_DIR, EXPERIMENT, N_CLASSES, TUNING
 
 # -------------------------------------------------------------------------
 # Global results logging
@@ -71,23 +70,37 @@ def start_server():
 # -------------------------------------------------------------------------
 # Helper methods for logging
 # -------------------------------------------------------------------------
+
+# --- Append a row to the global results CSV ------------------------------
 def _append_global_row(server_round: int, acc: float, loss: float) -> None:
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-    path = RESULTS_DIR / f"{EXPERIMENT['run_name']}.csv"
-    header = ["client_id", "round", "accuracy", "loss",
-              "frozen_layers", "is_frozen", "wall_time_sec", "trainable_params"]
+    exp = EXPERIMENT["run_name"]
+
+    if TUNING.get("log_phase"):
+        phase = (TUNING["phase_labels"]["enabled"] if TUNING.get("enabled") else
+                 TUNING["phase_labels"]["disabled"])
+    else:
+        phase = ""
+
+    if TUNING.get("log_phase") and TUNING.get("log_mode") == "separate":
+        path = RESULTS_DIR / f"{exp}_{phase or 'no_cv'}.csv"
+        header = ["client_id","round","accuracy","loss",
+                  "frozen_layers","is_frozen","wall_time_sec","trainable_params"]
+        row = ["GLOBAL", server_round, f"{acc:.4f}", f"{loss:.4f}", "", "", "", ""]
+    else:
+        path = RESULTS_DIR / f"{exp}.csv"
+        header = ["client_id","round","accuracy","loss",
+                  "frozen_layers","is_frozen","wall_time_sec","trainable_params","phase"]
+        row = ["GLOBAL", server_round, f"{acc:.4f}", f"{loss:.4f}", "", "", "", "", phase]
 
     write_header = not path.exists()
     with open(path, "a", newline="") as f:
         w = csv.writer(f)
         if write_header:
             w.writerow(header)
-        w.writerow([
-            GLOBAL_ROW["client_id"], server_round, f"{acc:.4f}", f"{loss:.4f}",
-            GLOBAL_ROW["frozen_layers"], GLOBAL_ROW["is_frozen"],
-            GLOBAL_ROW["wall_time_sec"], GLOBAL_ROW["trainable_params"]
-        ])
+        w.writerow(row)
 
+# --- Append per-class accuracy and confusion matrix -----------------------
 def _append_perclass_row(server_round: int, cm: np.ndarray) -> None:
     path = RESULTS_DIR / f"{EXPERIMENT['run_name']}_perclass.csv"
     header = ["round"] + [f"acc_{i}" for i in range(N_CLASSES)]
@@ -100,6 +113,7 @@ def _append_perclass_row(server_round: int, cm: np.ndarray) -> None:
             w.writerow(header)
         w.writerow([server_round] + [f"{a:.4f}" for a in accs])
 
+# --- Append confusion matrix in long format ------------------------------
 def _append_confusion_rows(server_round: int, cm: np.ndarray) -> None:
     path = RESULTS_DIR / f"{EXPERIMENT['run_name']}_cm.csv"
     write_header = not path.exists()
@@ -111,6 +125,7 @@ def _append_confusion_rows(server_round: int, cm: np.ndarray) -> None:
             for j in range(N_CLASSES):
                 w.writerow([server_round, i, j, int(cm[i, j])])
 
+# --- Save confusion matrix heatmap --------------------------------------
 def _save_confusion_heatmap(cm: np.ndarray, server_round: int) -> None:
     viz = RESULTS_DIR / "viz"
     viz.mkdir(parents=True, exist_ok=True)
