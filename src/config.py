@@ -56,7 +56,7 @@ EPOCHS_LOCAL = 2            # Local epochs per client per round
 BATCH_SIZE = 64
 LR = 1e-3                   # Learning rate for Adam optimizer
 FEDPROX_MU = 0.01           # FedProx proximal term (0 to disable)
-ROUNDS = 4                 # Total federated training rounds
+ROUNDS = 20                 # Total federated training rounds
 
 # Freezing configuration (sustainability-driven compute reduction)
 FREEZE_THRESHOLD = 600      # Clients with fewer samples freeze early layers
@@ -67,7 +67,7 @@ FREEZE_CFG = {
     "freeze_mode": "gated", # "gated" or "static"
 }
 # For logging (results/[name].csv) frozen layers vs not (True/False) manually
-FREEZE_ENABLED = False       # toggle this for frozen/non-frozen run
+FREEZE_ENABLED = True       # toggle this for frozen/non-frozen run
 EXPERIMENT = {
     "freeze_enabled": FREEZE_ENABLED,
     "run_name": "frozen_run" if FREEZE_ENABLED else "non_frozen_run",
@@ -94,7 +94,7 @@ MODEL = {
 }
 
 TUNING = {
-    "enabled": False,             # toggle HPT/CV on/off
+    "enabled": True,             # toggle HPT/CV on/off
     "log_phase": True,           # add a 'phase' label to rows
     "log_mode": "same",          # "same" -> write into <run>.csv with 'phase'
                                  # "separate" -> write <run>_<phase>.csv (no 'phase' col)

@@ -18,7 +18,8 @@ dataset/ptb-xl-a-large-publicly-available-electrocardiography-dataset-1.0.3
 !dataset/**/*.py
 
 # Ignore experiment outputs
-results/
+results/dropbox
+results/viz
 checkpoints/
 *.pt
 *.pth

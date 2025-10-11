@@ -48,6 +48,24 @@ percls   = {k:v for k,v in percls.items() if v is not None}
 conf_long= {k:v for k,v in conf_long.items() if v is not None}
 
 
+# --------------------------------------------------------------------------
+# Helper functions
+# --------------------------------------------------------------------------
+def perclass_columns(df):
+    """Return mapping label-> Series, accepting acc_<name> or acc_<index>."""
+    cols = [c for c in df.columns if c.startswith("acc_")]
+    mapping = {}
+    for c in cols:
+        key = c[4:]
+        if key.isdigit():
+            idx = int(key)
+            if 0 <= idx < len(SUPERCLASSES):
+                mapping[SUPERCLASSES[idx]] = df[c]
+        else:
+            mapping[key] = df[c]
+    return mapping
+
+
 # -------------------------------------------------------------------------
 # Plotting
 # -------------------------------------------------------------------------
@@ -118,35 +136,36 @@ if all(k in dfs for k in ("frozen", "non_frozen")):
 
 
 
-# -- Per-class accuracy over rounds (line plot) -------------------
+# -- Per-class accuracy over rounds (line plot) --
 if percls:
     plt.figure()
     if "non_frozen" in percls:
-        nf = percls["non_frozen"].sort_values("round")
-        for c in SUPERCLASSES:
-            plt.plot(nf["round"], nf[f"acc_{c}"], label=f"{c} (unfrozen)")
+        nf = percls["non_frozen"].sort_values(by="round")
+        for label, series in perclass_columns(nf).items():
+            plt.plot(nf["round"], series, label=f"{label} (unfrozen)")
     if "frozen" in percls:
-        fr = percls["frozen"].sort_values("round")
-        for c in SUPERCLASSES:
-            plt.plot(fr["round"], fr[f"acc_{c}"], linestyle="--", label=f"{c} (frozen)")
+        fr = percls["frozen"].sort_values(by="round")
+        for label, series in perclass_columns(fr).items():
+            plt.plot(fr["round"], series, linestyle="--", label=f"{label} (frozen)")
     plt.xlabel("Round"); plt.ylabel("Per-class Accuracy")
     plt.title("Per-class Accuracy per Round")
     plt.legend(ncol=2); plt.grid(True); plt.tight_layout()
     plt.savefig(OUT / "perclass_over_rounds.png", dpi=150); plt.close()
 
-
-
-# -- Final-round per-class accuracy (bar) -------------------------
+# -- Final-round per-class accuracy (bar) --
 if percls:
-    labels = SUPERCLASSES; x = np.arange(len(labels)); width = 0.35
+    labels = SUPERCLASSES
+    x = np.arange(len(labels)); width = 0.35
     plt.figure()
     if "non_frozen" in percls:
-        nf_last = percls["non_frozen"].sort_values("round").tail(1)
-        y_nf = [float(nf_last[f"acc_{c}"].values[0]) for c in labels]
+        nf_last = percls["non_frozen"].sort_values(by="round").tail(1)
+        nf_map  = perclass_columns(nf_last)
+        y_nf    = [float(nf_map.get(lbl, pd.Series([0])).iloc[0]) for lbl in labels]
         plt.bar(x - width/2, y_nf, width, label="Unfrozen")
     if "frozen" in percls:
-        fr_last = percls["frozen"].sort_values("round").tail(1)
-        y_fr = [float(fr_last[f"acc_{c}"].values[0]) for c in labels]
+        fr_last = percls["frozen"].sort_values(by="round").tail(1)
+        fr_map  = perclass_columns(fr_last)
+        y_fr    = [float(fr_map.get(lbl, pd.Series([0])).iloc[0]) for lbl in labels]
         plt.bar(x + width/2, y_fr, width, label="Frozen")
     plt.xticks(x, labels); plt.ylabel("Accuracy")
     plt.title("Final-Round Per-class Accuracy")
@@ -162,19 +181,12 @@ for name, dfc in conf_long.items():
     r = int(dfc["round"].max())
     sub = dfc[dfc["round"] == r]
     n = len(SUPERCLASSES)
-
-    # pivot to matrix (rows=true, cols=pred), fill missing with 0
-    cm = (
-        sub.pivot_table(index="true", columns="pred", values="count",
-                        aggfunc="sum", fill_value=0)
-           .reindex(index=range(n), columns=range(n), fill_value=0)
-           .to_numpy(dtype=float)
-    )
-
+    cm = (sub.pivot_table(index="true", columns="pred", values="count", aggfunc="sum", fill_value=0)
+              .reindex(index=range(n), columns=range(n), fill_value=0)
+              .to_numpy(dtype=float))
     with np.errstate(invalid="ignore", divide="ignore"):
-        cmn = cm / cm.sum(axis=1, keepdims=True)
-        cmn = np.nan_to_num(cmn)
-    plt.figure(figsize=(6, 5))
+        cmn = np.nan_to_num(cm / cm.sum(axis=1, keepdims=True))
+    plt.figure(figsize=(6,5))
     plt.imshow(cmn, aspect="auto")
     plt.title(f"Confusion Matrix — {name} (round {r})")
     plt.xlabel("Predicted"); plt.ylabel("True")
@@ -182,8 +194,7 @@ for name, dfc in conf_long.items():
     plt.yticks(range(n), SUPERCLASSES)
     plt.colorbar(label="Row-normalized")
     plt.tight_layout()
-    plt.savefig(OUT / f"confusion_{name}_r{r:02d}.png", dpi=150)
-    plt.close()
+    plt.savefig(OUT / f"confusion_{name}_r{r:02d}.png", dpi=150); plt.close()
 
 
 
@@ -192,15 +203,13 @@ for name, df in dfs.items():
     if "phase" not in df.columns:
         continue
     g = df[df["client_id"] == "GLOBAL"].copy()
-    pre = g[g["phase"].eq(PHASE_DISABLED)].sort_values(by="round")
+    pre  = g[g["phase"].eq(PHASE_DISABLED)].sort_values(by="round")
     post = g[g["phase"].eq(PHASE_ENABLED)].sort_values(by="round")
     if pre.empty and post.empty:
         continue
     plt.figure()
-    if not pre.empty:
-        plt.plot(pre["round"], pre["accuracy"], label=f"{name} (pre-CV)")
-    if not post.empty:
-        plt.plot(post["round"], post["accuracy"], label=f"{name} (post-CV)")
+    if not pre.empty:  plt.plot(pre["round"], pre["accuracy"], label=f"{name} (no-CV)")
+    if not post.empty: plt.plot(post["round"], post["accuracy"], label=f"{name} (post-CV)")
     plt.xlabel("Round"); plt.ylabel("Global Accuracy")
     plt.title(f"Global Accuracy by Phase — {name}")
     plt.legend(); plt.grid(True); plt.tight_layout()
@@ -214,10 +223,8 @@ for name, df in dfs.items():
         continue
     plt.figure()
     sub = df[df["client_id"] != "GLOBAL"].copy()
-    for phase, style in [("pre_cv","-"), ("post_cv","--")]:
+    for phase, style in [(PHASE_DISABLED,"-"), (PHASE_ENABLED,"--")]:
         grp = sub[sub["phase"].eq(phase)]
-        if grp.empty:
-            continue
         for cid, g in grp.groupby("client_id"):
             g = g.sort_values(by="round")
             plt.plot(g["round"], g["accuracy"], linestyle=style, alpha=0.7,

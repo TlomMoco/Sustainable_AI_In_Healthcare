@@ -26,7 +26,7 @@ import csv
 import flwr as fl
 import numpy as np
 import matplotlib.pyplot as plt
-from src.config import CLIENTS, FREEZE_CFG, ROUNDS, RESULTS_DIR, EXPERIMENT, N_CLASSES, TUNING
+from src.config import CLIENTS, FREEZE_CFG, ROUNDS, RESULTS_DIR, EXPERIMENT, N_CLASSES, TUNING, SUPERCLASSES
 
 # -------------------------------------------------------------------------
 # Global results logging
@@ -103,10 +103,10 @@ def _append_global_row(server_round: int, acc: float, loss: float) -> None:
 # --- Append per-class accuracy and confusion matrix -----------------------
 def _append_perclass_row(server_round: int, cm: np.ndarray) -> None:
     path = RESULTS_DIR / f"{EXPERIMENT['run_name']}_perclass.csv"
-    header = ["round"] + [f"acc_{i}" for i in range(N_CLASSES)]
+    header = ["round"] + [f"acc_{c}" for c in SUPERCLASSES]
     write_header = not path.exists()
     support = cm.sum(axis=1)
-    accs = [(cm[i, i] / support[i]) if support[i] > 0 else 0.0 for i in range(N_CLASSES)]
+    accs = [(cm[i, i] / support[i]) if support[i] > 0 else 0.0 for i in range(len(SUPERCLASSES))]
     with open(path, "a", newline="") as f:
         w = csv.writer(f)
         if write_header:
@@ -121,8 +121,9 @@ def _append_confusion_rows(server_round: int, cm: np.ndarray) -> None:
         w = csv.writer(f)
         if write_header:
             w.writerow(["round", "true", "pred", "count"])
-        for i in range(N_CLASSES):
-            for j in range(N_CLASSES):
+        n = cm.shape[0]
+        for i in range(n):
+            for j in range(n):
                 w.writerow([server_round, i, j, int(cm[i, j])])
 
 # --- Save confusion matrix heatmap --------------------------------------

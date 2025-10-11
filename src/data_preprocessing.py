@@ -119,7 +119,7 @@ def _hrv_from_peaks(peaks: np.ndarray, fs: float) -> Dict[str, float]:
     if rr.size < 2:
         return {"HR_bpm": np.nan, "SDNN_ms": np.nan, "RMSSD_ms": np.nan, "N_beats": int(peaks.size)}
     hr = 60.0 / rr.mean()
-    sdnn = np.std(rr, ddof=1) * 1000.0
+    sdnn = np.std(rr, ddof=1) * 1000
     rmssd = np.sqrt(np.mean(np.diff(rr) ** 2)) * 1000.0
     return {"HR_bpm": float(hr), "SDNN_ms": float(sdnn), "RMSSD_ms": float(rmssd), "N_beats": int(peaks.size)}
 
