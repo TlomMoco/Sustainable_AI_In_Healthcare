@@ -22,7 +22,6 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.linear_model import LogisticRegression
 
 
-
 # -------------------------------------------------------------------------
 # Classical ML baseline (optional reference)
 # -------------------------------------------------------------------------
@@ -35,62 +34,87 @@ def create_logistic_baseline() -> Pipeline:
 
 
 # -------------------------------------------------------------------------
+# Helpers: input layout handling + generic classification head
+# -------------------------------------------------------------------------
+def _to_NCT(x: torch.Tensor) -> torch.Tensor:
+    """
+    Ensure input is [N, C, T]:
+      - If x is [N, T, C], permute to [N, C, T]
+      - If x is already [N, C, T], return as-is
+    """
+    if x.dim() != 3:
+        raise ValueError(f"Expected a 3D tensor [N,T,C] or [N,C,T], got {tuple(x.shape)}")
+    N, A, B = x.shape
+    # Heuristic: 12-lead ECG => channels likely 12
+    if A == 12:  # [N, C, T]
+        return x
+    if B == 12:  # [N, T, C]
+        return x.permute(0, 2, 1)
+    # Fall back: assume current is [N, C, T]
+    return x
+
+
+def _time_dim(x: torch.Tensor) -> int:
+    """Return the index of the time dimension (after we may have NCT)."""
+    # After standardization we use [N, C, T], so time dim is -1
+    return -1
+
+
+def _cls_head(in_features: int, n_classes: int, binary: bool = False) -> nn.Module:
+    return nn.Linear(in_features, 1 if binary else n_classes)
+
+
+# -------------------------------------------------------------------------
 # CNN architecture
 # -------------------------------------------------------------------------
 class TinyECGCNN(nn.Module):
     """
-    A small but expressive 1D CNN for 12-lead ECG classification.
-
-    Input:  (B, 12, T)
-    Output: (B, n_classes)
+    Robust 1D CNN for 12-lead ECG classification.
+    Accepts [N,T,C] or [N,C,T]; internally standardized to [N,C,T].
+    Exposes `features` and `head` for freezing policies.
     """
-
-    def __init__(self, n_classes: int):
+    def __init__(self, n_classes: int, input_c: int = 12, binary: bool = False):
         super().__init__()
+        self.binary = binary
 
         self.features = nn.Sequential(
-            # Block 1 — early temporal reduction
-            nn.Conv1d(12, 32, kernel_size=7, stride=2, padding=3),
+            nn.Conv1d(input_c, 32, kernel_size=7, stride=2, padding=3),
             nn.BatchNorm1d(32),
             nn.ReLU(),
-            nn.MaxPool1d(2),   # → T/4 total reduction
+            nn.MaxPool1d(2),   # → T/4
 
-            # Block 2
             nn.Conv1d(32, 64, kernel_size=5, stride=1, padding=2),
             nn.BatchNorm1d(64),
             nn.ReLU(),
             nn.MaxPool1d(2),   # → T/8
 
-            # Block 3
             nn.Conv1d(64, 96, kernel_size=5, stride=1, padding=2),
             nn.BatchNorm1d(96),
             nn.ReLU(),
 
-            # Block 4
             nn.Conv1d(96, 128, kernel_size=3, stride=1, padding=1),
             nn.BatchNorm1d(128),
             nn.ReLU(),
 
-            # Block 5
             nn.Conv1d(128, 160, kernel_size=3, stride=1, padding=1),
             nn.BatchNorm1d(160),
             nn.ReLU(),
 
-            nn.AdaptiveAvgPool1d(1),  # Global average pooling → (B, 160, 1)
+            nn.AdaptiveAvgPool1d(1),  # → [N, 160, 1]
         )
 
         self.head = nn.Sequential(
-            nn.Flatten(),          # → (B, 160)
+            nn.Flatten(),              # → [N, 160]
             nn.Linear(160, 96),
             nn.ReLU(),
             nn.Dropout(0.5),
-            nn.Linear(96, n_classes)
+            _cls_head(96, n_classes, binary),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Forward pass."""
-        z = self.features(x)     # (B, 160, 1)
-        return self.head(z)      # (B, n_classes)
+        x = _to_NCT(x)                # [N, C, T]
+        z = self.features(x)          # [N, 160, 1]
+        return self.head(z)           # [N, n_classes] or [N, 1]
 
 
 # -------------------------------------------------------------------------
@@ -99,40 +123,28 @@ class TinyECGCNN(nn.Module):
 class TinyECGLSTM(nn.Module):
     """
     Lightweight LSTM model for sequential ECG processing.
-
-    Input:  (B, 12, T)
-    Output: (B, n_classes)
-
-    The model exposes self.features as a ModuleList to allow
-    dynamic freezing during federated training.
+    Accepts [N,T,C] or [N,C,T]; standardized internally.
+    Exposes `features` (ModuleList) and `head` for freezing policies.
     """
-
-    def __init__(
-        self,
-        n_classes: int,
-        hidden: int = 128,
-        layers: int = 1,
-        bidir: bool = True,
-        use_stem: bool = False,
-    ):
+    def __init__(self, n_classes: int, input_c: int = 12, hidden: int = 128,
+                 layers: int = 1, bidir: bool = True, binary: bool = False, use_stem: bool = False):
         super().__init__()
+        self.binary = binary
         self.use_stem = use_stem
 
-        # Optional convolutional stem for feature extraction
         if use_stem:
-            self.stem = nn.Sequential(
-                nn.Conv1d(12, 32, kernel_size=7, stride=2, padding=3),
+            stem = nn.Sequential(
+                nn.Conv1d(input_c, 32, kernel_size=7, stride=2, padding=3),
                 nn.BatchNorm1d(32),
                 nn.ReLU(),
                 nn.MaxPool1d(2),
             )
             rnn_in = 32
         else:
-            self.stem = nn.Identity()
-            rnn_in = 12
+            stem = nn.Identity()
+            rnn_in = input_c
 
-        # LSTM encoder
-        self.rnn = nn.LSTM(
+        rnn = nn.LSTM(
             input_size=rnn_in,
             hidden_size=hidden,
             num_layers=layers,
@@ -141,144 +153,135 @@ class TinyECGLSTM(nn.Module):
         )
         rnn_out = hidden * (2 if bidir else 1)
 
-        # Fully connected head
+        self.features = nn.ModuleList([stem, rnn])
         self.head = nn.Sequential(
             nn.Linear(rnn_out, 96),
             nn.ReLU(),
             nn.Dropout(0.5),
-            nn.Linear(96, n_classes),
+            _cls_head(96, n_classes, binary),
         )
 
-        # Expose stem + RNN as 'features' for freezing policy
-        self.features = nn.ModuleList([self.stem, self.rnn])
-
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Forward pass."""
-        z = self.stem(x)          # (B, C, T)
-        z = z.permute(0, 2, 1)    # (B, T, C)
-        z, _ = self.rnn(z)        # (B, T, H)
-        z = z.mean(dim=1)         # Temporal pooling
+        x = _to_NCT(x)          # [N, C, T]
+        # To RNN: [N, T, C’]
+        z = self.features[0](x) if self.use_stem else x
+        if isinstance(self.features[0], nn.Sequential) and self.use_stem:
+            # stem output is [N, C’, T]
+            z = z.permute(0, 2, 1)
+        else:
+            # x is [N, C, T] → [N, T, C]
+            z = z.permute(0, 2, 1)
+        z, _ = self.features[1](z)  # LSTM
+        z = z.mean(dim=1)           # temporal pooling
         return self.head(z)
 
 
 # -------------------------------------------------------------------------
-# Model factory
+# Simple RNN (tanh) architecture
 # -------------------------------------------------------------------------
-def create_model(n_classes: int, model_type: str = "cnn", **kwargs) -> nn.Module:
+class RNNSimple(nn.Module):
     """
-    Factory function for model creation.
-
-    Args:
-        n_classes: number of output classes (5 for PTB-XL)
-        model_type: 'cnn' or 'lstm'
-        kwargs: extra parameters (hidden, layers, bidir, etc.)
-
-    Returns:
-        torch.nn.Module: model instance
+    Two-layer vanilla RNN with dropout in between.
+    Accepts [N,T,C] or [N,C,T]; standardized internally.
+    Exposes `features` and `head`.
     """
-    if model_type == "cnn":
-        return TinyECGCNN(n_classes)
-    elif model_type == "lstm":
-        return TinyECGLSTM(n_classes, **kwargs)
-    else:
-        raise ValueError(f"Unknown model_type: {model_type}")
-
-
-
-
-
-
-
-
-# ---------
-# ## 12) Models + Heads (from notebook)
-# ---------
-import torch
-from torch import nn
-from . import config as CFG
-
-def _head(in_features: int, n_classes: int, binary: bool = False):
-    return nn.Linear(in_features, 1 if binary else n_classes)
-
-class TinyECGCNN(nn.Module):
-    def __init__(self, n_classes: int, input_c: int = 12, binary: bool = False):
+    def __init__(self, n_classes: int, input_c: int = 12, hidden1: int = 128,
+                 hidden2: int = 64, binary: bool = False):
         super().__init__()
         self.binary = binary
-        self.avg2 = nn.AvgPool1d(2)
-        self.body = nn.Sequential(
-            nn.Conv1d(input_c, 32, 7, padding=3), nn.BatchNorm1d(32), nn.ReLU(), nn.MaxPool1d(2),
-            nn.Conv1d(32, 64, 5, padding=2),     nn.BatchNorm1d(64), nn.ReLU(), nn.MaxPool1d(2),
-            nn.Conv1d(64,128, 3, padding=1),     nn.BatchNorm1d(128), nn.ReLU(),
-            nn.AdaptiveAvgPool1d(1)
+        self.rnn1 = nn.RNN(input_c, hidden1, nonlinearity="tanh", batch_first=True)
+        self.drop = nn.Dropout(0.15)
+        self.rnn2 = nn.RNN(hidden1, hidden2, nonlinearity="tanh", batch_first=True)
+        self.head = nn.Sequential(
+            nn.Linear(hidden2, 96),
+            nn.ReLU(),
+            _cls_head(96, n_classes, binary),
         )
-        self.fc = _head(128, n_classes, binary)
-    def forward(self, x):              # x: [N, T, C]
-        x = x.permute(0,2,1)           # → [N, C, T]
-        x = self.avg2(x)
-        x = self.body(x).squeeze(-1)   # [N, 128]
-        return self.fc(x)
+        self.features = nn.ModuleList([self.rnn1, self.rnn2])
 
-class TinyECGLSTM(nn.Module):
-    def __init__(self, n_classes: int, input_c: int = 12, binary: bool = False):
-        super().__init__()
-        self.binary = binary
-        self.l1 = nn.LSTM(input_c, 128, batch_first=True)
-        self.drop = nn.Dropout(0.15)
-        self.l2 = nn.LSTM(128, 64, batch_first=True)
-        self.fc1 = nn.Linear(64, 96)
-        self.fc2 = _head(96, n_classes, binary)
-    def forward(self, x):
-        x = x[:, ::2, :]
-        x, _ = self.l1(x); x = self.drop(x)
-        x, _ = self.l2(x)
-        x = x[:, -1, :]
-        x = torch.relu(self.fc1(x))
-        return self.fc2(x)
-
-class RNNsimple(nn.Module):
-    # ---------
-    # ## 12) Models — RNN (from notebook)
-    # ---------
-    def __init__(self, n_classes: int, input_c: int = 12, binary: bool = False):
-        super().__init__()
-        self.binary = binary
-        self.rnn1 = nn.RNN(input_c, 128, batch_first=True)
-        self.drop = nn.Dropout(0.15)
-        self.rnn2 = nn.RNN(128, 64, batch_first=True)
-        self.fc1  = nn.Linear(64, 96)
-        self.fc2  = _head(96, n_classes, binary)
-    def forward(self, x):
-        x = x[:, ::2, :]
-        x, _ = self.rnn1(x); x = self.drop(x)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = _to_NCT(x)              # [N, C, T]
+        x = x.permute(0, 2, 1)      # [N, T, C]
+        x, _ = self.rnn1(x)
+        x = self.drop(x)
         x, _ = self.rnn2(x)
-        x = x[:, -1, :]
-        x = torch.relu(self.fc1(x))
-        return self.fc2(x)
+        x = x[:, -1, :]             # last timestep
+        return self.head(x)
 
-class ANNpooled(nn.Module):
-    # ---------
-    # ## 12) Models — ANN (from notebook)
-    # ---------
+
+# -------------------------------------------------------------------------
+# ANN with temporal mean pooling
+# -------------------------------------------------------------------------
+class ANNPooled(nn.Module):
+    """
+    Simple MLP over per-lead features obtained via temporal mean pooling.
+    Accepts [N,T,C] or [N,C,T]. Exposes `features` (Identity) and `head`.
+    """
     def __init__(self, n_classes: int, input_c: int = 12, binary: bool = False):
         super().__init__()
         self.binary = binary
-        self.fc = nn.Sequential(
+        self.features = nn.Identity()
+        self.mlp = nn.Sequential(
             nn.Linear(input_c, 256), nn.ReLU(), nn.Dropout(0.20),
             nn.Linear(256, 128),     nn.ReLU()
         )
-        self.out = _head(128, n_classes, binary)
-    def forward(self, x):
-        x = x.mean(dim=1)              # global mean over time
-        x = self.fc(x)
-        return self.out(x)
+        self.head = nn.Sequential(_cls_head(128, n_classes, binary))
 
-# ---------
-# ## 12) Factory (extended)
-# ---------
-def create_model(model_type: str, n_classes: int, *, input_c: int = 12, binary: bool = False):
-    mt = str(model_type).lower()
-    if mt == "cnn":  return TinyECGCNN(n_classes, input_c=input_c, binary=binary)
-    if mt == "lstm": return TinyECGLSTM(n_classes, input_c=input_c, binary=binary)
-    if mt == "rnn":  return RNNsimple(n_classes, input_c=input_c, binary=binary)
-    if mt == "ann":  return ANNpooled(n_classes, input_c=input_c, binary=binary)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = _to_NCT(x)                      # [N, C, T]
+        tdim = _time_dim(x)                 # -1
+        x = x.mean(dim=tdim)                # [N, C] → average over time
+        z = self.mlp(x)                     # [N, 128]
+        return self.head(z)                 # [N, n_classes] or [N,1]
+
+
+# -------------------------------------------------------------------------
+# Unified factory (compatible with all current call sites)
+# -------------------------------------------------------------------------
+def create_model(*args, **kwargs) -> nn.Module:
+    """
+    Flexible factory to satisfy both usages in your codebase:
+      - create_model(model_type, n_classes, binary=..., **extra)
+      - create_model(n_classes=<int>, model_type=<str>, **extra)
+      - create_model(n_classes=<int>)  # defaults to cnn
+
+    Supported model_type values: 'cnn', 'lstm', 'rnn', 'ann'
+    Extra kwargs are passed to the specific constructor (e.g., hidden/layers/bidir for LSTM).
+    """
+    model_type = kwargs.pop("model_type", None)
+
+    if len(args) == 0:
+        n_classes = kwargs.pop("n_classes")
+    elif len(args) == 1:
+        # Either (model_type) or (n_classes)
+        if isinstance(args[0], str):
+            model_type = args[0]
+            n_classes = kwargs.pop("n_classes")
+        else:
+            n_classes = int(args[0])
+    elif len(args) >= 2:
+        # (model_type, n_classes)
+        if isinstance(args[0], str):
+            model_type = args[0]
+            n_classes = int(args[1])
+        else:
+            # (n_classes, model_type) — tolerate swapped order
+            n_classes = int(args[0])
+            model_type = str(args[1])
+    else:
+        raise ValueError("create_model: could not parse arguments")
+
+    model_type = (model_type or "cnn").lower()
+    binary = bool(kwargs.pop("binary", False))
+    input_c = int(kwargs.pop("input_c", 12))
+
+    if model_type == "cnn":
+        return TinyECGCNN(n_classes, input_c=input_c, binary=binary)
+    if model_type == "lstm":
+        return TinyECGLSTM(n_classes, input_c=input_c, binary=binary, **kwargs)
+    if model_type == "rnn":
+        return RNNSimple(n_classes, input_c=input_c, binary=binary, **kwargs)
+    if model_type == "ann":
+        return ANNPooled(n_classes, input_c=input_c, binary=binary, **kwargs)
+
     raise ValueError(f"Unknown model_type: {model_type}")

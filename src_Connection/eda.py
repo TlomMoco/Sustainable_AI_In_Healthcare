@@ -1,77 +1,110 @@
-from __future__ import annotations
-import pandas as pd
-import numpy as np
-from rich import print
-
-from src.config import SAMPLE_RATE
-from src.data_loader import load_metadata, map_superclasses, filter_single_label, load_waveform
-from src.utils import plot_signal, summarize_dataset
-
-
-if __name__ == "__main__":
-    ptb = load_metadata()
-    df = map_superclasses(ptb)
-    one = filter_single_label(df)
-
-    summarize_dataset(one, sample_rate=SAMPLE_RATE, title="PTB-XL (Filtered Single-Label)")
-
-
-    print(f"Total records: {len(df):,}")
-    print(f"Single‑label records: {len(one):,}")
-
-
-    # Inspect distributions
-    print(one["y"].value_counts())
-    by_patient = one.groupby("patient_id").size()
-    print("Records per patient — median:", by_patient.median())
-
-
-    # Age/Sex distribution (age 300 is 90+ per PTB‑XL privacy; treat specially in analysis)
-    ages = one["age"].replace({300: np.nan})
-    print("Age — mean (excluding 300):", ages.mean())
-    print(one["sex"].value_counts())
-
-"""
-    # Plot a few example signals
-    for i, (_, row) in enumerate(one.sample(3, random_state=7).iterrows()):
-        sig = load_waveform(row, sampling_rate=SAMPLE_RATE)
-        plot_signal(sig, title=f"ecg_id={row.ecg_id} class={row.y}", save=f"example_{i+1}.png")
-        print("Saved example plots to results/.")"""
-        
 # ---------
 # ## 6) EDA — summaries and a few saved plots (from notebook, condensed)
 # ---------
 import numpy as np, pandas as pd, matplotlib.pyplot as plt, textwrap
 from pathlib import Path
 from . import config as CFG
+from .data_loader import load_waveform_np
+from .utils import log
 
 ART_DIR = Path(CFG.ART_DIR) / "figs"
 ART_DIR.mkdir(parents=True, exist_ok=True)
 
-def _save(fig, name):
+def _save(fig, name: str):
     out = ART_DIR / name
+    out.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out, dpi=300, bbox_inches="tight")
+    plt.close(fig)
     print("Saved:", out)
 
 def class_counts_bar(features_df: pd.DataFrame):
     labs = features_df["label"].astype(str)
     counts = labs.value_counts().sort_index()
-    fig, ax = plt.subplots(figsize=(10,5))
+    if counts.empty: 
+        log("class_counts_bar: no labels to plot."); 
+        return
+    fig, ax = plt.subplots(figsize=(9,5))
     xs = np.arange(len(counts))
     ax.bar(xs, counts.values, width=0.6)
     ax.set_xticks(xs); ax.set_xticklabels(counts.index)
     ax.set_title("Class counts"); ax.set_ylabel("Count"); ax.grid(axis="y", alpha=0.3)
-    _save(fig, "eda_class_counts.png"); plt.close(fig)
+    _save(fig, "eda_class_counts.png")
 
 def records_per_year(features_df: pd.DataFrame):
-    if "recording_date" not in features_df.columns: return
+    if "recording_date" not in features_df.columns:
+        log("records_per_year: 'recording_date' not present — skipping.")
+        return
     dt = pd.to_datetime(features_df["recording_date"], errors="coerce")
     yrs = dt.dt.year.value_counts().sort_index()
-    if yrs.empty: return
-    fig, ax = plt.subplots(figsize=(11,5))
+    if yrs.empty: 
+        log("records_per_year: no valid years — skipping.")
+        return
+    fig, ax = plt.subplots(figsize=(10,5))
     xs = np.arange(len(yrs))
     ax.bar(xs, yrs.values, width=0.7)
     ax.set_xticks(xs); ax.set_xticklabels(yrs.index.astype(str), rotation=50, ha="right")
     ax.set_title("Records per year"); ax.set_ylabel("Count"); ax.grid(axis="y", alpha=0.3)
-    _save(fig, "eda_records_per_year.png"); plt.close(fig)
+    _save(fig, "eda_records_per_year.png")
 
+def age_histogram(meta_df: pd.DataFrame):
+    if "age" not in meta_df.columns:
+        log("age_histogram: 'age' not present — skipping.")
+        return
+    ages = meta_df["age"].replace({300: np.nan}).dropna()
+    if ages.empty:
+        log("age_histogram: no usable ages — skipping.")
+        return
+    fig, ax = plt.subplots(figsize=(8,5))
+    ax.hist(ages.values, bins=20)
+    ax.set_title("Age distribution (300→NaN excluded)")
+    ax.set_xlabel("Age"); ax.set_ylabel("Count"); ax.grid(axis="y", alpha=0.3)
+    _save(fig, "eda_age_hist.png")
+
+def sex_distribution(meta_df: pd.DataFrame):
+    if "sex" not in meta_df.columns:
+        log("sex_distribution: 'sex' not present — skipping.")
+        return
+    counts = meta_df["sex"].value_counts()
+    if counts.empty:
+        log("sex_distribution: empty — skipping.")
+        return
+    fig, ax = plt.subplots(figsize=(6,6))
+    ax.pie(counts.values, labels=counts.index.astype(str), autopct="%1.1f%%")
+    ax.set_title("Sex distribution")
+    _save(fig, "eda_sex_pie.png")
+
+def sample_signal_plots(features_df: pd.DataFrame, n: int = 3):
+    """Optional: save a few example ECGs (guarded by CFG.EDA_SKIP_HEAVY)."""
+    if CFG.EDA_SKIP_HEAVY:
+        log("sample_signal_plots: CFG.EDA_SKIP_HEAVY=True — skipping waveform plots.")
+        return
+    if "record_path" not in features_df.columns:
+        log("sample_signal_plots: 'record_path' missing — skipping.")
+        return
+    ex = features_df.sample(min(n, len(features_df)), random_state=7)
+    T  = max(1, CFG.SEQ_LEN // max(1, CFG.DOWNSAMPLE_FACTOR))
+    for i, (_, row) in enumerate(ex.iterrows(), start=1):
+        try:
+            X = load_waveform_np(str(row["record_path"]), T=T, factor=CFG.DOWNSAMPLE_FACTOR)  # (T, C)
+            fig, ax = plt.subplots(figsize=(10,4))
+            ax.plot(X[:,0])  # lead I (or first column after channel mapping)
+            ax.set_title(f"Example #{i} — id={row.get('ecg_id','?')} label={row.get('label','?')}")
+            ax.set_xlabel("Samples"); ax.set_ylabel("Amplitude"); ax.grid(alpha=0.25)
+            _save(fig, f"example_signal_{i}.png")
+        except Exception as e:
+            log(f"sample_signal_plots: failed on {row.get('record_path')} ({e})")
+
+def run_basic_eda(features_df: pd.DataFrame, meta_df: pd.DataFrame | None = None):
+    """
+    Generate a small EDA pack into ART_DIR using the feature/minimal tables.
+    Pass the same `features_df` returned by data_loader.make_feature_table(...).
+    If you also keep a richer meta table, pass it as `meta_df`; otherwise this
+    function will use columns present in `features_df` when available.
+    """
+    meta = meta_df if meta_df is not None else features_df
+    class_counts_bar(features_df)
+    records_per_year(meta)
+    age_histogram(meta)
+    sex_distribution(meta)
+    sample_signal_plots(features_df)
+    log("EDA complete.")

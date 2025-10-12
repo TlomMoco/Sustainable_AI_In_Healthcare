@@ -1,6 +1,9 @@
 from __future__ import annotations
 import subprocess
-
+import argparse
+import sys
+import time
+from pathlib import Path
 
 # Minimal holder to show where to add experiment loops/config sweeps
 
@@ -9,19 +12,17 @@ SERVER_CMD = ["python", "-m", "src.Server"]
 CLIENT_CMD = lambda cid: ["python", "-m", "src.Client", "--cid", str(cid)]
 
 
-if __name__ == "__main__":
+if __name__ == "__main__" and False:
     # Example: run centralized once
     subprocess.run(CENTRALIZED_CMD, check=True)
-    # For federated, open multiple terminals or use process manager (tmux, etc.)
-
-
+    # For federated, open multiple terminals or use process manager (tmux, etc.))
 
 
 # ---------
 # ## 14) K-Fold CV for All Models (from notebook)
 # ---------
 from __future__ import annotations
-import time, math
+import time as _time, math
 import numpy as np
 import pandas as pd
 import torch
@@ -29,11 +30,17 @@ from torch import nn, optim
 from torch.utils.data import Dataset, DataLoader
 from sklearn.model_selection import StratifiedKFold
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
+
 from . import config as CFG
 from .models import create_model
-from .utils import torch_loader_kwargs, log
-from .data_loader import load_waveform_np
+from .utils import torch_loader_kwargs, log, set_seed, ensure_dir
+from .data_loader import load_metadata as _dl_load_metadata  # legacy use (kept for context)
+from .data_loader import make_feature_table as _dl_make_feature_table
+from .data_preprocessing import make_label_encoder
 
+# -----------------------------
+# Core CV helpers (unchanged)
+# -----------------------------
 def _criterion(binary: bool, ce_weights=None, bce_pos_weight=None):
     if binary:
         if bce_pos_weight:
@@ -52,6 +59,7 @@ class _PairDS(Dataset):
         self.T = max(1, CFG.SEQ_LEN // max(1, CFG.DOWNSAMPLE_FACTOR))
     def __len__(self): return len(self.paths)
     def __getitem__(self, i):
+        from .data_loader import load_waveform_np
         x = load_waveform_np(self.paths[i], T=self.T, factor=CFG.DOWNSAMPLE_FACTOR)
         return torch.from_numpy(x), int(self.y[i])
 
@@ -96,7 +104,8 @@ def _fit_for_epochs(model, dl_tr, dl_va, epochs, binary, device):
         model.load_state_dict(best_state)
     return model
 
-def run_kfold_all(train_paths, y_train_encoded, label_encoder, *, device=None, model_types=("CNN","RNN","LSTM","ANN")):
+def run_kfold_all(train_paths, y_train_encoded, label_encoder, *, device=None,
+                  model_types=("CNN","RNN","LSTM","ANN")):
     device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
     K = int(CFG.KFOLDS); CV_EPOCHS = int(CFG.CV_EPOCHS)
     skf = StratifiedKFold(n_splits=K, shuffle=True, random_state=CFG.SEED)
@@ -105,16 +114,16 @@ def run_kfold_all(train_paths, y_train_encoded, label_encoder, *, device=None, m
     for mdl_name in model_types:
         log(f"[CV-ALL] {mdl_name}: {K}-fold, epochs={CV_EPOCHS}")
         rows = []
-        start_m = time.time()
+        start_m = _time.time()
         for fold, (tr_i, va_i) in enumerate(skf.split(train_paths, y_train_encoded), 1):
             ds_tr = _PairDS(train_paths[tr_i], y_train_encoded[tr_i])
             ds_va = _PairDS(train_paths[va_i], y_train_encoded[va_i])
             dl_tr = DataLoader(ds_tr, **torch_loader_kwargs(True,  CFG.BATCH_SIZE, device.type))
             dl_va = DataLoader(ds_va, **torch_loader_kwargs(False, CFG.BATCH_SIZE, device.type))
-            t0 = time.time()
+            t0 = _time.time()
             model = create_model(mdl_name, n_classes=len(label_encoder.classes_), binary=(len(label_encoder.classes_)==2))
             model = _fit_for_epochs(model, dl_tr, dl_va, CV_EPOCHS, (len(label_encoder.classes_)==2), device)
-            t_fold = time.time() - t0
+            t_fold = _time.time() - t0
 
             # Evaluate
             y_pred_idx = []
@@ -140,9 +149,103 @@ def run_kfold_all(train_paths, y_train_encoded, label_encoder, *, device=None, m
             })
             log(f"[CV-ALL] {mdl_name} fold {fold}/{K} time={t_fold:.2f}s")
 
-        total_m = time.time() - start_m
+        total_m = _time.time() - start_m
         log(f"[CV-ALL] {mdl_name} total time: {total_m:.2f}s")
         all_rows.extend(rows)
 
     cv_all_df = pd.DataFrame(all_rows).reset_index(drop=True)
     return cv_all_df
+
+
+# -----------------------------
+# Orchestration helpers/CLI
+# -----------------------------
+def run_centralized():
+    log("[RUN] Centralized")
+    subprocess.run(CENTRALIZED_CMD, check=True)
+
+def run_federated(n_clients: int):
+    """
+    Launch the Flower server and N clients in this process.
+    (For production, prefer tmux/screen or a process manager.)
+    """
+    log(f"[RUN] Federated: server + {n_clients} clients")
+    server = subprocess.Popen(SERVER_CMD)
+    procs = []
+    try:
+        # Give the server a brief head start
+        time.sleep(1.0)
+        for cid in range(n_clients):
+            p = subprocess.Popen(CLIENT_CMD(cid))
+            procs.append(p)
+        # Wait for clients to complete
+        rcodes = [p.wait() for p in procs]
+        log(f"[RUN] Clients finished: {rcodes}")
+    except KeyboardInterrupt:
+        log("[RUN] KeyboardInterrupt — terminating children")
+    finally:
+        for p in procs:
+            if p.poll() is None:
+                p.terminate()
+        if server.poll() is None:
+            server.terminate()
+
+def run_cv():
+    """
+    Build minimal deep table, encode labels, and run K-Fold across
+    the selected models (CNN, RNN, LSTM, ANN). Results are saved to CSV.
+    """
+    set_seed(CFG.SEED)
+    log("[RUN] K-Fold CV — building feature/minimal tables…")
+    feat_df, features_df = _dl_make_feature_table(save_csv=True)
+
+    # training pool = entire set (paths + labels), since this is CV
+    paths = features_df["record_path"].astype(str).values
+    y_series = features_df["label"].astype(str)
+    le = make_label_encoder(y_series, y_series)  # union(train,test) = same for CV
+    y_enc = le.transform(y_series.values)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    cv_df = run_kfold_all(paths, y_enc, le, device=device,
+                          model_types=tuple(m for m, flag in {
+                              "CNN":  CFG.RUN_TORCH_CNN,
+                              "RNN":  CFG.RUN_TORCH_RNN,
+                              "LSTM": CFG.RUN_TORCH_LSTM,
+                              "ANN":  CFG.RUN_TORCH_ANN,
+                          }.items() if flag))
+
+    ensure_dir(CFG.RESULTS_DIR)
+    out = Path(CFG.RESULTS_DIR) / f"cv_all_{int(time.time())}.csv"
+    cv_df.to_csv(out, index=False)
+    log(f"[RUN] CV results saved → {out}")
+    print(cv_df.groupby("model")[["accuracy","f1_macro","f1_weighted"]].mean().round(4))
+
+
+def _parse_args(argv=None):
+    p = argparse.ArgumentParser(description="Experiment runner")
+    sub = p.add_subparsers(dest="mode", required=True)
+
+    sub.add_parser("centralized", help="Run centralized training pipeline")
+
+    p_fed = sub.add_parser("federated", help="Run Flower server + N clients")
+    p_fed.add_argument("--clients", type=int, default=CFG.FL_N_CLIENTS, help="Number of clients to launch")
+
+    sub.add_parser("cv", help="Run K-Fold CV over enabled deep models")
+
+    return p.parse_args(argv)
+
+
+def main(argv=None):
+    args = _parse_args(argv)
+    if args.mode == "centralized":
+        run_centralized()
+    elif args.mode == "federated":
+        run_federated(int(getattr(args, "clients", CFG.FL_N_CLIENTS)))
+    elif args.mode == "cv":
+        run_cv()
+    else:
+        raise SystemExit(f"Unknown mode: {args.mode}")
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])

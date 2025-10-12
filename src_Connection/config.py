@@ -130,77 +130,91 @@ GRIDSEARCH = {
 # ---------
 # ## 0) Config — toggles, label mode, training/FL knobs (from notebook)
 # ---------
+# NOTE:
+# - We do NOT redefine globals above (no shadowing of SEED, PTBXL_CSV, BATCH_SIZE, etc.).
+# - Everything here is wrapped in NOTEBOOK so notebooks/scripts can import safely:
+#       from src.config import NOTEBOOK
+# - Paths reuse the top-level PTBXL_CSV/SCP_CSV and are cast to str when needed.
 
-# Paths to PTB-XL metadata (edit to your local paths)
-PTBXL_CSV = "dataset/ptb-xl-a-large-publicly-available-electrocardiography-dataset-1.0.3/ptbxl_database.csv"
-SCP_CSV   = "dataset/ptb-xl-a-large-publicly-available-electrocardiography-dataset-1.0.3/scp_statements.csv"
+NOTEBOOK = {
+    # Paths to PTB-XL metadata (reuse top-level paths; cast to str for pandas)
+    "PTBXL_CSV": str(PTBXL_CSV),
+    "SCP_CSV":   str(SCP_CSV),
 
-# Label/targets
-LABEL_MODE = "5class"            # or "10class"
-SCP_MIN_CONF = 0.0
-BINARY_TASK = False              # keep OFF for 5-class
-BINARY_SCHEME = "NORM_vs_ALL"
-CONFUSION_COLLAPSE_TO_3 = False
+    # Label/targets
+    "LABEL_MODE": "5class",          # or "10class"
+    "SCP_MIN_CONF": 0.0,
+    "BINARY_TASK": False,            # keep OFF for 5-class
+    "BINARY_SCHEME": "NORM_vs_ALL",
+    "CONFUSION_COLLAPSE_TO_3": False,
 
-# Data / runtime
-RECORD_FILE_COL = "filename_lr"  # or "filename_hr"
-FAST_RUN = False
-MAX_RECORDS = None
-SEED = 42
-USE_FEATURE_CACHE = False
-DEEP_CACHE_TO_DISK = True
-SAVE_MIN_TABLE = False
-SAVE_ARTIFACTS = False
-ART_DIR = "test/artifacts"
-EDA_SKIP_HEAVY = True
-LOW_RAM = False
-TORCH_AMP = True
-DEEP_FAST_METADATA_ONLY = True
-DEEP_MAX_TRAIN_FRAC = 0.80
+    # Data / runtime
+    "RECORD_FILE_COL": "filename_lr",  # or "filename_hr"
+    "FAST_RUN": False,
+    "MAX_RECORDS": None,
+    "SEED": SEED,                      # reuse global SEED
+    "USE_FEATURE_CACHE": False,
+    "DEEP_CACHE_TO_DISK": True,
+    "SAVE_MIN_TABLE": False,
+    "SAVE_ARTIFACTS": False,
+    "ART_DIR": "test/artifacts",
+    "EDA_SKIP_HEAVY": True,
+    "LOW_RAM": False,
+    "TORCH_AMP": True,
+    "DEEP_FAST_METADATA_ONLY": True,
+    "DEEP_MAX_TRAIN_FRAC": 0.80,
 
-# Sequence & training
-SEQ_LEN = 600
-DOWNSAMPLE_FACTOR = 2
-BATCH_SIZE = 24
-EPOCHS = 12
-EARLY_STOP_PATIENCE = 0          # disabled
-EARLY_STOP_MONITOR = "acc"
-GRAD_CLIP_NORM = 1.0
-BASE_LR = 3e-4
-RECURRENT_LR = 2e-4
+    # Sequence & training (notebook-only; does NOT affect script BATCH_SIZE/EPOCHS)
+    "SEQ_LEN": 600,
+    "DOWNSAMPLE_FACTOR": 2,
+    "BATCH_SIZE": 24,
+    "EPOCHS": 12,
+    "EARLY_STOP_PATIENCE": 0,          # disabled
+    "EARLY_STOP_MONITOR": "acc",
+    "GRAD_CLIP_NORM": 1.0,
+    "BASE_LR": 3e-4,
+    "RECURRENT_LR": 2e-4,
 
-# Run which deep models
-RUN_TORCH_CNN  = True
-RUN_TORCH_RNN  = True
-RUN_TORCH_LSTM = True
-RUN_TORCH_ANN  = True
-DEEP_HYBRID    = False
+    # Run which deep models
+    "RUN_TORCH_CNN":  True,
+    "RUN_TORCH_RNN":  True,
+    "RUN_TORCH_LSTM": True,
+    "RUN_TORCH_ANN":  True,
+    "DEEP_HYBRID": False,
 
-# CV
-RUN_KFOLD_ALL = True
-KFOLDS = 5
-CV_EPOCHS = 5
+    # CV
+    "RUN_KFOLD_ALL": True,
+    "KFOLDS": 5,
+    "CV_EPOCHS": 5,
 
-# Features
-RUN_FEATURES_BUILD = True
-SAVE_FEATURES_CSV = True
-FEATURES_CSV_NAME = "basic_signal_features.csv"
-FEATURES_USE_FOR_BASELINE = True
+    # Features
+    "RUN_FEATURES_BUILD": True,
+    "SAVE_FEATURES_CSV": True,
+    "FEATURES_CSV_NAME": "basic_signal_features.csv",
+    "FEATURES_USE_FOR_BASELINE": True,
 
-# Federated Learning (Flower)
-FL_BASE_MODEL = "ANN"            # ANN/CNN/RNN/LSTM
-FL_N_CLIENTS = 4
-FL_SAMPLE_FRAC = 0.75
-FL_LOCAL_EPOCHS = 1
-FL_ROUNDS = 10
-FL_PARTITION = "by_patient"      # by_patient | iid | dirichlet
-FL_DIRICHLET_ALPHA = 0.3
-FL_MIN_SAMPLES_PER_CLIENT = 25
-FL_BALANCE_BY_SIZE = True
-FL_SERVER_ADDRESS = "127.0.0.1:8080"   # change as needed
+    # Federated Learning (Flower) — reuse top-level FL knobs to avoid divergence
+    "FL_BASE_MODEL": "ANN",                 # ANN/CNN/RNN/LSTM
+    "FL_N_CLIENTS": CLIENTS,
+    "FL_SAMPLE_FRAC": 0.75,
+    "FL_LOCAL_EPOCHS": 1,
+    "FL_ROUNDS": 10,
+    "FL_PARTITION": "by_patient",           # by_patient | iid | dirichlet
+    "FL_DIRICHLET_ALPHA": 0.3,
+    "FL_MIN_SAMPLES_PER_CLIENT": 25,
+    "FL_BALANCE_BY_SIZE": True,
+    "FL_SERVER_ADDRESS": "127.0.0.1:8080",
+}
 
 # Derived (keep)
-if FAST_RUN and (MAX_RECORDS is None):
-    MAX_RECORDS = 200
-if FAST_RUN:
-    EPOCHS = min(EPOCHS, 4)
+if NOTEBOOK["FAST_RUN"] and (NOTEBOOK["MAX_RECORDS"] is None):
+    NOTEBOOK["MAX_RECORDS"] = 200
+if NOTEBOOK["FAST_RUN"]:
+    NOTEBOOK["EPOCHS"] = min(NOTEBOOK["EPOCHS"], 4)
+
+# Ensure results directories exist (safe no-op if already present)
+try:
+    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    (RESULTS_DIR / "viz").mkdir(parents=True, exist_ok=True)
+except Exception:
+    pass

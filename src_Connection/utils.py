@@ -4,39 +4,93 @@ utils.py — General Utilities
 
 Helper functions shared across modules in the Sustainable AI in Healthcare (DSP5100) project:
   • Reproducibility: seed setting across Python/NumPy/PyTorch
+  • Logging helpers
   • File/dir helpers
   • Plotting of 12-lead ECG signals
   • Basic metrics (acc/F1/AUC) for quick evals
   • Dataset summaries (patients/records/time)
+  • Device/DataLoader utilities
   • Lightweight model reporting utilities
 """
 
 from __future__ import annotations
-import random
 from pathlib import Path
 from typing import Dict
 
+import os
+import time
+import random
 import numpy as np
 import torch
 import matplotlib.pyplot as plt
 from sklearn.metrics import accuracy_score, f1_score, roc_auc_score
 
-from src.config import RESULTS_DIR
+from src.config import RESULTS_DIR, SEED, LOW_RAM
+
+
+# -------------------------------------------------------------------------
+# 0) Logging / timestamps
+# -------------------------------------------------------------------------
+def ts() -> str:
+    return time.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def log(msg: str) -> None:
+    print(f"[{ts()}] {msg}")
 
 
 # -------------------------------------------------------------------------
 # 1) Reproducibility
 # -------------------------------------------------------------------------
-def set_seed(seed: int = 42) -> None:
-    """Set global random seed across Python, NumPy, and PyTorch."""
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
+def set_seed(seed: int | None = None) -> None:
+    """
+    Set global random seed across Python, NumPy, and PyTorch.
+
+    Notes:
+      • Makes CUDA/CuDNN deterministic (slightly slower but reproducible).
+      • If seed is None, uses SEED from config.
+    """
+    s = int(SEED if seed is None else seed)
+    random.seed(s)
+    np.random.seed(s)
+    try:
+        torch.manual_seed(s)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(s)
+        # Deterministic cuDNN for reproducibility
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+    except Exception:
+        pass
+    log(f"Seeds set (seed={s}).")
+
+
+def sanitize_mps_env() -> None:
+    """
+    Set sensible defaults for Apple MPS memory watermarks to reduce OOMs.
+    Safe on non-MPS systems (no-ops).
+    """
+    hi = float(os.environ.get("PYTORCH_MPS_HIGH_WATERMARK_RATIO", 0.92))
+    lo = float(os.environ.get("PYTORCH_MPS_LOW_WATERMARK_RATIO", 0.65))
+    lo = max(0.05, min(lo, hi - 0.05))
+    os.environ["PYTORCH_MPS_HIGH_WATERMARK_RATIO"] = f"{hi:.2f}"
+    os.environ["PYTORCH_MPS_LOW_WATERMARK_RATIO"] = f"{lo:.2f}"
+    log(f"[MPS] LOW={lo:.2f}, HIGH={hi:.2f}")
+
+
+def pick_device() -> torch.device:
+    """
+    Prefer MPS on Apple, then CUDA, else CPU.
+    """
+    if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+        try:
+            _ = torch.empty(1, device="mps")  # sanity check
+            return torch.device("mps")
+        except Exception:
+            pass
     if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-    # Make CUDA/CuDNN deterministic (slightly slower but reproducible)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
+        return torch.device("cuda")
+    return torch.device("cpu")
 
 
 # -------------------------------------------------------------------------
@@ -73,9 +127,9 @@ def plot_signal(sig: np.ndarray, title: str = "ECG (12xT)", save: str | None = N
 # -------------------------------------------------------------------------
 # 4) Metrics
 # -------------------------------------------------------------------------
-def compute_metrics(y_true, y_prob, labels) -> Dict[str, float]:
+def compute_metrics(y_true, y_prob, labels=None) -> Dict[str, float]:
     """
-    Compute basic multi-class metrics from probabilities:
+    Compute basic multi-class metrics from probabilities or logits:
       - accuracy
       - macro F1
       - one-vs-rest ROC-AUC (may be NaN if classes missing)
@@ -88,9 +142,9 @@ def compute_metrics(y_true, y_prob, labels) -> Dict[str, float]:
     y_prob = np.asarray(y_prob)
     y_pred = y_prob.argmax(axis=1)
     acc = float(accuracy_score(y_true, y_pred))
-    f1m = float(f1_score(y_true, y_pred, average="macro"))
+    f1m = float(f1_score(y_true, y_pred, average="macro", zero_division=0))
     try:
-        # If y_prob are logits, softmax isn't strictly required for roc_auc_score
+        # roc_auc_score handles logits; softmax not required
         auc = float(roc_auc_score(y_true, y_prob, multi_class="ovr"))
     except Exception:
         auc = float("nan")
@@ -157,60 +211,22 @@ def print_model_summary(model: torch.nn.Module) -> None:
     print(f"Total trainable parameters: {total:,}\n")
 
 
+# -------------------------------------------------------------------------
+# 7) DataLoader convenience
+# -------------------------------------------------------------------------
+def torch_loader_kwargs(shuffle: bool, batch_size: int, device_type: str) -> dict:
+    """
+    Centralized DataLoader kwargs used across the codebase.
 
-
-
-
-
-
-# ---------
-# ## 1) Setup & Reproducibility (from notebook)
-# ---------
-import os, time, random
-import numpy as np
-from . import config as CFG
-
-def ts() -> str:
-    return time.strftime("%Y-%m-%d %H:%M:%S")
-
-def log(msg: str):
-    print(f"[{ts()}] {msg}")
-
-def set_seed(seed: int | None = None):
-    s = int(CFG.SEED if seed is None else seed)
-    random.seed(s); np.random.seed(s)
-    try:
-        import torch
-        torch.manual_seed(s)
-        if torch.cuda.is_available():
-            torch.cuda.manual_seed_all(s)
-    except Exception:
-        pass
-    log(f"Seeds set (seed={s}).")
-
-def sanitize_mps_env():
-    hi = float(os.environ.get("PYTORCH_MPS_HIGH_WATERMARK_RATIO", 0.92))
-    lo = float(os.environ.get("PYTORCH_MPS_LOW_WATERMARK_RATIO", 0.65))
-    lo = max(0.05, min(lo, hi - 0.05))
-    os.environ["PYTORCH_MPS_HIGH_WATERMARK_RATIO"] = f"{hi:.2f}"
-    os.environ["PYTORCH_MPS_LOW_WATERMARK_RATIO"]  = f"{lo:.2f}"
-    log(f"[MPS] LOW={lo:.2f}, HIGH={hi:.2f}")
-
-def pick_device():
-    import torch
-    if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
-        try:
-            _ = torch.empty(1, device="mps")
-            return torch.device("mps")
-        except Exception:
-            pass
-    if torch.cuda.is_available():
-        return torch.device("cuda")
-    return torch.device("cpu")
-
-def torch_loader_kwargs(shuffle: bool, batch_size: int, device_type: str):
-    # Notebook-safe defaults (workers=0) but configurable later
-    num_workers = 0 if CFG.LOW_RAM else 0
+    • On low-RAM runs, keep workers at 0 (safer for notebooks).
+    • Pin memory only on CUDA.
+    """
+    num_workers = 0 if LOW_RAM else 0  # adjust here if you later add multiprocessing
     pin = (device_type == "cuda")
-    return dict(batch_size=int(batch_size), shuffle=bool(shuffle),
-                num_workers=int(num_workers), pin_memory=pin, drop_last=False)
+    return dict(
+        batch_size=int(batch_size),
+        shuffle=bool(shuffle),
+        num_workers=int(num_workers),
+        pin_memory=pin,
+        drop_last=False,
+    )

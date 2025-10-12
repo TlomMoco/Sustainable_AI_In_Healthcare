@@ -1,7 +1,13 @@
+# results_visualization.py
+
+import matplotlib
+matplotlib.use("Agg")  # headless-safe backend
+
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 from pathlib import Path
+
 from src.config import RESULTS_DIR, SUPERCLASSES
 from src.utils import ensure_dir
 
@@ -27,36 +33,55 @@ PHASE_ENABLED  = "post_cv"
 PHASE_DISABLED = "no_cv"
 
 
+def _print_missing(path: Path):
+    print(f"Missing: {path}")
+
+
 # --- Load CSVs with numeric columns coerced to numbers (NaN if invalid) ---
 def load_numeric_csv(path: Path):
     if not path.exists():
-        print(f"Missing: {path}")
+        _print_missing(path)
         return None
-    df = pd.read_csv(path)
-    for col in ["round","accuracy","loss","wall_time_sec","trainable_params","true","pred","count"]:
+    try:
+        df = pd.read_csv(path, low_memory=False)
+    except Exception as e:
+        print(f"Failed to read {path}: {e}")
+        return None
+    if df is None or df.empty:
+        return df
+
+    # Normalize common columns if present
+    for col in ["round", "accuracy", "loss", "wall_time_sec", "trainable_params", "true", "pred", "count"]:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    # Normalize client_id to string (GLOBAL vs numeric client ids)
+    if "client_id" in df.columns:
+        df["client_id"] = df["client_id"].astype(str)
+
     return df
 
+
 # --- Load all dataframes (calling load_numeric_csv) ---------------------
-dfs      = {name: load_numeric_csv(p) for name, p in FILES.items()}
-percls   = {name: load_numeric_csv(p) for name, p in PERCLASS.items()}
-conf_long= {name: load_numeric_csv(p) for name, p in CONFUSION.items()}
+dfs       = {name: load_numeric_csv(p) for name, p in FILES.items()}
+percls    = {name: load_numeric_csv(p) for name, p in PERCLASS.items()}
+conf_long = {name: load_numeric_csv(p) for name, p in CONFUSION.items()}
 
-dfs      = {k:v for k,v in dfs.items() if v is not None}
-percls   = {k:v for k,v in percls.items() if v is not None}
-conf_long= {k:v for k,v in conf_long.items() if v is not None}
+# Keep only non-empty frames
+dfs       = {k: v for k, v in dfs.items() if v is not None and not v.empty}
+percls    = {k: v for k, v in percls.items() if v is not None and not v.empty}
+conf_long = {k: v for k, v in conf_long.items() if v is not None and not v.empty}
 
 
-# --------------------------------------------------------------------------
+# -------------------------------------------------------------------------
 # Helper functions
-# --------------------------------------------------------------------------
-def perclass_columns(df):
-    """Return mapping label-> Series, accepting acc_<name> or acc_<index>."""
-    cols = [c for c in df.columns if c.startswith("acc_")]
+# -------------------------------------------------------------------------
+def perclass_columns(df: pd.DataFrame):
+    """Return mapping label->Series, accepting acc_<name> or acc_<index>."""
+    cols = [c for c in df.columns if str(c).startswith("acc_")]
     mapping = {}
     for c in cols:
-        key = c[4:]
+        key = str(c)[4:]
         if key.isdigit():
             idx = int(key)
             if 0 <= idx < len(SUPERCLASSES):
@@ -66,204 +91,284 @@ def perclass_columns(df):
     return mapping
 
 
+def _safe_save(fig, name: str):
+    out = OUT / name
+    try:
+        fig.savefig(out, dpi=150, bbox_inches="tight")
+        print("Saved:", out)
+    finally:
+        plt.close(fig)
+
+
 # -------------------------------------------------------------------------
 # Plotting
 # -------------------------------------------------------------------------
 
-# -- Global accuracy vs round ----------------------------------
-plt.figure()
+# -- Global accuracy vs round --------------------------------------------
+if dfs:
+    fig = plt.figure()
+    ax = fig.add_subplot(111)
+    for name, df in dfs.items():
+        if df is None or df.empty or "client_id" not in df.columns:
+            continue
+        g = df.loc[df["client_id"].astype(str) == "GLOBAL"].copy()
+        if g.empty or "round" not in g.columns or "accuracy" not in g.columns:
+            continue
+        g = g.sort_values("round")
+        ax.plot(g["round"], g["accuracy"], label=f"Global ({name})")
+    ax.set_xlabel("Round"); ax.set_ylabel("Accuracy"); ax.set_title("Global Accuracy per Round")
+    ax.legend(); ax.grid(True); fig.tight_layout()
+    _safe_save(fig, "global_accuracy.png")
+
+
+# -- Client accuracies vs round ------------------------------------------
 for name, df in dfs.items():
-    g = df[df["client_id"] == "GLOBAL"].sort_values("round")
-    if len(g):
-        plt.plot(g["round"], g["accuracy"], label=f"Global ({name})")
-plt.xlabel("Round"); plt.ylabel("Accuracy"); plt.title("Global Accuracy per Round")
-plt.legend(); plt.grid(True); plt.tight_layout()
-plt.savefig(OUT / "global_accuracy.png", dpi=150); plt.close()
-
-
-
-# -- Client accuracies vs round ---------------------------------
-for name, df in dfs.items():
-    plt.figure()
-    sub = df[df["client_id"] != "GLOBAL"].sort_values(["client_id", "round"])
-    for cid, grp in sub.groupby("client_id"):
-        plt.plot(grp["round"], grp["accuracy"], alpha=0.6, label=f"Client {cid}")
-    g = df[df["client_id"] == "GLOBAL"].sort_values("round")
-    if len(g):
-        plt.plot(g["round"], g["accuracy"], linewidth=3, linestyle="--", label="GLOBAL")
-    plt.xlabel("Round"); plt.ylabel("Accuracy")
-    plt.title(f"Client vs Global Accuracy — {name}")
-    plt.legend(ncol=2); plt.grid(True); plt.tight_layout()
-    plt.savefig(OUT / f"clients_vs_global_{name}.png", dpi=150); plt.close()
-
-
-
-# -- Wall-time per round (total across clients) -------------------
-for name, df in dfs.items():
-    if "wall_time_sec" not in df.columns:
+    if df is None or df.empty or "client_id" not in df.columns:
         continue
-    sub = df[df["client_id"] != "GLOBAL"]
-    agg = (
-        sub.groupby("round", as_index=False)
-           .agg(wall_time_sec=("wall_time_sec", "sum"))
-           .sort_values(by="round")
-    )
-    plt.figure()
-    plt.plot(agg["round"], agg["wall_time_sec"])
-    plt.xlabel("Round"); plt.ylabel("Total client wall-time (s)")
-    plt.title(f"Total Wall-Time per Round — {name}")
-    plt.grid(True); plt.tight_layout()
-    plt.savefig(OUT / f"walltime_{name}.png", dpi=150); plt.close()
+    sub = df[df["client_id"].astype(str) != "GLOBAL"].copy()
+    if sub.empty or "round" not in sub.columns or "accuracy" not in sub.columns:
+        continue
+    sub = sub.sort_values(["client_id", "round"])
+    fig = plt.figure()
+    ax = fig.add_subplot(111)
+    for cid, grp in sub.groupby("client_id"):
+        if grp.empty:
+            continue
+        ax.plot(grp["round"], grp["accuracy"], alpha=0.6, label=f"Client {cid}")
+    # overlay global if present
+    g = df[df["client_id"].astype(str) == "GLOBAL"].copy()
+    if not g.empty and "round" in g.columns and "accuracy" in g.columns:
+        g = g.sort_values("round")
+        ax.plot(g["round"], g["accuracy"], linewidth=3, linestyle="--", label="GLOBAL")
+    ax.set_xlabel("Round"); ax.set_ylabel("Accuracy")
+    ax.set_title(f"Client vs Global Accuracy — {name}")
+    ax.legend(ncol=2); ax.grid(True); fig.tight_layout()
+    _safe_save(fig, f"clients_vs_global_{name}.png")
 
 
+# -- Total wall-time per round (sum across clients) ----------------------
+for name, df in dfs.items():
+    if df is None or df.empty or "wall_time_sec" not in df.columns or "round" not in df.columns:
+        continue
+    sub = df[df["client_id"].astype(str) != "GLOBAL"].copy()
+    if sub.empty:
+        continue
+    agg = (sub.groupby("round", as_index=False)
+              .agg(wall_time_sec=("wall_time_sec", "sum"))
+              .sort_values(by="round"))
+    if agg.empty:
+        continue
+    fig = plt.figure()
+    ax = fig.add_subplot(111)
+    ax.plot(agg["round"], agg["wall_time_sec"])
+    ax.set_xlabel("Round"); ax.set_ylabel("Total client wall-time (s)")
+    ax.set_title(f"Total Wall-Time per Round — {name}")
+    ax.grid(True); fig.tight_layout()
+    _safe_save(fig, f"walltime_{name}.png")
 
-# -- Per-client trajectories (frozen vs non-frozen, one figure) ---
+
+# -- Per-client trajectories (frozen vs non-frozen, one figure) ----------
 if all(k in dfs for k in ("frozen", "non_frozen")):
-    plt.figure()
-    cids = set(dfs["non_frozen"].query("client_id!='GLOBAL'")["client_id"]).union(
-           set(dfs["frozen"].query("client_id!='GLOBAL'")["client_id"]))
-    for cid in sorted(cids):
-        for name, style in [("non_frozen","-"), ("frozen","--")]:
-            sub_df = dfs[name].loc[dfs[name]["client_id"] == cid].copy()  # DataFrame
-            sub_df.sort_values(by="round", inplace=True)                  # sort DataFrame
-            if not sub_df.empty:
-                lbl = f"Client {cid} ({'unfrozen' if name=='non_frozen' else 'frozen'})"
-                plt.plot(sub_df["round"], sub_df["accuracy"], linestyle=style, label=lbl, alpha=0.8)
-    plt.xlabel("Round"); plt.ylabel("Local Accuracy")
-    plt.title("Per-Client Accuracy Trajectories (Frozen vs Unfrozen)")
-    plt.legend(ncol=2); plt.grid(True); plt.tight_layout()
-    plt.savefig(OUT / "per_client_trajectories.png", dpi=150); plt.close()
+    nf = dfs.get("non_frozen"); fr = dfs.get("frozen")
+    if nf is not None and fr is not None and not nf.empty and not fr.empty:
+        fig = plt.figure()
+        ax = fig.add_subplot(111)
+        cids = set(nf.query("client_id!='GLOBAL'")["client_id"]).union(
+               set(fr.query("client_id!='GLOBAL'")["client_id"]))
+        for cid in sorted(cids):
+            for run_name, dfi, style in [("non_frozen", nf, "-"), ("frozen", fr, "--")]:
+                sub_df = dfi.loc[dfi["client_id"] == cid].copy()
+                if sub_df.empty or "round" not in sub_df.columns or "accuracy" not in sub_df.columns:
+                    continue
+                sub_df.sort_values(by="round", inplace=True)
+                lbl = f"Client {cid} ({'unfrozen' if run_name=='non_frozen' else 'frozen'})"
+                ax.plot(sub_df["round"], sub_df["accuracy"], linestyle=style, label=lbl, alpha=0.8)
+        ax.set_xlabel("Round"); ax.set_ylabel("Local Accuracy")
+        ax.set_title("Per-Client Accuracy Trajectories (Frozen vs Unfrozen)")
+        ax.legend(ncol=2); ax.grid(True); fig.tight_layout()
+        _safe_save(fig, "per_client_trajectories.png")
 
 
-
-# -- Per-class accuracy over rounds (line plot) --
+# -- Per-class accuracy over rounds (line plot) --------------------------
 if percls:
-    plt.figure()
-    if "non_frozen" in percls:
+    fig = plt.figure()
+    ax = fig.add_subplot(111)
+    if "non_frozen" in percls and not percls["non_frozen"].empty:
         nf = percls["non_frozen"].sort_values(by="round")
         for label, series in perclass_columns(nf).items():
-            plt.plot(nf["round"], series, label=f"{label} (unfrozen)")
-    if "frozen" in percls:
+            try:
+                ax.plot(nf["round"], series, label=f"{label} (unfrozen)")
+            except Exception:
+                pass
+    if "frozen" in percls and not percls["frozen"].empty:
         fr = percls["frozen"].sort_values(by="round")
         for label, series in perclass_columns(fr).items():
-            plt.plot(fr["round"], series, linestyle="--", label=f"{label} (frozen)")
-    plt.xlabel("Round"); plt.ylabel("Per-class Accuracy")
-    plt.title("Per-class Accuracy per Round")
-    plt.legend(ncol=2); plt.grid(True); plt.tight_layout()
-    plt.savefig(OUT / "perclass_over_rounds.png", dpi=150); plt.close()
+            try:
+                ax.plot(fr["round"], series, linestyle="--", label=f"{label} (frozen)")
+            except Exception:
+                pass
+    ax.set_xlabel("Round"); ax.set_ylabel("Per-class Accuracy")
+    ax.set_title("Per-class Accuracy per Round")
+    ax.legend(ncol=2); ax.grid(True); fig.tight_layout()
+    _safe_save(fig, "perclass_over_rounds.png")
 
-# -- Final-round per-class accuracy (bar) --
+
+# -- Final-round per-class accuracy (bar) --------------------------------
 if percls:
     labels = SUPERCLASSES
     x = np.arange(len(labels)); width = 0.35
-    plt.figure()
-    if "non_frozen" in percls:
+    fig = plt.figure()
+    ax = fig.add_subplot(111)
+    drew_any = False
+    if "non_frozen" in percls and not percls["non_frozen"].empty:
         nf_last = percls["non_frozen"].sort_values(by="round").tail(1)
         nf_map  = perclass_columns(nf_last)
         y_nf    = [float(nf_map.get(lbl, pd.Series([0])).iloc[0]) for lbl in labels]
-        plt.bar(x - width/2, y_nf, width, label="Unfrozen")
-    if "frozen" in percls:
+        ax.bar(x - width/2, y_nf, width, label="Unfrozen"); drew_any = True
+    if "frozen" in percls and not percls["frozen"].empty:
         fr_last = percls["frozen"].sort_values(by="round").tail(1)
         fr_map  = perclass_columns(fr_last)
         y_fr    = [float(fr_map.get(lbl, pd.Series([0])).iloc[0]) for lbl in labels]
-        plt.bar(x + width/2, y_fr, width, label="Frozen")
-    plt.xticks(x, labels); plt.ylabel("Accuracy")
-    plt.title("Final-Round Per-class Accuracy")
-    plt.legend(); plt.tight_layout()
-    plt.savefig(OUT / "perclass_final_bar.png", dpi=150); plt.close()
+        ax.bar(x + width/2, y_fr, width, label="Frozen"); drew_any = True
+    if drew_any:
+        ax.set_xticks(x); ax.set_xticklabels(labels)
+        ax.set_ylabel("Accuracy"); ax.set_title("Final-Round Per-class Accuracy")
+        ax.legend(); fig.tight_layout()
+        _safe_save(fig, "perclass_final_bar.png")
+    else:
+        plt.close(fig)
 
 
-
-# -- Confusion heatmaps (last round of each run) ------------------
+# -- Confusion heatmaps (last round of each run) -------------------------
 for name, dfc in conf_long.items():
     if dfc is None or dfc.empty:
         continue
-    r = int(dfc["round"].max())
-    sub = dfc[dfc["round"] == r]
-    n = len(SUPERCLASSES)
-    cm = (sub.pivot_table(index="true", columns="pred", values="count", aggfunc="sum", fill_value=0)
-              .reindex(index=range(n), columns=range(n), fill_value=0)
-              .to_numpy(dtype=float))
-    with np.errstate(invalid="ignore", divide="ignore"):
-        cmn = np.nan_to_num(cm / cm.sum(axis=1, keepdims=True))
-    plt.figure(figsize=(6,5))
-    plt.imshow(cmn, aspect="auto")
-    plt.title(f"Confusion Matrix — {name} (round {r})")
-    plt.xlabel("Predicted"); plt.ylabel("True")
-    plt.xticks(range(n), SUPERCLASSES, rotation=45, ha="right")
-    plt.yticks(range(n), SUPERCLASSES)
-    plt.colorbar(label="Row-normalized")
-    plt.tight_layout()
-    plt.savefig(OUT / f"confusion_{name}_r{r:02d}.png", dpi=150); plt.close()
-
-
-
-# -- Global accuracy by phase (within each run) ---------------------------
-for name, df in dfs.items():
-    if "phase" not in df.columns:
+    if "round" not in dfc.columns or "true" not in dfc.columns or "pred" not in dfc.columns or "count" not in dfc.columns:
         continue
-    g = df[df["client_id"] == "GLOBAL"].copy()
-    pre  = g[g["phase"].eq(PHASE_DISABLED)].sort_values(by="round")
-    post = g[g["phase"].eq(PHASE_ENABLED)].sort_values(by="round")
+    r = int(dfc["round"].max())
+    sub = dfc[dfc["round"] == r].copy()
+    if sub.empty:
+        continue
+    n = len(SUPERCLASSES)
+    # pivot and coerce to square matrix (0..n-1)
+    try:
+        piv = sub.pivot_table(index="true", columns="pred", values="count", aggfunc="sum", fill_value=0)
+        # force integer-like indices/cols to 0..n-1
+        piv.index = pd.to_numeric(piv.index, errors="coerce")
+        piv.columns = pd.to_numeric(piv.columns, errors="coerce")
+        cm = (piv.reindex(index=range(n), columns=range(n), fill_value=0)
+                 .to_numpy(dtype=float))
+    except Exception as e:
+        print(f"Confusion pivot failed for {name}: {e}")
+        continue
+
+    with np.errstate(invalid="ignore", divide="ignore"):
+        row_sum = cm.sum(axis=1, keepdims=True)
+        cmn = np.nan_to_num(cm / np.maximum(row_sum, 1), nan=0.0, posinf=0.0, neginf=0.0)
+
+    fig = plt.figure(figsize=(6, 5))
+    ax = fig.add_subplot(111)
+    im = ax.imshow(cmn, aspect="auto", vmin=0, vmax=1.0)
+    ax.set_title(f"Confusion Matrix — {name} (round {r})")
+    ax.set_xlabel("Predicted"); ax.set_ylabel("True")
+    ax.set_xticks(range(n)); ax.set_xticklabels(SUPERCLASSES, rotation=45, ha="right")
+    ax.set_yticks(range(n)); ax.set_yticklabels(SUPERCLASSES)
+    cbar = fig.colorbar(im, ax=ax); cbar.set_label("Row-normalized")
+    # annotate
+    for i in range(n):
+        for j in range(n):
+            val = cmn[i, j] * 100.0
+            ax.text(j, i, f"{val:0.2f}", ha="center", va="center",
+                    color=("white" if val >= 50 else "black"), fontsize=9)
+    fig.tight_layout()
+    _safe_save(fig, f"confusion_{name}_r{r:02d}.png")
+
+
+# -- Global accuracy by phase (within each run) --------------------------
+for name, df in dfs.items():
+    if df is None or df.empty or "phase" not in df.columns:
+        continue
+    g = df[df["client_id"].astype(str) == "GLOBAL"].copy()
+    if g.empty or "round" not in g.columns or "accuracy" not in g.columns:
+        continue
+    pre  = g[g["phase"].astype(str).eq(PHASE_DISABLED)].sort_values(by="round")
+    post = g[g["phase"].astype(str).eq(PHASE_ENABLED)].sort_values(by="round")
     if pre.empty and post.empty:
         continue
-    plt.figure()
-    if not pre.empty:  plt.plot(pre["round"], pre["accuracy"], label=f"{name} (no-CV)")
-    if not post.empty: plt.plot(post["round"], post["accuracy"], label=f"{name} (post-CV)")
-    plt.xlabel("Round"); plt.ylabel("Global Accuracy")
-    plt.title(f"Global Accuracy by Phase — {name}")
-    plt.legend(); plt.grid(True); plt.tight_layout()
-    plt.savefig(OUT / f"global_by_phase_{name}.png", dpi=150); plt.close()
-
+    fig = plt.figure()
+    ax = fig.add_subplot(111)
+    if not pre.empty:  ax.plot(pre["round"], pre["accuracy"], label=f"{name} (no-CV)")
+    if not post.empty: ax.plot(post["round"], post["accuracy"], label=f"{name} (post-CV)")
+    ax.set_xlabel("Round"); ax.set_ylabel("Global Accuracy")
+    ax.set_title(f"Global Accuracy by Phase — {name}")
+    ax.legend(); ax.grid(True); fig.tight_layout()
+    _safe_save(fig, f"global_by_phase_{name}.png")
 
 
 # -- Per-client accuracy by phase (overlay pre/post) ---------------------
 for name, df in dfs.items():
-    if "phase" not in df.columns:
+    if df is None or df.empty or "phase" not in df.columns or "client_id" not in df.columns:
         continue
-    plt.figure()
-    sub = df[df["client_id"] != "GLOBAL"].copy()
-    for phase, style in [(PHASE_DISABLED,"-"), (PHASE_ENABLED,"--")]:
-        grp = sub[sub["phase"].eq(phase)]
+    sub = df[df["client_id"].astype(str) != "GLOBAL"].copy()
+    if sub.empty or "round" not in sub.columns or "accuracy" not in sub.columns:
+        continue
+    fig = plt.figure()
+    ax = fig.add_subplot(111)
+    drew_any = False
+    for phase, style in [(PHASE_DISABLED, "-"), (PHASE_ENABLED, "--")]:
+        grp = sub[sub["phase"].astype(str).eq(phase)]
         for cid, g in grp.groupby("client_id"):
             g = g.sort_values(by="round")
-            plt.plot(g["round"], g["accuracy"], linestyle=style, alpha=0.7,
-                     label=f"Client {cid} ({name}, {phase})")
-    plt.xlabel("Round"); plt.ylabel("Local Accuracy")
-    plt.title(f"Per-Client Accuracy by Phase — {name}")
-    plt.legend(ncol=2); plt.grid(True); plt.tight_layout()
-    plt.savefig(OUT / f"clients_by_phase_{name}.png", dpi=150); plt.close()
+            if g.empty: 
+                continue
+            ax.plot(g["round"], g["accuracy"], linestyle=style, alpha=0.7,
+                    label=f"Client {cid} ({name}, {phase})")
+            drew_any = True
+    if drew_any:
+        ax.set_xlabel("Round"); ax.set_ylabel("Local Accuracy")
+        ax.set_title(f"Per-Client Accuracy by Phase — {name}")
+        ax.legend(ncol=2); ax.grid(True); fig.tight_layout()
+        _safe_save(fig, f"clients_by_phase_{name}.png")
+    else:
+        plt.close(fig)
+
+print(f"Saved plots (where possible) to: {OUT.resolve()}")
 
 
-print(f"Saved plots to: {OUT.resolve()}")
-
-
-
-
-
-
-
-
+# =============================================================================
+# The remainder provides unified evaluation utilities used by Centralized.py.
+# (Kept as in your original file; lightly hardened for imports.)
+# =============================================================================
 
 # ---------
 # ## 15) Unified Evaluation + ROC-AUC (from notebook)
 # ---------
-from __future__ import annotations
-import time, re
-from pathlib import Path
-import numpy as np, pandas as pd, torch
-from sklearn.metrics import classification_report, accuracy_score, f1_score, precision_score, recall_score, roc_auc_score, confusion_matrix
-import matplotlib.pyplot as plt
-from . import config as CFG
-from .utils import torch_loader_kwargs
+from __future__ import annotations as _ann_eval  # avoid shadowing
+
+import time as _time, re as _re
+import torch as _torch
+from sklearn.metrics import (classification_report as _clsrep, accuracy_score as _acc,
+                             f1_score as _f1, precision_score as _prec, recall_score as _rec,
+                             roc_auc_score as _rocauc, confusion_matrix as _sk_cm)
+
+# Avoid circular imports at module load time
+try:
+    from . import config as CFG
+    from .utils import torch_loader_kwargs as _torch_loader_kwargs
+except Exception:
+    # Fallback if imported as a standalone script (optional)
+    from src import config as CFG  # type: ignore
+    from src.utils import torch_loader_kwargs as _torch_loader_kwargs  # type: ignore
+
 
 class TorchAdapter:
     def __init__(self, model, label_encoder, is_binary: bool, batch=32, device=None):
-        self.model = model.to(device or torch.device("cpu")).eval()
+        self.model = model.to(device or _torch.device("cpu")).eval()
         self.le = label_encoder; self.is_binary = is_binary
-        self.batch = int(batch); self.device = device or torch.device("cpu")
+        self.batch = int(batch); self.device = device or _torch.device("cpu")
         self.classes_ = getattr(self.le, "classes_", None)
-    @torch.no_grad()
+
+    @_torch.no_grad()
     def _loader(self, paths):
         from torch.utils.data import Dataset, DataLoader
         from .data_loader import load_waveform_np
@@ -273,28 +378,31 @@ class TorchAdapter:
                 self.T = max(1, CFG.SEQ_LEN // max(1, CFG.DOWNSAMPLE_FACTOR))
             def __len__(self): return len(self.paths)
             def __getitem__(self, i):
-                return torch.from_numpy(load_waveform_np(self.paths[i], T=self.T, factor=CFG.DOWNSAMPLE_FACTOR))
-        return DataLoader(_PredictOnly(paths), **torch_loader_kwargs(False, self.batch, self.device.type))
-    @torch.no_grad()
+                return _torch.from_numpy(load_waveform_np(self.paths[i], T=self.T, factor=CFG.DOWNSAMPLE_FACTOR))
+        return DataLoader(_PredictOnly(paths), **_torch_loader_kwargs(False, self.batch, self.device.type))
+
+    @_torch.no_grad()
     def predict(self, paths):
         preds=[]
         for xb in self._loader(paths):
             xb=xb.to(self.device); logits=self.model(xb)
-            y_idx=((torch.sigmoid(logits.view(-1))>=0.5).long().cpu().numpy()
+            y_idx=((_torch.sigmoid(logits.view(-1))>=0.5).long().cpu().numpy()
                    if self.is_binary else logits.argmax(1).cpu().numpy())
             preds.extend(self.le.inverse_transform(y_idx))
         return np.asarray(preds)
-    @torch.no_grad()
+
+    @_torch.no_grad()
     def predict_proba(self, paths):
         out=[]
         for xb in self._loader(paths):
             xb=xb.to(self.device); logits=self.model(xb)
             if self.is_binary:
-                p1=torch.sigmoid(logits.view(-1)).unsqueeze(1); p0=1.0-p1; p=torch.cat([p0,p1], dim=1)
+                p1=_torch.sigmoid(logits.view(-1)).unsqueeze(1); p0=1.0-p1; p=_torch.cat([p0,p1], dim=1)
             else:
-                p=torch.softmax(logits, dim=1)
+                p=_torch.softmax(logits, dim=1)
             out.append(p.cpu().numpy().astype("float32"))
         return np.vstack(out)
+
 
 def evaluate_models(models_dict, paths, y_true, label_encoder, is_binary, device):
     rows=[]
@@ -302,16 +410,16 @@ def evaluate_models(models_dict, paths, y_true, label_encoder, is_binary, device
         y_pred = adapter.predict(paths)
         try:
             print(f"\n=== {name} ===")
-            print(classification_report(y_true, y_pred, digits=3, zero_division=0))
+            print(_clsrep(y_true, y_pred, digits=3, zero_division=0))
         except Exception:
             pass
         row = {
             "model": name,
-            "accuracy": accuracy_score(y_true, y_pred),
-            "precision_macro": precision_score(y_true, y_pred, average="macro", zero_division=0),
-            "recall_macro": recall_score(y_true, y_pred, average="macro", zero_division=0),
-            "f1_macro": f1_score(y_true, y_pred, average="macro", zero_division=0),
-            "f1_weighted": f1_score(y_true, y_pred, average="weighted", zero_division=0),
+            "accuracy": _acc(y_true, y_pred),
+            "precision_macro": _prec(y_true, y_pred, average="macro", zero_division=0),
+            "recall_macro": _rec(y_true, y_pred, average="macro", zero_division=0),
+            "f1_macro": _f1(y_true, y_pred, average="macro", zero_division=0),
+            "f1_weighted": _f1(y_true, y_pred, average="weighted", zero_division=0),
             "roc_auc_ovr_macro": np.nan
         }
         try:
@@ -323,17 +431,18 @@ def evaluate_models(models_dict, paths, y_true, label_encoder, is_binary, device
             pos = {c:i for i,c in enumerate(est)}
             idx = [pos[c] for c in classes]
             scores = scores[:, idx]
-            row["roc_auc_ovr_macro"] = float(roc_auc_score(y_bin, scores, average="macro", multi_class="ovr"))
+            row["roc_auc_ovr_macro"] = float(_rocauc(y_bin, scores, average="macro", multi_class="ovr"))
         except Exception:
             pass
         rows.append(row)
     df = pd.DataFrame(rows).sort_values("f1_weighted", ascending=False)
     return df
 
+
 # ---------
 # ## 16) Confusion Matrix (from notebook)
 # ---------
-def _slug(txt): return re.sub(r"[^a-z0-9]+", "_", str(txt).lower()).strip("_")
+def _slug(txt): return _re.sub(r"[^a-z0-9]+", "_", str(txt).lower()).strip("_")
 
 def plot_confusion(y_true, y_pred, title="Confusion Matrix", classes=None, save_path=None, collapse_to_3=False):
     if collapse_to_3:
@@ -347,7 +456,7 @@ def plot_confusion(y_true, y_pred, title="Confusion Matrix", classes=None, save_
     else:
         y_true = np.array(y_true); y_pred = np.array(y_pred)
         classes = classes or sorted(list(set(y_true)|set(y_pred)))
-    cm = confusion_matrix(y_true, y_pred, labels=classes)
+    cm = _sk_cm(y_true, y_pred, labels=classes)
     cm_pct = cm.astype(float); row_sum = cm_pct.sum(axis=1, keepdims=True)
     cm_pct = np.divide(cm_pct, np.maximum(row_sum, 1), where=row_sum>0) * 100.0
     fig, ax = plt.subplots(figsize=(7.8, 6.2))
@@ -367,12 +476,13 @@ def plot_confusion(y_true, y_pred, title="Confusion Matrix", classes=None, save_
         plt.savefig(save_path, dpi=300, bbox_inches="tight")
     return fig
 
+
 # ---------
 # ## 17) Learning Curves (from notebook)
 # ---------
 def plot_learning_curves(histories: dict[str, dict], out_dir: str | Path | None = None):
-    if not histories: 
-        print("No histories to plot."); 
+    if not histories:
+        print("No histories to plot.")
         return
     out_dir = Path(out_dir or (Path(CFG.ART_DIR) / "figs"))
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -394,6 +504,7 @@ def plot_learning_curves(histories: dict[str, dict], out_dir: str | Path | None 
             fp2 = out_dir / f"accuracy_curve_{_slug(name)}.png"
             plt.tight_layout(); plt.savefig(fp2, dpi=300, bbox_inches='tight'); print('Saved:', fp2); plt.close()
 
+
 # ---------
 # ## 17c) Overfitting quick check (from notebook)
 # ---------
@@ -404,7 +515,7 @@ def overfitting_check(histories: dict[str, dict], cv_all_df: pd.DataFrame | None
         tr = np.array(hist.get("accuracy", []), float)
         va = np.array(hist.get("val_accuracy", []), float)
         if tr.size == 0 or va.size == 0:
-            rows.append({"model": name, "OVERFITTING": "no history"}); 
+            rows.append({"model": name, "OVERFITTING": "no history"})
             continue
         gap = float(tr[-1] - va[-1])
         flag = (tr[-1] >= min_train) and (va[-1] <= max_val) and (gap >= min_gap)
@@ -420,10 +531,12 @@ def overfitting_check(histories: dict[str, dict], cv_all_df: pd.DataFrame | None
         return df, g
     return df, None
 
+
 # ---------
 # ## 18a) Fairness / Group Metrics (from notebook)
 # ---------
-from sklearn.metrics import f1_score
+from sklearn.metrics import f1_score as _f1_score
+
 def fairness_macro_f1_by_groups(best_adapter, y_true, test_index, meta_df: pd.DataFrame):
     paths = meta_df.loc[test_index, "record_path"].astype(str).values
     y_pred = np.asarray(best_adapter.predict(paths))
@@ -451,7 +564,7 @@ def fairness_macro_f1_by_groups(best_adapter, y_true, test_index, meta_df: pd.Da
         a, b = y_true[mask], y_pred[mask]
         if len(np.unique(a)) < 2:
             return np.nan
-        return f1_score(a, b, average="macro", zero_division=0)
+        return _f1_score(a, b, average="macro", zero_division=0)
 
     for grp_name, series in [("sex_norm", meta_test["sex_norm"]), ("age_bin", meta_test["age_bin"])]:
         for g, idxs in series.groupby(series).groups.items():
@@ -460,19 +573,20 @@ def fairness_macro_f1_by_groups(best_adapter, y_true, test_index, meta_df: pd.Da
     fair_df = pd.DataFrame(rows).sort_values(["group","value"])
     return fair_df
 
+
 # ---------
 # ## 18b) Interpretation — Gradient×Input saliency (from notebook)
 # ---------
-def saliency_grad_times_input(model: torch.nn.Module, path: str, device=None):
-    device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+def saliency_grad_times_input(model: _torch.nn.Module, path: str, device=None):
+    device = device or _torch.device("cuda" if _torch.cuda.is_available() else "cpu")
     model = model.to(device).eval()
     from .data_loader import load_waveform_np
     T = max(1, CFG.SEQ_LEN // max(1, CFG.DOWNSAMPLE_FACTOR))
     x = load_waveform_np(path, T=T, factor=CFG.DOWNSAMPLE_FACTOR)
-    xt = torch.from_numpy(x).unsqueeze(0).to(device)
+    xt = _torch.from_numpy(x).unsqueeze(0).to(device)
     xt.requires_grad_(True)
 
-    with torch.enable_grad():
+    with _torch.enable_grad():
         logits = model(xt)
         if logits.ndim == 2 and logits.size(1) > 1:
             target = logits[0, logits.argmax(1).item()]
@@ -500,17 +614,17 @@ def plot_saliency_overlay(model, sample_paths: list[str], out_dir: str | Path | 
 # ---------
 # ## 18c) Efficiency — params & inference time (from notebook)
 # ---------
-def count_params(m): 
+def count_params(m):
     return sum(p.numel() for p in m.parameters() if p.requires_grad)
 
 def benchmark_inference(adapter, paths, device=None, warmup=1):
-    device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = device or _torch.device("cuda" if _torch.cuda.is_available() else "cpu")
     model = adapter.model.to(device).eval()
     if warmup:
         _ = adapter.predict(paths[:min(8, len(paths))])
-    t0 = time.time()
+    t0 = _time.time()
     _ = adapter.predict(paths)
-    return time.time() - t0
+    return _time.time() - t0
 
 def summarize_efficiency(adapters: dict[str, object], test_paths: list[str]):
     rows = []
