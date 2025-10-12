@@ -18,28 +18,39 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Dict, List, Tuple, Any
 
+import ast
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
 import wfdb
-import ast
-from pathlib import Path
+from joblib import Parallel, delayed
 
 from src_Connection.config import (
     PTBXL_CSV, SCP_CSV, DATA_ROOT, SAMPLE_RATE,
     N_CLASSES, SUPERCLASSES,
-    # Notebook/deep config values:
+    # notebook/deep config values
     RECORD_FILE_COL, SEQ_LEN, DOWNSAMPLE_FACTOR, SAVE_FEATURES_CSV,
-    ART_DIR, SEED
+    ART_DIR, SEED,
 )
-from joblib import Parallel, delayed
+
+# -------------------------------------------------------------------------
+# Robust access to LABEL_MODE / SCP_MIN_CONF (can be top-level or NOTEBOOK)
+# -------------------------------------------------------------------------
+try:
+    # If exported at top-level in config.py
+    from src_Connection.config import LABEL_MODE as _LABEL_MODE, SCP_MIN_CONF as _SCP_MIN_CONF  # type: ignore
+except Exception:
+    # Fallback to NOTEBOOK dict
+    from src_Connection.config import NOTEBOOK  # type: ignore
+    _LABEL_MODE = NOTEBOOK.get("LABEL_MODE", "5class")
+    _SCP_MIN_CONF = float(NOTEBOOK.get("SCP_MIN_CONF", 0.0))
+
 
 # =============================================================================
 # ========== Classic PTB-XL dataclass-based API (baseline compatibility) ======
 # =============================================================================
 
-# -------------------------------------------------------------------------
-# Data structures
-# -------------------------------------------------------------------------
 @dataclass
 class PTBXL:
     """Container for PTB-XL metadata and SCP aggregation table."""
@@ -47,16 +58,8 @@ class PTBXL:
     agg: pd.DataFrame
 
 
-# -------------------------------------------------------------------------
-# Metadata loading (classic)
-# -------------------------------------------------------------------------
 def load_metadata() -> PTBXL:
-    """
-    Load and preprocess PTB-XL metadata and SCP aggregation table.
-
-    Returns:
-        PTBXL: dataclass containing main dataframe and diagnostic mappings.
-    """
+    """Load and preprocess PTB-XL metadata and SCP aggregation table."""
     df = pd.read_csv(PTBXL_CSV)
     df["scp_codes"] = df["scp_codes"].apply(ast.literal_eval)
 
@@ -65,13 +68,8 @@ def load_metadata() -> PTBXL:
     return PTBXL(df=df, agg=agg)
 
 
-# -------------------------------------------------------------------------
-# Label mapping and filtering
-# -------------------------------------------------------------------------
 def map_superclasses(ptb: PTBXL) -> pd.DataFrame:
-    """
-    Map each ECG record's SCP codes to diagnostic superclasses.
-    """
+    """Map each ECG record's SCP codes to diagnostic superclasses."""
     df = ptb.df.copy()
 
     def to_superclasses(code_dict: Dict[str, float]) -> List[str]:
@@ -96,22 +94,15 @@ def filter_single_label(df: pd.DataFrame) -> pd.DataFrame:
     return one
 
 
-# -------------------------------------------------------------------------
-# Patient-aware splitting (classic)
-# -------------------------------------------------------------------------
 def stratified_patient_split(
     df: pd.DataFrame, test_size: float = 0.2, seed: int = 42
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """
-    Group-aware split by patient_id to prevent leakage.
-    """
+    """Group-aware split by patient_id to prevent leakage."""
     rng = np.random.default_rng(seed)
-
-    # Majority label per patient
     patient_labels = df.groupby("patient_id")["y"].agg(lambda s: s.value_counts().idxmax())
     patients = patient_labels.index.to_numpy()
 
-    test_patients = []
+    test_patients: List[int] = []
     for c in patient_labels.unique():
         p_cls = patients[patient_labels.values == c]
         rng.shuffle(p_cls)
@@ -127,28 +118,20 @@ def stratified_patient_split(
 def stratified_patient_split_3way(
     df: pd.DataFrame, splits: Tuple[float, float, float] = (0.70, 0.15, 0.15), seed: int = 42
 ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    """
-    Patient-aware 3-way split: (train, val, test).
-    """
+    """Patient-aware 3-way split: (train, val, test)."""
     assert abs(sum(splits) - 1.0) < 1e-6, "splits must sum to 1.0"
 
     train_frac, val_frac, test_frac = splits
-
-    # Step 1: train vs temp
     train_df, temp_df = stratified_patient_split(df, test_size=(1.0 - train_frac), seed=seed)
 
     if len(temp_df) == 0:
         raise ValueError("Temp split is empty; dataset too small for requested ratios.")
 
-    # Step 2: val vs test from temp
     val_prop_within_temp = val_frac / (val_frac + test_frac)
     val_df, test_df = stratified_patient_split(temp_df, test_size=(1.0 - val_prop_within_temp), seed=seed + 1)
     return train_df, val_df, test_df
 
 
-# -------------------------------------------------------------------------
-# Waveform loading & normalization (classic)
-# -------------------------------------------------------------------------
 def load_waveform(row: pd.Series, sampling_rate: int = SAMPLE_RATE) -> np.ndarray:
     """
     Load a single ECG signal from disk via WFDB.
@@ -172,10 +155,10 @@ def basic_features(signal: np.ndarray) -> np.ndarray:
 
 def make_feature_table_legacy(df: pd.DataFrame, limit: int | None = None) -> Tuple[np.ndarray, np.ndarray, List[str]]:
     """
-    Legacy baseline features API (kept for old code):
-        X: (n, 36) feature matrix
-        y: (n,) class indices
-        classes: SUPERCLASSES list
+    Legacy baseline features API:
+        X: (n, 36)
+        y: (n,)
+        classes: SUPERCLASSES
     """
     sel = df if limit is None else df.iloc[:limit]
     X, y = [], []
@@ -187,9 +170,7 @@ def make_feature_table_legacy(df: pd.DataFrame, limit: int | None = None) -> Tup
 
 
 def compute_perlead_norm_stats(df: pd.DataFrame, sampling_rate: int = SAMPLE_RATE) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    Compute per-lead mean and std using only the provided DataFrame.
-    """
+    """Compute per-lead mean and std using only the provided DataFrame."""
     means, stds = [], []
     for _, row in df.iterrows():
         sig = load_waveform(row, sampling_rate)
@@ -209,30 +190,26 @@ def normalize_signal(sig: np.ndarray, mu: np.ndarray, sigma: np.ndarray, eps: fl
 # =============================================================================
 # ======================= Notebook / deep-learning API ========================
 # =============================================================================
-# These functions back your newer Centralized.py path (feature_df, features_df).
 
 # Local aliases from config (already imported above)
-DB_CSV  = Path(PTBXL_CSV)
+DB_CSV = Path(PTBXL_CSV)
 SCP_CSV_PATH = Path(SCP_CSV)
-ROOT    = DB_CSV.parent
+ROOT = DB_CSV.parent
 RECORDS_DIR = ROOT / ("records100" if RECORD_FILE_COL == "filename_lr" else "records500")
 
+
 def load_metadata_raw() -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """
-    Raw CSV loaders used by the notebook/deep pipeline.
-    Returns:
-        (db, scp_raw)
-    """
+    """Raw CSV loaders used by the notebook/deep pipeline."""
     assert DB_CSV.exists(), f"Missing {DB_CSV}"
     assert SCP_CSV_PATH.exists(), f"Missing {SCP_CSV_PATH}"
-    db  = pd.read_csv(DB_CSV)
+    db = pd.read_csv(DB_CSV)
     scp_raw = pd.read_csv(SCP_CSV_PATH, encoding="utf-8-sig")
     scp_raw.columns = [str(c).strip() for c in scp_raw.columns]
     return db, scp_raw
 
 
-def _extract_scp_keys(db_series: pd.Series, n=2000):
-    keys = set()
+def _extract_scp_keys(db_series: pd.Series, n=2000) -> set[str]:
+    keys: set[str] = set()
     for s in db_series.head(min(n, len(db_series))):
         try:
             keys.update(map(str, ast.literal_eval(s).keys()))
@@ -244,29 +221,34 @@ def _extract_scp_keys(db_series: pd.Series, n=2000):
 def build_scp_mapping(db: pd.DataFrame, scp_raw: pd.DataFrame):
     obj_cols = [c for c in scp_raw.columns if scp_raw[c].dtype == "object"]
     known_keys = _extract_scp_keys(db["scp_codes"], n=2000)
-    scores = {c: len(set(scp_raw[c].astype(str)).intersection(known_keys)) for c in obj_cols} or {obj_cols[0]:1}
+    scores = {c: len(set(scp_raw[c].astype(str)).intersection(known_keys)) for c in obj_cols} or {obj_cols[0]: 1}
     code_col = max(scores, key=scores.get)
 
     scp_raw["code"] = scp_raw[code_col].astype(str)
-    scp = scp_raw.set_index("code", drop=False); scp.index.name = "code"
+    scp = scp_raw.set_index("code", drop=False)
+    scp.index.name = "code"
 
     for req in ["diagnostic", "diagnostic_class", "diagnostic_subclass"]:
         if req not in scp.columns:
             raise ValueError(f"scp_statements.csv missing column: {req}")
 
     diag_col = scp["diagnostic"].astype(str).str.strip().str.lower()
-    diag_mask = pd.to_numeric(diag_col, errors="coerce").fillna(0).gt(0) | diag_col.isin({"1","1.0","true","t","yes","y","on"})
-    diag_only = scp.loc[diag_mask, ["diagnostic_class","diagnostic_subclass"]].copy()
+    diag_mask = (
+        pd.to_numeric(diag_col, errors="coerce").fillna(0).gt(0)
+        | diag_col.isin({"1", "1.0", "true", "t", "yes", "y", "on"})
+    )
+    diag_only = scp.loc[diag_mask, ["diagnostic_class", "diagnostic_subclass"]].copy()
     valid_codes = set(diag_only.index)
 
     # Label field chosen by config (5-class or 10-class)
-    from src_Connection.config import LABEL_MODE, SCP_MIN_CONF
-    label_field = "diagnostic_class" if LABEL_MODE == "5class" else "diagnostic_subclass"
+    label_field = "diagnostic_class" if _LABEL_MODE == "5class" else "diagnostic_subclass"
 
-    def to_diag_label(scp_codes_dict, min_conf=float(SCP_MIN_CONF)):
+    def to_diag_label(scp_codes_dict, min_conf: float = _SCP_MIN_CONF):
         try:
-            items = [(str(k), float(v)) for k, v in ast.literal_eval(scp_codes_dict).items()] \
-                    if isinstance(scp_codes_dict, str) else [(str(k), float(v)) for k, v in scp_codes_dict.items()]
+            if isinstance(scp_codes_dict, str):
+                items = [(str(k), float(v)) for k, v in ast.literal_eval(scp_codes_dict).items()]
+            else:
+                items = [(str(k), float(v)) for k, v in scp_codes_dict.items()]
         except Exception:
             return None
         items = [(k, v) for k, v in items if k in valid_codes and v >= min_conf]
@@ -281,7 +263,8 @@ def build_scp_mapping(db: pd.DataFrame, scp_raw: pd.DataFrame):
     return diag_only, valid_codes, to_diag_label
 
 
-META_FIELDS = ["ecg_id","patient_id","age","sex","device","recording_date","scp_codes","strat_fold"]
+META_FIELDS = ["ecg_id", "patient_id", "age", "sex", "device", "recording_date", "scp_codes", "strat_fold"]
+
 
 def _row_min(r: dict, to_diag_label) -> dict | None:
     row: Dict[str, Any] = {}
@@ -316,12 +299,12 @@ def build_minimal_table(db: pd.DataFrame, to_diag_label, max_records=None) -> pd
 
 
 # ----------------- Waveforms for deep pipeline -----------------
-def _sr_from_cfg(): 
+def _sr_from_cfg() -> int:
     return 100 if RECORD_FILE_COL == "filename_lr" else 500
 
 
-def load_waveform_np(rec_path: str, T: int, factor: int):
-    STD_LEADS = ["I","II","III","aVR","aVL","aVF","V1","V2","V3","V4","V5","V6"]
+def load_waveform_np(rec_path: str, T: int, factor: int) -> np.ndarray:
+    STD_LEADS = ["I", "II", "III", "aVR", "aVL", "aVF", "V1", "V2", "V3", "V4", "V5", "V6"]
     x, meta = wfdb.rdsamp(rec_path)
     x = x.astype("float32")
     try:
@@ -342,30 +325,30 @@ def load_waveform_np(rec_path: str, T: int, factor: int):
 
 
 # ----------------- Basic engineered features + HRV -----------------
-def _bandpower(sig_1d, fs, f_lo, f_hi):
+def _bandpower(sig_1d, fs, f_lo, f_hi) -> float:
     x = np.asarray(sig_1d, dtype=np.float32)
     n = len(x)
     if n == 0:
         return 0.0
-    freqs = np.fft.rfftfreq(n, d=1.0/fs)
-    spec  = np.abs(np.fft.rfft(x))**2
-    mask  = (freqs >= f_lo) & (freqs < f_hi)
-    msum  = int(mask.sum())
+    freqs = np.fft.rfftfreq(n, d=1.0 / fs)
+    spec = np.abs(np.fft.rfft(x)) ** 2
+    mask = (freqs >= f_lo) & (freqs < f_hi)
+    msum = int(mask.sum())
     return float(spec[mask].sum() / max(1, msum))
 
 
-def _stats_and_bands(X, fs, leads=12):
-    feats = {}
+def _stats_and_bands(X, fs, leads=12) -> Dict[str, float]:
+    feats: Dict[str, float] = {}
     for j in range(min(leads, X.shape[1])):
         s = X[:, j]
         feats[f"L{j+1}_mean"] = float(np.mean(s))
-        feats[f"L{j+1}_std"]  = float(np.std(s))
-        feats[f"L{j+1}_rms"]  = float(np.sqrt(np.mean(s*s)))
-        feats[f"L{j+1}_ptp"]  = float(np.ptp(s))
-    bands = [(0.0,5.0),(5.0,15.0),(15.0,40.0)]
+        feats[f"L{j+1}_std"] = float(np.std(s))
+        feats[f"L{j+1}_rms"] = float(np.sqrt(np.mean(s * s)))
+        feats[f"L{j+1}_ptp"] = float(np.ptp(s))
+    bands = [(0.0, 5.0), (5.0, 15.0), (15.0, 40.0)]
     for j in range(min(leads, X.shape[1])):
         s = X[:, j]
-        for (a,b) in bands:
+        for (a, b) in bands:
             feats[f"L{j+1}_bp_{int(a)}_{int(b)}Hz"] = _bandpower(s, fs, a, b)
     return feats
 
@@ -382,37 +365,38 @@ def _bandpass(x, fs, lo=5.0, hi=15.0, order=2):
     x = np.asarray(x, np.float32)
     if not _HAS_SCIPY:
         return x - x.mean()
-    b, a = butter(order, [lo/(fs/2), hi/(fs/2)], btype='band')
+    b, a = butter(order, [lo / (fs / 2), hi / (fs / 2)], btype="band")
     return filtfilt(b, a, x)
 
 
 def _rpeaks(signal_1d, fs):
     y = _bandpass(signal_1d, fs)
-    y = y**2
+    y = y ** 2
     win = max(1, int(0.150 * fs))
-    ma = np.convolve(y, np.ones(win)/win, mode='same')
+    ma = np.convolve(y, np.ones(win) / win, mode="same")
     distance = max(1, int(0.25 * fs))
-    height = float(ma.mean() + 1.0*ma.std())
+    height = float(ma.mean() + 1.0 * ma.std())
     if _HAS_SCIPY:
         peaks, _ = find_peaks(ma, distance=distance, height=height)
     else:
         cand = np.where((ma[1:-1] > ma[:-2]) & (ma[1:-1] > ma[2:]) & (ma[1:-1] >= height))[0] + 1
-        keep = []
+        keep: List[int] = []
         last = -10**9
         for p in cand:
             if not keep or (p - last) >= distance:
-                keep.append(p); last = p
+                keep.append(p)
+                last = p
         peaks = np.asarray(keep, dtype=int)
     return peaks
 
 
-def _hrv_metrics(peaks, fs):
+def _hrv_metrics(peaks, fs) -> Dict[str, float]:
     rr = np.diff(peaks) / float(fs)
     if rr.size < 2:
         return {"n_beats": int(peaks.size), "HR_bpm": np.nan, "SDNN_ms": np.nan, "RMSSD_ms": np.nan}
     hr = 60.0 / rr.mean()
     sdnn = np.std(rr, ddof=1) * 1000.0
-    rmssd = np.sqrt(np.mean(np.diff(rr)**2)) * 1000.0
+    rmssd = np.sqrt(np.mean(np.diff(rr) ** 2)) * 1000.0
     return {"n_beats": int(peaks.size), "HR_bpm": float(hr), "SDNN_ms": float(sdnn), "RMSSD_ms": float(rmssd)}
 
 
@@ -428,13 +412,13 @@ def hrv_for_record(path: str):
 
 def make_feature_table(save_csv: bool = True) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
-    Notebook-style engineered features + minimal table for deep models.
+    Engineered features + minimal table for deep models.
 
     Returns:
         feature_df: DataFrame of engineered features (+label)
         features_df: minimal table with record_path/label/metadata for deep loaders
     """
-    from src_Connection.config import MAX_RECORDS  # defer to avoid circular import issues
+    from src_Connection.config import MAX_RECORDS  # defer to avoid circular import
     db, scp_raw = load_metadata_raw()
     diag_only, valid_codes, to_diag_label = build_scp_mapping(db, scp_raw)
 
@@ -443,7 +427,7 @@ def make_feature_table(save_csv: bool = True) -> tuple[pd.DataFrame, pd.DataFram
 
     # Engineered features
     fs = _sr_from_cfg()
-    T  = max(1, int(SEQ_LEN // max(1, DOWNSAMPLE_FACTOR)))
+    T = max(1, int(SEQ_LEN // max(1, DOWNSAMPLE_FACTOR)))
 
     rows = []
     for idx, p in features_df["record_path"].astype(str).items():
@@ -461,24 +445,26 @@ def make_feature_table(save_csv: bool = True) -> tuple[pd.DataFrame, pd.DataFram
     # Cache to CSV
     if save_csv and SAVE_FEATURES_CSV:
         out = Path(ART_DIR) / "basic_signal_features.csv"
-        out.parent.mkdir(parents=True, exist_ok=True)
+        out.parent.mkdir(parents=True, exist_ok=True
+                         )
         feat.to_csv(out)
 
     return feat, features_df
 
 
-# ----------------- Leakage-safe Split for deep features -----------------
-def train_test_split(features_df: pd.DataFrame):
+def train_test_split(features_df: pd.DataFrame) -> Tuple[pd.Series, pd.Series]:
     """
-    Group-wise split with PTB-XL strat_fold if available; otherwise GroupShuffleSplit by patient_id.
+    Group-wise split with PTB-XL strat_fold if available;
+    otherwise GroupShuffleSplit by patient_id.
     """
     from sklearn.model_selection import GroupShuffleSplit
     if "strat_fold" in features_df.columns and features_df["strat_fold"].notna().all():
-        train_mask = features_df["strat_fold"].astype(int).isin(range(1,10))
-        test_mask  = features_df["strat_fold"].astype(int) == 10
+        train_mask = features_df["strat_fold"].astype(int).isin(range(1, 10))
+        test_mask = features_df["strat_fold"].astype(int) == 10
     else:
         groups = features_df["patient_id"].values if "patient_id" in features_df.columns else np.arange(len(features_df))
         gss = GroupShuffleSplit(n_splits=1, test_size=0.2, random_state=SEED)
         tr_i, te_i = next(gss.split(features_df, features_df["label"], groups))
-        train_mask = features_df.index.isin(tr_i); test_mask = features_df.index.isin(te_i)
+        train_mask = features_df.index.isin(tr_i)
+        test_mask = features_df.index.isin(te_i)
     return train_mask, test_mask

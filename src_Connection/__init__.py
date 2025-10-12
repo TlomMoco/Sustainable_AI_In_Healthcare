@@ -6,11 +6,12 @@ Lightweight initializer:
   • Package metadata
   • Resolves project paths safely
   • Ensures results directory exists
-  • Exposes a few convenience helpers via lazy imports (no heavy deps on import)
+  • Exposes a few convenience helpers via lazy imports (no heavy deps)
 """
 
 from __future__ import annotations
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 # --- Metadata -------------------------------------------------------------
 __title__   = "sustainable-ai-healthcare-connection"
@@ -23,12 +24,22 @@ try:
     from .config import RESULTS_DIR, PROJ_ROOT  # type: ignore
 except Exception:
     # Safe fallbacks if config isn't ready yet
-    PROJ_ROOT  = Path(__file__).resolve().parent.parent
+    PROJ_ROOT = Path(__file__).resolve().parent.parent
     RESULTS_DIR = PROJ_ROOT / "results"
 
-RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+# Ensure results dirs exist
+try:
+    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    (RESULTS_DIR / "viz").mkdir(parents=True, exist_ok=True)
+except Exception:
+    # Non-fatal (e.g., read-only env)
+    pass
 
-# --- Lazy convenience wrappers (avoid heavy imports on import) ------------
+def get_paths():
+    """Return common project paths (PROJ_ROOT, RESULTS_DIR)."""
+    return PROJ_ROOT, RESULTS_DIR
+
+# --- Lazy convenience wrappers (avoid heavy imports at import time) ------
 def set_seed(seed: int | None = None) -> None:
     """Project-wide seeding (lazy import)."""
     from .utils import set_seed as _set_seed
@@ -49,8 +60,12 @@ def create_model(model_type: str, n_classes: int, **kwargs):
     from .models import create_model as _create
     return _create(model_type, n_classes, **kwargs)
 
+# Optional: make type checkers happy without importing at runtime
+if TYPE_CHECKING:
+    from . import config, models, data_loader, data_preprocessing, results_visualization, utils  # noqa: F401
+
 __all__ = [
     "__title__", "__version__", "__author__",
-    "PROJ_ROOT", "RESULTS_DIR",
+    "PROJ_ROOT", "RESULTS_DIR", "get_paths",
     "set_seed", "pick_device", "load_metadata", "create_model",
 ]

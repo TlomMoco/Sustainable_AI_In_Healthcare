@@ -1,17 +1,7 @@
 """Client.py — PTB-XL Federated Learning Client
 --------------------------------------------
-
-Implements a single federated learning (FL) client for ECG classification
-under the Sustainable AI in Healthcare project (DSP5100).
-
-Each client:
-  • Loads a patient-specific PTB-XL subset (uneven split)
-  • Builds a CNN/RNN/LSTM/ANN model depending on config.py
-  • Trains locally using FedAvg (with optional FedProx term)
-  • Applies dynamic & reactive layer freezing
-  • Logs sustainability metrics per round
-  • Communicates with the Flower server (FedAvg)
-  • Logs per-round metrics (accuracy, loss, time, #trainable params)
+Federated client with optional dynamic freezing and FedProx.
+Trains CNN/RNN/LSTM/ANN defined in src_Connection.models on local splits.
 """
 
 from __future__ import annotations
@@ -31,13 +21,14 @@ import torch.optim as optim
 try:
     import flwr as fl
 except ImportError as e:
-    raise ImportError("Please install Flower: pip install flwr==1.*") from e
+    raise ImportError("Please install Flower: pip install 'flwr==1.*'") from e
 
 # --- Project imports (absolute) ---
 from src_Connection.config import (
     LR, BATCH_SIZE, EPOCHS_LOCAL, FREEZE_THRESHOLD, FEDPROX_MU,
     SEED, RESULTS_DIR, FREEZE_CFG, SPLITS, NORM, MODEL, EXPERIMENT,
     SAMPLE_RATE, N_CLASSES, TUNING, GRIDSEARCH, CLIENTS, FL_SERVER_ADDRESS,
+    SUPERCLASSES,
 )
 from src_Connection.data_loader import (
     load_metadata, map_superclasses, filter_single_label,
@@ -51,23 +42,30 @@ from src_Connection.utils import set_seed, ensure_dir
 # -------------------------------------------------------------------------
 # Small helpers for dataset -> tensors
 # -------------------------------------------------------------------------
-CLASSES = ["NORM", "MI", "STTC", "HYP", "CD"]
+CLASSES = list(SUPERCLASSES)  # keep in sync with config
 
 def _make_tensor_dataset(df, mu=None, sigma=None):
+    """
+    Build a TensorDataset from a PTB-XL dataframe.
+    Shapes:
+      load_waveform(row) returns (12, T)
+      -> normalize per lead in that space
+      -> transpose to time-major (T, 12) expected by models
+    """
     X, y = [], []
     for _, row in df.iterrows():
-        sig = load_waveform(row)
+        sig = load_waveform(row)                # (12, T)
         if mu is not None and sigma is not None and NORM["enabled"]:
-            sig = normalize_signal(sig, mu, sigma, eps=NORM["eps"])
+            sig = normalize_signal(sig, mu, sigma, eps=NORM["eps"])  # (12, T)
+        sig = sig.T.astype(np.float32, copy=False)  # -> (T, 12)  <<< IMPORTANT
         X.append(sig)
         y.append(CLASSES.index(row["y"]))
     X = torch.tensor(np.stack(X), dtype=torch.float32)
     y = torch.tensor(np.array(y), dtype=torch.long)
-    return X, y
+    return torch.utils.data.TensorDataset(X, y)
 
 def _loader_for(df, batch_size=BATCH_SIZE, mu=None, sigma=None, shuffle=True):
-    X, y = _make_tensor_dataset(df, mu, sigma)
-    ds = torch.utils.data.TensorDataset(X, y)
+    ds = _make_tensor_dataset(df, mu, sigma)
     return torch.utils.data.DataLoader(ds, batch_size=int(batch_size), shuffle=bool(shuffle))
 
 
@@ -108,7 +106,6 @@ class PTBClient(fl.client.NumPyClient):
         )
 
         # --- Uneven per-client allocation by patient --------------------
-        # Generalized for arbitrary CLIENTS:
         patients = train_g.patient_id.unique()
         rng = np.random.RandomState(SEED)
         rng.shuffle(patients)
@@ -116,10 +113,9 @@ class PTBClient(fl.client.NumPyClient):
         if CLIENTS <= 1:
             buckets = [patients]
         else:
-            # Make uneven buckets by drawing proportions from a Dirichlet, then slicing patients.
+            # Dirichlet proportions for uneven splits
             props = rng.dirichlet(alpha=[0.8] + [0.4]*(CLIENTS-1))
             counts = np.floor(props * len(patients)).astype(int)
-            # fix rounding to match total
             while counts.sum() < len(patients):
                 counts[rng.randint(0, CLIENTS)] += 1
             splits = np.cumsum(counts)
@@ -142,7 +138,8 @@ class PTBClient(fl.client.NumPyClient):
         )
 
         # --- Local normalization stats ----------------------------------
-        self.mu, self.sigma = compute_perlead_norm_stats(self.train_df)  # shape (12,), (12,)
+        # (computed in (12, T) space; we transpose after normalization when creating tensors)
+        self.mu, self.sigma = compute_perlead_norm_stats(self.train_df)  # (12,), (12,)
 
         # --- Model -------------------------------------------------------
         self.model = create_model(
@@ -153,7 +150,33 @@ class PTBClient(fl.client.NumPyClient):
             bidir=MODEL.get("bidirectional", True),
         ).to(self.device)
 
-        self.ce = nn.CrossEntropyLoss()
+        # <<< NEW: dual losses (weighted for train, plain for eval) ------
+        # Build inverse-frequency class weights from THIS client's training labels
+        counts_series = self.train_df["y"].value_counts()
+        counts = np.array([int(counts_series.get(cname, 0)) for cname in CLASSES], dtype=np.int64)
+        if counts.sum() > 0:
+            total = counts.sum()
+            w = np.zeros_like(counts, dtype=np.float32)
+            for i, c in enumerate(counts):
+                if c > 0:
+                    w[i] = total / (N_CLASSES * float(c))  # inverse-frequency
+                else:
+                    w[i] = 0.0                            # absent → ignored in CE
+            # Normalize weights so the mean over PRESENT classes is ~1
+            present = w > 0
+            if present.any():
+                w[present] *= (present.sum() / float(w[present].sum()))
+            else:
+                w[:] = 1.0
+        else:
+            w = np.ones(N_CLASSES, dtype=np.float32)
+
+        class_weights = torch.tensor(w, dtype=torch.float32, device=self.device)
+        self.ce_train = nn.CrossEntropyLoss(weight=class_weights)  # used in training
+        self.ce_eval  = nn.CrossEntropyLoss()                      # used in val/test
+        print(f"[Client {self.cid}] class weights:", {c: float(v) for c, v in zip(CLASSES, w)})
+        # >>> NEW
+
         self.state = FreezeState()
 
         # --- Hyperparams (subject to tuning) ----------------------------
@@ -188,7 +211,7 @@ class PTBClient(fl.client.NumPyClient):
                 except Exception:
                     pass
 
-            if self.hp_source == "default":  # still not set from cache
+            if self.hp_source == "default":
                 print(f"[Client {self.cid}] Starting CV: grid={len(GRIDSEARCH.get('grid', []))}, "
                       f"k={int(GRIDSEARCH.get('cv', 5))}")
                 res = run_client_cv(
@@ -220,18 +243,16 @@ class PTBClient(fl.client.NumPyClient):
         # --- Optional head-only warm start for tiny clients -------------
         if EXPERIMENT.get("freeze_enabled", False) and len(self.train_df) < int(FREEZE_THRESHOLD):
             print(f"[Client {self.cid}] Head-only warm start (small client).")
-            # Try freezing features/head if present
             if hasattr(self.model, "features"):
                 for p in self.model.features.parameters():
                     p.requires_grad = False
             if hasattr(self.model, "head"):
-                # enable only the last linear in head
                 for j, module in enumerate(self.model.head):
                     req = (j == len(self.model.head) - 1)
                     for p in getattr(module, "parameters", lambda: [])():
                         p.requires_grad = req
 
-        print(f"[Client {self.cid}] Model: {MODEL['type']} on {self.device} | HP src_Connection: {self.hp_source}")
+        print(f"[Client {self.cid}] Model: {MODEL['type']} on {self.device} | HP source: {self.hp_source}")
 
     # ---------------------------------------------------------------------
     # Flower API
@@ -255,14 +276,12 @@ class PTBClient(fl.client.NumPyClient):
             self.state.last_frozen = 0
             return {"policy": "disabled", "frozen_layers": 0}
 
-        # If model has no .features, bail out gracefully
         if not hasattr(self.model, "features"):
             return {"policy": "unavailable", "frozen_layers": 0}
 
         total_layers = len(list(self.model.features))
         n_train = len(self.train_df)
 
-        # Base target based on size
         if n_train >= 2 * int(FREEZE_THRESHOLD):
             target = 0
         elif n_train < int(FREEZE_THRESHOLD):
@@ -270,7 +289,6 @@ class PTBClient(fl.client.NumPyClient):
         else:
             target = max(0, total_layers // 4)
 
-        # Reactive part
         improved = ((self.state.best_loss - loss_local) > self.state.min_delta) or (acc_local > self.state.best_acc)
         degraded = ((loss_local - self.state.best_loss) > self.state.min_delta) or \
                    (acc_local < self.state.best_acc - 1e-3)
@@ -286,7 +304,6 @@ class PTBClient(fl.client.NumPyClient):
         elif improved:
             target = max(0, target - adjust)
 
-        # Apply pattern: freeze first `target` feature layers
         for i, layer in enumerate(self.model.features):
             for p in layer.parameters():
                 p.requires_grad = (i >= target)
@@ -295,13 +312,8 @@ class PTBClient(fl.client.NumPyClient):
         self.state.best_loss = min(self.state.best_loss, loss_local)
         self.state.best_acc = max(self.state.best_acc, acc_local)
 
-        return {
-            "policy": "dynamic",
-            "frozen_layers": target,
-            "improved": improved,
-            "degraded": degraded,
-            "no_improve": self.state.no_improve,
-        }
+        return {"policy": "dynamic", "frozen_layers": target,
+                "improved": improved, "degraded": degraded, "no_improve": self.state.no_improve}
 
     # ---------------------------------------------------------------------
     # Training / Evaluation on local data
@@ -310,7 +322,7 @@ class PTBClient(fl.client.NumPyClient):
         self.set_parameters(parameters)
         round_num = int(config.get("round", 1))
 
-        # Pre-eval (val) to update freezing plan
+        # Pre-eval (val) to update freezing plan — use UNWEIGHTED eval loss
         loss_before, acc_before = self._eval_on(self.val_df)
         self._apply_freeze_policy(round_num, loss_before, acc_before)
 
@@ -329,7 +341,9 @@ class PTBClient(fl.client.NumPyClient):
                 xb, yb = xb.to(self.device), yb.to(self.device)
                 opt.zero_grad(set_to_none=True)
                 logits = self.model(xb)
-                loss = self.ce(logits, yb)
+                # <<< NEW: use weighted CE during training
+                loss = self.ce_train(logits, yb)
+                # >>> NEW
                 if self.fedprox_mu > 0 and global_params is not None:
                     prox = sum(torch.sum((w - w0) ** 2) for w, w0 in zip(self.model.parameters(), global_params))
                     loss = loss + (self.fedprox_mu / 2.0) * prox
@@ -337,6 +351,7 @@ class PTBClient(fl.client.NumPyClient):
                 opt.step()
 
         wall_s = time.perf_counter() - t0
+        # Post-train validation — use UNWEIGHTED loss for fair comparison
         loss_after, acc_after = self._eval_on(self.val_df)
 
         # Track bests
@@ -351,18 +366,18 @@ class PTBClient(fl.client.NumPyClient):
 
     def evaluate(self, parameters, config):
         self.set_parameters(parameters)
-        # Evaluate on TEST
         loader = _loader_for(self.test_df, batch_size=128, mu=self.mu, sigma=self.sigma, shuffle=False)
         self.model.eval()
         correct, total, loss_sum = 0, 0, 0.0
 
-        # Confusion counts (rows:true, cols:pred)
         cm = np.zeros((N_CLASSES, N_CLASSES), dtype=np.int64)
         with torch.no_grad():
             for xb, yb in loader:
                 xb, yb = xb.to(self.device), yb.to(self.device)
                 logits = self.model(xb)
-                loss_sum += float(self.ce(logits, yb).item()) * len(yb)
+                # <<< NEW: unweighted CE for evaluation
+                loss_sum += float(self.ce_eval(logits, yb).item()) * len(yb)
+                # >>> NEW
                 pred = logits.argmax(dim=1)
                 correct += int((pred == yb).sum())
                 total += len(yb)
@@ -373,14 +388,12 @@ class PTBClient(fl.client.NumPyClient):
         acc = (correct / total) if total > 0 else 0.0
 
         metrics = {"accuracy": float(acc)}
-        # Flatten confusion matrix into metrics
         for i in range(N_CLASSES):
             for j in range(N_CLASSES):
                 metrics[f"cm_{i}_{j}"] = float(cm[i, j])
 
         return float(loss), len(self.test_df), metrics
 
-    # -- helper eval on arbitrary df ------------------------------------
     def _eval_on(self, df) -> Tuple[float, float]:
         if len(df) == 0:
             return 0.0, 0.0
@@ -391,7 +404,9 @@ class PTBClient(fl.client.NumPyClient):
             for xb, yb in loader:
                 xb, yb = xb.to(self.device), yb.to(self.device)
                 logits = self.model(xb)
-                loss_sum += float(self.ce(logits, yb).item()) * len(yb)
+                # <<< NEW: unweighted CE for validation
+                loss_sum += float(self.ce_eval(logits, yb).item()) * len(yb)
+                # >>> NEW
                 pred = logits.argmax(dim=1)
                 correct += int((pred == yb).sum())
                 total += len(yb)
@@ -446,7 +461,6 @@ def main():
 
     client = PTBClient(args.cid)
 
-    # Flower >=1.0: start_client + NumPyClient instance
     fl.client.start_client(
         server_address=str(FL_SERVER_ADDRESS),
         client=client,  # NumPyClient instance

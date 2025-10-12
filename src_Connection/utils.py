@@ -1,3 +1,4 @@
+# src_Connection/utils.py
 """
 utils.py — General Utilities
 ----------------------------
@@ -6,7 +7,7 @@ Helper functions shared across modules in the Sustainable AI in Healthcare (DSP5
   • Reproducibility: seed setting across Python/NumPy/PyTorch
   • Logging helpers
   • File/dir helpers
-  • Plotting of 12-lead ECG signals
+  • Plotting of 12-lead ECG signals (lazy matplotlib import)
   • Basic metrics (acc/F1/AUC) for quick evals
   • Dataset summaries (patients/records/time)
   • Device/DataLoader utilities
@@ -22,11 +23,18 @@ import time
 import random
 import numpy as np
 import torch
-import matplotlib.pyplot as plt
 from sklearn.metrics import accuracy_score, f1_score, roc_auc_score
 
 from src_Connection.config import RESULTS_DIR, SEED, LOW_RAM
 
+__all__ = [
+    "ts", "log",
+    "set_seed", "sanitize_mps_env", "pick_device",
+    "ensure_dir", "plot_signal",
+    "compute_metrics", "summarize_dataset",
+    "format_time", "count_trainable_params", "print_model_summary",
+    "torch_loader_kwargs",
+]
 
 # -------------------------------------------------------------------------
 # 0) Logging / timestamps
@@ -57,10 +65,12 @@ def set_seed(seed: int | None = None) -> None:
         torch.manual_seed(s)
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(s)
-        # Deterministic cuDNN for reproducibility
-        torch.backends.cudnn.deterministic = True
-        torch.backends.cudnn.benchmark = False
+        # Deterministic cuDNN for reproducibility (only if CUDA is built)
+        if hasattr(torch.backends, "cudnn"):
+            torch.backends.cudnn.deterministic = True
+            torch.backends.cudnn.benchmark = False
     except Exception:
+        # Keep going even if torch isn't fully available in this environment
         pass
     log(f"Seeds set (seed={s}).")
 
@@ -102,14 +112,27 @@ def ensure_dir(p: Path) -> None:
 
 
 # -------------------------------------------------------------------------
-# 3) Plotting
+# 3) Plotting (lazy import for headless safety)
 # -------------------------------------------------------------------------
 def plot_signal(sig: np.ndarray, title: str = "ECG (12xT)", save: str | None = None) -> None:
     """
     Plot a 12-lead ECG (shape: 12 x T) with vertical offsets for readability.
     If `save` is provided, stores the figure under RESULTS_DIR / save.
+    Uses a lazy matplotlib import to avoid backend issues.
     """
-    # sig: (12, T)
+    try:
+        import matplotlib
+        # Use non-interactive backend if not already set
+        if os.environ.get("MPLBACKEND") is None:
+            try:
+                matplotlib.use("Agg", force=False)
+            except Exception:
+                pass
+        import matplotlib.pyplot as plt
+    except Exception:
+        log("plot_signal: matplotlib not available; skipping plot.")
+        return
+
     plt.figure(figsize=(10, 6))
     offset = 2.5 * np.arange(sig.shape[0])
     for i in range(sig.shape[0]):
@@ -218,10 +241,14 @@ def torch_loader_kwargs(shuffle: bool, batch_size: int, device_type: str) -> dic
     """
     Centralized DataLoader kwargs used across the codebase.
 
-    • On low-RAM runs, keep workers at 0 (safer for notebooks).
+    • On low-RAM runs, keep workers at 0 (safer for notebooks & Windows).
     • Pin memory only on CUDA.
     """
-    num_workers = 0 if LOW_RAM else 0  # adjust here if you later add multiprocessing
+    if LOW_RAM:
+        num_workers = 0
+    else:
+        # Conservative default that is stable on macOS/Windows/Linux
+        num_workers = 0  # raise to 2+ later if you want multiprocessing
     pin = (device_type == "cuda")
     return dict(
         batch_size=int(batch_size),

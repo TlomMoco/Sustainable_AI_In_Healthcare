@@ -1,16 +1,12 @@
+# src_Connection/Server.py
 """
 Server.py — Federated Learning Orchestrator
 -------------------------------------------
 
 Coordinates the federated training process across multiple PTB-XL clients.
 
-Responsibilities:
-  • Initialize the Flower (flwr) federated averaging server
-  • Configure each training round (number, unfreezing schedule, etc.)
-  • Aggregate metrics across clients (weighted by number of examples)
-
 Launch order (multi-terminal):
-    $ python -m src_Connection.Server         # Terminal 1
+    $ python -m src_Connection.Server         # Terminal 1 (server)
     $ python -m src_Connection.Client --cid 0 # Terminal 2
     $ python -m src_Connection.Client --cid 1 # Terminal 3
     $ python -m src_Connection.Client --cid 2 # ...
@@ -18,11 +14,23 @@ Launch order (multi-terminal):
 """
 
 from __future__ import annotations
+
 from typing import Dict, List, Tuple
 import csv
 import numpy as np
+
+# Headless-safe plotting (only used if you enable heatmaps)
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-import flwr as fl
+
+try:
+    import flwr as fl
+except ImportError as e:
+    raise ImportError(
+        "Flower is not installed. On zsh, quote the spec to avoid globbing:\n"
+        "  pip install 'flwr==1.*'"
+    ) from e
 
 from src_Connection.config import (
     CLIENTS,
@@ -33,12 +41,13 @@ from src_Connection.config import (
     N_CLASSES,
     TUNING,
     SUPERCLASSES,
+    FL_SERVER_ADDRESS,  # use address from config
 )
+
 
 # -------------------------------------------------------------------------
 # Helper methods for logging
 # -------------------------------------------------------------------------
-
 def _append_global_row(server_round: int, acc: float, loss: float) -> None:
     """Append a GLOBAL row with round-level metrics to the results CSV."""
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
@@ -105,7 +114,7 @@ def _save_confusion_heatmap(cm: np.ndarray, server_round: int) -> None:
         cmn = cm / cm.sum(axis=1, keepdims=True)
         cmn = np.nan_to_num(cmn)
     plt.figure(figsize=(6, 5))
-    plt.imshow(cmn, aspect="auto")
+    plt.imshow(cmn, aspect="auto", vmin=0, vmax=1)
     plt.title(f"Confusion Matrix — {EXPERIMENT['run_name']} (round {server_round})")
     plt.xlabel("Predicted"); plt.ylabel("True")
     plt.colorbar(label="Row-normalized")
@@ -120,10 +129,8 @@ def _save_confusion_heatmap(cm: np.ndarray, server_round: int) -> None:
 def weighted_average(metrics: List[Tuple[int, Dict[str, float]]]) -> Dict[str, float]:
     """
     Compute weighted average of client metrics.
-
     Args:
         metrics: List of (num_examples, {"accuracy": value, ...}) pairs.
-
     Returns:
         Dict[str, float]: Weighted average metrics (currently accuracy only).
     """
@@ -132,7 +139,7 @@ def weighted_average(metrics: List[Tuple[int, Dict[str, float]]]) -> Dict[str, f
         return {"accuracy": 0.0}
     avg_accuracy = sum(num_examples * m.get("accuracy", 0.0)
                        for num_examples, m in metrics) / total_examples
-    return {"accuracy": avg_accuracy}
+    return {"accuracy": float(avg_accuracy)}
 
 
 # -------------------------------------------------------------------------
@@ -155,12 +162,13 @@ class LoggingFedAvg(fl.server.strategy.FedAvg):
             for i in range(N_CLASSES):
                 for j in range(N_CLASSES):
                     key = f"cm_{i}_{j}"
-                    if key in m:
-                        cm[i, j] += float(m[key])
+                    v = m.get(key, None)
+                    if v is not None:
+                        cm[i, j] += float(v)
 
         _append_perclass_row(server_round, cm)
         _append_confusion_rows(server_round, cm)
-        # Optionally save a figure each round:
+        # If you want per-round images, uncomment below (slower):
         # _save_confusion_heatmap(cm, server_round)
         return agg
 
@@ -173,20 +181,22 @@ def start_server():
 
     def on_fit_config_fn(rnd: int) -> Dict[str, int]:
         # Sent to clients each round; clients can use 'round' and schedule logic
-        return {"round": rnd, "unfreeze_after": FREEZE_CFG["unfreeze_after"]}
+        return {"round": rnd, "unfreeze_after": int(FREEZE_CFG["unfreeze_after"])}
 
     strategy = LoggingFedAvg(
-        min_fit_clients=CLIENTS,                    # clients selected per round
-        min_available_clients=CLIENTS,              # required clients online
+        min_fit_clients=int(CLIENTS),
+        min_available_clients=int(CLIENTS),
         evaluate_metrics_aggregation_fn=weighted_average,
-        fit_metrics_aggregation_fn=lambda mets: {}, # silence fit-metrics warning
+        fit_metrics_aggregation_fn=lambda mets: {},  # silence fit-metrics warning
         on_fit_config_fn=on_fit_config_fn,
     )
 
+    addr = str(FL_SERVER_ADDRESS)  # e.g., "127.0.0.1:8080" from config.py
+    print(f"[Server] Starting Flower @ {addr}  |  rounds={int(ROUNDS)}  |  clients={int(CLIENTS)}")
     fl.server.start_server(
-        server_address="0.0.0.0:8080",
+        server_address=addr,
         strategy=strategy,
-        config=fl.server.ServerConfig(num_rounds=ROUNDS),
+        config=fl.server.ServerConfig(num_rounds=int(ROUNDS)),
     )
 
 
@@ -194,10 +204,4 @@ def start_server():
 # Entry point (multi-terminal)
 # -------------------------------------------------------------------------
 if __name__ == "__main__":
-    # Real multi-process / multi-terminal server:
     start_server()
-
-    # If you ever want the single-process local simulation again,
-    # keep that code in a separate helper (not executed here).
-    # from .Server import start_simulation
-    # start_simulation()

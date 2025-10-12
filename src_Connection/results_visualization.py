@@ -1,4 +1,9 @@
 # results_visualization.py
+"""
+Visualization utilities for FL runs and centralized evaluation.
+"""
+
+from __future__ import annotations
 
 import matplotlib
 matplotlib.use("Agg")  # headless-safe backend
@@ -31,6 +36,23 @@ ensure_dir(OUT)
 
 PHASE_ENABLED  = "post_cv"
 PHASE_DISABLED = "no_cv"
+
+# --- small helper: moving average (rounds) -----------------------------------
+MA_WINDOW = 3  # change if you want a smoother/rougher overlay
+
+
+def _ma_xy(x, y, k: int = MA_WINDOW):
+    """Return (x_ma, y_ma) for a simple moving average of length k."""
+    try:
+        x = np.asarray(list(x), dtype=float)
+        y = np.asarray(list(y), dtype=float)
+    except Exception:
+        return x, y
+    if k is None or k <= 1 or y.size < k:
+        return x, y
+    y_ma = np.convolve(y, np.ones(k, dtype=float) / k, mode="valid")
+    x_ma = x[k - 1 :]
+    return x_ma, y_ma
 
 
 def _print_missing(path: Path):
@@ -104,7 +126,7 @@ def _safe_save(fig, name: str):
 # Plotting
 # -------------------------------------------------------------------------
 
-# -- Global accuracy vs round --------------------------------------------
+# -- Global accuracy vs round (+ MA overlay) ------------------------------
 if dfs:
     fig = plt.figure()
     ax = fig.add_subplot(111)
@@ -115,7 +137,11 @@ if dfs:
         if g.empty or "round" not in g.columns or "accuracy" not in g.columns:
             continue
         g = g.sort_values("round")
-        ax.plot(g["round"], g["accuracy"], label=f"Global ({name})")
+        line, = ax.plot(g["round"], g["accuracy"], alpha=0.45, label=f"Global ({name})")
+        xm, ym = _ma_xy(g["round"], g["accuracy"])
+        if len(ym):
+            ax.plot(xm, ym, linestyle="--", linewidth=2.5, color=line.get_color(),
+                    label=f"Global ({name}, MA{MA_WINDOW})")
     ax.set_xlabel("Round"); ax.set_ylabel("Accuracy"); ax.set_title("Global Accuracy per Round")
     ax.legend(); ax.grid(True); fig.tight_layout()
     _safe_save(fig, "global_accuracy.png")
@@ -284,6 +310,55 @@ for name, dfc in conf_long.items():
     _safe_save(fig, f"confusion_{name}_r{r:02d}.png")
 
 
+# -- Macro-F1 per round (computed from confusion matrices) ----------------
+def _macro_f1_from_cm(cm: np.ndarray) -> float:
+    """Compute macro-F1 from a confusion matrix (rows=true, cols=pred)."""
+    tp = np.diag(cm).astype(float)
+    fp = cm.sum(axis=0) - tp
+    fn = cm.sum(axis=1) - tp
+    denom = (2 * tp + fp + fn)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        f1 = np.where(denom > 0, (2 * tp) / np.maximum(denom, 1e-12), 0.0)
+    valid = cm.sum(axis=1) > 0
+    return float(f1[valid].mean()) if valid.any() else float("nan")
+
+
+for name, dfc in conf_long.items():
+    if dfc is None or dfc.empty or not {"round", "true", "pred", "count"}.issubset(dfc.columns):
+        continue
+    rounds = sorted(dfc["round"].dropna().unique().tolist())
+    if not rounds:
+        continue
+    macro_f1_vals, rr = [], []
+    n = len(SUPERCLASSES)
+    for r in rounds:
+        sub = dfc[dfc["round"] == r]
+        try:
+            piv = sub.pivot_table(index="true", columns="pred", values="count",
+                                  aggfunc="sum", fill_value=0)
+            piv.index = pd.to_numeric(piv.index, errors="coerce")
+            piv.columns = pd.to_numeric(piv.columns, errors="coerce")
+            cm = (piv.reindex(index=range(n), columns=range(n), fill_value=0)
+                     .to_numpy(dtype=float))
+        except Exception:
+            continue
+        macro_f1_vals.append(_macro_f1_from_cm(cm))
+        rr.append(int(r))
+
+    if macro_f1_vals:
+        fig = plt.figure()
+        ax = fig.add_subplot(111)
+        line, = ax.plot(rr, macro_f1_vals, marker="o", label=f"{name}")
+        xm, ym = _ma_xy(rr, macro_f1_vals)
+        if len(ym):
+            ax.plot(xm, ym, linestyle="--", linewidth=2.0, color=line.get_color(),
+                    label=f"{name} (MA{MA_WINDOW})")
+        ax.set_xlabel("Round"); ax.set_ylabel("Macro-F1")
+        ax.set_title(f"Global Macro-F1 per Round — {name}")
+        ax.legend(); ax.grid(True); fig.tight_layout()
+        _safe_save(fig, f"global_macro_f1_{name}.png")
+
+
 # -- Global accuracy by phase (within each run) --------------------------
 for name, df in dfs.items():
     if df is None or df.empty or "phase" not in df.columns:
@@ -305,7 +380,7 @@ for name, df in dfs.items():
     _safe_save(fig, f"global_by_phase_{name}.png")
 
 
-# -- Per-client accuracy by phase (overlay pre/post) ---------------------
+# -- Per-client accuracy by phase (overlay pre/post + MA overlays) -------
 for name, df in dfs.items():
     if df is None or df.empty or "phase" not in df.columns or "client_id" not in df.columns:
         continue
@@ -315,15 +390,37 @@ for name, df in dfs.items():
     fig = plt.figure()
     ax = fig.add_subplot(111)
     drew_any = False
+
+    # Plot raw client lines (lighter) + their MA overlay (thicker, same color)
     for phase, style in [(PHASE_DISABLED, "-"), (PHASE_ENABLED, "--")]:
         grp = sub[sub["phase"].astype(str).eq(phase)]
         for cid, g in grp.groupby("client_id"):
             g = g.sort_values(by="round")
-            if g.empty: 
+            if g.empty:
                 continue
-            ax.plot(g["round"], g["accuracy"], linestyle=style, alpha=0.7,
-                    label=f"Client {cid} ({name}, {phase})")
+            # raw (light, unlabeled to avoid legend clutter)
+            line, = ax.plot(g["round"], g["accuracy"], linestyle=style, alpha=0.35, zorder=1)
+            # moving average overlay (thicker, labeled)
+            xm, ym = _ma_xy(g["round"].values, g["accuracy"].values)
+            ax.plot(
+                xm, ym,
+                linestyle=style, linewidth=2.0, color=line.get_color(), alpha=0.95,
+                label=f"Client {cid} ({name}, {phase})", zorder=2
+            )
             drew_any = True
+
+    # Add GLOBAL moving-average overlay for context (single black line)
+    g_global = df[df["client_id"].astype(str) == "GLOBAL"].copy()
+    if not g_global.empty and "round" in g_global.columns and "accuracy" in g_global.columns:
+        g_global = g_global.sort_values("round")
+        xg, yg = _ma_xy(g_global["round"].values, g_global["accuracy"].values)
+        if len(yg):
+            ax.plot(
+                xg, yg,
+                linestyle="-.", linewidth=3.0, color="black", alpha=0.8,
+                label=f"GLOBAL ({name}, MA{MA_WINDOW})", zorder=3
+            )
+
     if drew_any:
         ax.set_xlabel("Round"); ax.set_ylabel("Local Accuracy")
         ax.set_title(f"Per-Client Accuracy by Phase — {name}")
@@ -340,11 +437,6 @@ print(f"Saved plots (where possible) to: {OUT.resolve()}")
 # (Kept as in your original file; lightly hardened for imports.)
 # =============================================================================
 
-# ---------
-# ## 15) Unified Evaluation + ROC-AUC (from notebook)
-# ---------
-from __future__ import annotations as _ann_eval  # avoid shadowing
-
 import time as _time, re as _re
 import torch as _torch
 from sklearn.metrics import (classification_report as _clsrep, accuracy_score as _acc,
@@ -356,7 +448,6 @@ try:
     from . import config as CFG
     from .utils import torch_loader_kwargs as _torch_loader_kwargs
 except Exception:
-    # Fallback if imported as a standalone script (optional)
     from src_Connection import config as CFG  # type: ignore
     from src_Connection.utils import torch_loader_kwargs as _torch_loader_kwargs  # type: ignore
 
@@ -439,9 +530,6 @@ def evaluate_models(models_dict, paths, y_true, label_encoder, is_binary, device
     return df
 
 
-# ---------
-# ## 16) Confusion Matrix (from notebook)
-# ---------
 def _slug(txt): return _re.sub(r"[^a-z0-9]+", "_", str(txt).lower()).strip("_")
 
 def plot_confusion(y_true, y_pred, title="Confusion Matrix", classes=None, save_path=None, collapse_to_3=False):
@@ -477,9 +565,6 @@ def plot_confusion(y_true, y_pred, title="Confusion Matrix", classes=None, save_
     return fig
 
 
-# ---------
-# ## 17) Learning Curves (from notebook)
-# ---------
 def plot_learning_curves(histories: dict[str, dict], out_dir: str | Path | None = None):
     if not histories:
         print("No histories to plot.")
@@ -505,36 +590,6 @@ def plot_learning_curves(histories: dict[str, dict], out_dir: str | Path | None 
             plt.tight_layout(); plt.savefig(fp2, dpi=300, bbox_inches='tight'); print('Saved:', fp2); plt.close()
 
 
-# ---------
-# ## 17c) Overfitting quick check (from notebook)
-# ---------
-def overfitting_check(histories: dict[str, dict], cv_all_df: pd.DataFrame | None = None,
-                      min_train=0.80, max_val=0.70, min_gap=0.12):
-    rows = []
-    for name, hist in histories.items():
-        tr = np.array(hist.get("accuracy", []), float)
-        va = np.array(hist.get("val_accuracy", []), float)
-        if tr.size == 0 or va.size == 0:
-            rows.append({"model": name, "OVERFITTING": "no history"})
-            continue
-        gap = float(tr[-1] - va[-1])
-        flag = (tr[-1] >= min_train) and (va[-1] <= max_val) and (gap >= min_gap)
-        rows.append({"model": name, "train_acc_last": float(tr[-1]), "val_acc_last": float(va[-1]),
-                     "gap": gap, "OVERFITTING": "YES" if flag else "NO/unclear"})
-    df = pd.DataFrame(rows).sort_values("gap", ascending=False)
-    if cv_all_df is not None and not cv_all_df.empty:
-        g = cv_all_df.groupby("model")["accuracy"].agg(cv_mean="mean", cv_std="std")
-        last_tr = {k: (np.array(v.get("accuracy", []), float)[-1] if v.get("accuracy") else np.nan)
-                   for k, v in histories.items()}
-        g["train_acc_last"] = [last_tr.get(m if "(PyTorch)" in m else f"{m} (PyTorch)", np.nan) for m in g.index]
-        g["train_minus_cv"] = g["train_acc_last"] - g["cv_mean"]
-        return df, g
-    return df, None
-
-
-# ---------
-# ## 18a) Fairness / Group Metrics (from notebook)
-# ---------
 from sklearn.metrics import f1_score as _f1_score
 
 def fairness_macro_f1_by_groups(best_adapter, y_true, test_index, meta_df: pd.DataFrame):
@@ -574,9 +629,6 @@ def fairness_macro_f1_by_groups(best_adapter, y_true, test_index, meta_df: pd.Da
     return fair_df
 
 
-# ---------
-# ## 18b) Interpretation — Gradient×Input saliency (from notebook)
-# ---------
 def saliency_grad_times_input(model: _torch.nn.Module, path: str, device=None):
     device = device or _torch.device("cuda" if _torch.cuda.is_available() else "cpu")
     model = model.to(device).eval()
@@ -612,7 +664,7 @@ def plot_saliency_overlay(model, sample_paths: list[str], out_dir: str | Path | 
         plt.tight_layout(); plt.savefig(fp, dpi=220, bbox_inches="tight"); print("Saved:", fp); plt.close()
 
 # ---------
-# ## 18c) Efficiency — params & inference time (from notebook)
+# Efficiency helpers
 # ---------
 def count_params(m):
     return sum(p.numel() for p in m.parameters() if p.requires_grad)

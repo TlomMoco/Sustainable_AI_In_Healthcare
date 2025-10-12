@@ -10,6 +10,7 @@ import numpy as np
 import pandas as pd
 import torch
 from torch import nn, optim
+from torch.utils.data import DataLoader
 from sklearn.metrics import classification_report
 from sklearn.pipeline import Pipeline
 from sklearn.impute import SimpleImputer
@@ -19,24 +20,49 @@ from sklearn.ensemble import RandomForestClassifier
 
 # --- Project imports (use absolute package imports consistently)
 from src_Connection import config as CFG
-from src_Connection.utils import set_seed, pick_device, log, sanitize_mps_env
+from src_Connection.utils import (
+    set_seed,
+    pick_device,
+    log,
+    sanitize_mps_env,
+    torch_loader_kwargs,   # NEW: for a stable train-eval DataLoader
+)
 from src_Connection.data_loader import (
     load_metadata,
     map_superclasses,
     filter_single_label,
     stratified_patient_split,
-    make_feature_table,             # returns (feature_df, minimal_meta_df)
-    train_test_split as mask_split  # boolean-mask split for deep set
+    make_feature_table_legacy,                  # <- legacy: (X, y, classes)
+    make_feature_table as build_feature_tables, # <- deep: (feature_df, features_df)
+    train_test_split as mask_split,             # boolean-mask split for deep set
 )
-from src_Connection.data_preprocessing import make_label_encoder, make_train_val_loaders
+from src_Connection.data_preprocessing import (
+    make_label_encoder,
+    make_train_val_loaders,
+    ECGDataset,                                 # NEW: to build a train-eval loader
+)
 from src_Connection.models import create_model, create_logistic_baseline
-from src_Connection.results_visualization import TorchAdapter, evaluate_models, plot_confusion, plot_learning_curves
+from src_Connection.results_visualization import (
+    TorchAdapter,
+    evaluate_models,
+    plot_confusion,
+    plot_learning_curves,
+)
+
+
+# =============================================================================
+# Helper to read config (supports top-level vars or NOTEBOOK[...] fallbacks)
+# =============================================================================
+def C(name: str, default=None):
+    """Return CFG.<name> if present, else CFG.NOTEBOOK[name], else default."""
+    return getattr(CFG, name, CFG.NOTEBOOK.get(name, default))
 
 
 # =============================================================================
 # 1) Quick ML baselines on engineered features (LogReg, RandomForest)
 # =============================================================================
-def run_quick_ml_baselines(seed: int = CFG.SEED) -> None:
+def run_quick_ml_baselines(seed: int | None = None) -> None:
+    seed = int(seed if seed is not None else C("SEED", 42))
     set_seed(seed)
 
     # Load + map labels, ensure 1 label per row, patient-safe split
@@ -44,13 +70,22 @@ def run_quick_ml_baselines(seed: int = CFG.SEED) -> None:
     df = filter_single_label(map_superclasses(ptb))
     train_df, test_df = stratified_patient_split(df, test_size=0.2, seed=seed)
 
-    # Build simple per-record feature table
-    Xtr, ytr, classes = make_feature_table(train_df)
-    Xte, yte, _ = make_feature_table(test_df)
+    # Build simple per-record feature tables (LEGACY API)
+    Xtr, ytr, classes = make_feature_table_legacy(train_df)
+    Xte, yte, _ = make_feature_table_legacy(test_df)
 
     # Baseline models
     logreg = create_logistic_baseline().fit(Xtr, ytr)
-    rf = RandomForestClassifier(n_estimators=300, random_state=seed).fit(Xtr, ytr)
+
+    rf = Pipeline([
+        ("imp", SimpleImputer(strategy="median")),
+        ("rf", RandomForestClassifier(
+            n_estimators=300,
+            random_state=seed,
+            n_jobs=-1,
+            class_weight="balanced_subsample",
+        )),
+    ]).fit(Xtr, ytr)
 
     for name, clf in {"LogReg": logreg, "RF": rf}.items():
         ypred = clf.predict(Xte)
@@ -61,14 +96,15 @@ def run_quick_ml_baselines(seed: int = CFG.SEED) -> None:
 # =============================================================================
 # 2) Deep learning pipeline (CNN/RNN/LSTM/ANN in PyTorch)
 # =============================================================================
-def run_deep_models(seed: int = CFG.SEED) -> None:
+def run_deep_models(seed: int | None = None) -> None:
+    seed = int(seed if seed is not None else C("SEED", 42))
     set_seed(seed)
     sanitize_mps_env()
     device = pick_device()
     log(f"[Torch] device={device}")
 
-    # Build features + minimal meta table (feature_df has engineered features; features_df has minimal deep meta)
-    feature_df, features_df = make_feature_table(save_csv=True)
+    # Build engineered feature table + minimal meta (DEEP API)
+    feature_df, features_df = build_feature_tables(save_csv=True)
 
     # Boolean masks for train/test (patient/leakage-safe)
     train_mask, test_mask = mask_split(features_df)
@@ -112,9 +148,15 @@ def run_deep_models(seed: int = CFG.SEED) -> None:
     n_classes = len(le.classes_)
     is_binary = (n_classes == 2)
 
-    # DataLoaders
+    # DataLoaders (increase val_frac for steadier validation)
     train_loader, val_loader, tr_pos, va_pos = make_train_val_loaders(
-        train_paths, y_tr, device=device
+        train_paths, y_tr, device=device, val_frac=0.20
+    )
+
+    # Stable train metrics: eval-mode loader (non-shuffled) on the train split
+    train_eval_ds = ECGDataset(train_paths[tr_pos], y_tr[tr_pos])
+    train_eval_loader = DataLoader(
+        train_eval_ds, **torch_loader_kwargs(False, C("BATCH_SIZE", 24), device.type)
     )
 
     def _criterion():
@@ -135,9 +177,10 @@ def run_deep_models(seed: int = CFG.SEED) -> None:
             total += xb.size(0)
         return (loss_sum / total if total else math.nan), (correct / total if total else math.nan)
 
-    def train_model_torch(name: str, epochs: int = CFG.EPOCHS):
+    def train_model_torch(name: str, epochs: int | None = None):
+        epochs = int(epochs if epochs is not None else C("EPOCHS", 12))
         model = create_model(name, n_classes, binary=is_binary).to(device)
-        base_lr = CFG.RECURRENT_LR if name.lower() in {"rnn", "lstm", "ann"} else CFG.BASE_LR
+        base_lr = C("RECURRENT_LR", 2e-4) if name.lower() in {"rnn", "lstm", "ann"} else C("BASE_LR", 3e-4)
         opt = optim.Adam(model.parameters(), lr=base_lr)
         sch = optim.lr_scheduler.ReduceLROnPlateau(opt, mode="min", factor=0.5, patience=2, min_lr=1e-5)
         crit = _criterion()
@@ -147,37 +190,37 @@ def run_deep_models(seed: int = CFG.SEED) -> None:
         best_val = float("inf")
 
         for ep in range(1, epochs + 1):
+            # --- train phase (dropout ON) ---
             model.train()
-            ep_loss = ep_correct = ep_total = 0
+            ep_loss = ep_total = 0
             for xb, yb in train_loader:
                 xb, yb = xb.to(device), yb.to(device)
                 opt.zero_grad(set_to_none=True)
                 logits = model(xb)
                 loss = crit(logits.view(-1), yb.float()) if is_binary else crit(logits, yb)
                 loss.backward()
-                if getattr(CFG, "GRAD_CLIP_NORM", None):
-                    nn.utils.clip_grad_norm_(model.parameters(), float(CFG.GRAD_CLIP_NORM))
+                if C("GRAD_CLIP_NORM", None):
+                    nn.utils.clip_grad_norm_(model.parameters(), float(C("GRAD_CLIP_NORM")))
                 opt.step()
-
                 ep_loss += loss.item() * xb.size(0)
-                preds = (torch.sigmoid(logits.view(-1)) >= 0.5).long() if is_binary else logits.argmax(1)
-                ep_correct += (preds == yb).sum().item()
                 ep_total += xb.size(0)
 
-            tr_loss = ep_loss / max(1, ep_total)
-            tr_acc = ep_correct / max(1, ep_total)
+            train_loss_trainmode = ep_loss / max(1, ep_total)
+
+            # --- metrics in EVAL mode (dropout OFF) ---
+            tr_loss, tr_acc = _eval_epoch(model, train_eval_loader)
             va_loss, va_acc = _eval_epoch(model, val_loader)
             sch.step(va_loss if not math.isnan(va_loss) else tr_loss)
 
-            hist["loss"].append(tr_loss)
-            hist["accuracy"].append(tr_acc)
+            hist["loss"].append(tr_loss)           # eval-mode train loss
+            hist["accuracy"].append(tr_acc)        # eval-mode train acc
             hist["val_loss"].append(va_loss)
             hist["val_accuracy"].append(va_acc)
 
             print(
                 f"[{name}] epoch {ep:02d}/{epochs}  "
-                f"loss={tr_loss:.4f} acc={tr_acc:.4f}  "
-                f"val_loss={va_loss:.4f} val_acc={va_acc:.4f}"
+                f"train(loss={train_loss_trainmode:.4f}→eval {tr_loss:.4f} acc={tr_acc:.4f})  "
+                f"val(loss={va_loss:.4f} acc={va_acc:.4f})"
             )
 
             if va_loss < best_val:
@@ -192,10 +235,10 @@ def run_deep_models(seed: int = CFG.SEED) -> None:
     histories: dict[str, dict] = {}
     deep_models_raw: dict[str, torch.nn.Module] = {}
     for name, flag in [
-        ("cnn",  getattr(CFG, "RUN_TORCH_CNN",  True)),
-        ("rnn",  getattr(CFG, "RUN_TORCH_RNN",  True)),
-        ("lstm", getattr(CFG, "RUN_TORCH_LSTM", True)),
-        ("ann",  getattr(CFG, "RUN_TORCH_ANN",  True)),
+        ("cnn",  C("RUN_TORCH_CNN",  True)),
+        ("rnn",  C("RUN_TORCH_RNN",  True)),
+        ("lstm", C("RUN_TORCH_LSTM", True)),
+        ("ann",  C("RUN_TORCH_ANN",  True)),
     ]:
         if not flag:
             print(f"[Train] Skipped {name.upper()} (flag off)")
@@ -203,18 +246,17 @@ def run_deep_models(seed: int = CFG.SEED) -> None:
         print(f"\n[Train] === {name.upper()} ===")
         m, h = train_model_torch(name)
         deep_models_raw[f"{name.upper()} (PyTorch)"] = m
-        histories[f"{name.upper()} (PyTorch)"] = h
+        histories[f"{name.UPPER()} (PyTorch)"] = h if False else histories.setdefault(f"{name.upper()} (PyTorch)", h)  # keep order
 
     # Evaluate on TEST
-    # TorchAdapter may or may not accept a 'device' argument depending on your version.
     try:
         adapters = {
-            name: TorchAdapter(m, le, is_binary, batch=CFG.BATCH_SIZE, device=device)
+            name: TorchAdapter(m, le, is_binary, batch=C("BATCH_SIZE", 24), device=device)
             for name, m in deep_models_raw.items()
         }
     except TypeError:
         adapters = {
-            name: TorchAdapter(m, le, is_binary, batch=CFG.BATCH_SIZE)
+            name: TorchAdapter(m, le, is_binary, batch=C("BATCH_SIZE", 24))
             for name, m in deep_models_raw.items()
         }
 
@@ -223,8 +265,8 @@ def run_deep_models(seed: int = CFG.SEED) -> None:
     print(unified_df)
 
     # Plots
-    viz_dir = CFG.RESULTS_DIR / "viz"
-    viz_dir.mkdir(parents=True, exist_ok=True)
+    viz_dir = C("RESULTS_DIR", Path("results")) / "viz"
+    Path(viz_dir).mkdir(parents=True, exist_ok=True)
 
     if not unified_df.empty:
         best_name = str(unified_df.iloc[0]["model"])
@@ -233,8 +275,8 @@ def run_deep_models(seed: int = CFG.SEED) -> None:
         plot_confusion(
             y_te, y_pred,
             title=f"Confusion — {best_name}",
-            save_path=str(viz_dir / f"confusion_{best_name.replace(' ', '_')}.png"),
-            collapse_to_3=getattr(CFG, "CONFUSION_COLLAPSE_TO_3", False),
+            save_path=str(Path(viz_dir) / f"confusion_{best_name.replace(' ', '_')}.png"),
+            collapse_to_3=C("CONFUSION_COLLAPSE_TO_3", False),
         )
 
     plot_learning_curves(histories, out_dir=str(viz_dir))
@@ -246,8 +288,8 @@ def run_deep_models(seed: int = CFG.SEED) -> None:
 # =============================================================================
 def main():
     # Run both phases; comment either out if you want to skip one.
-    run_quick_ml_baselines(seed=CFG.SEED)
-    run_deep_models(seed=CFG.SEED)
+    run_quick_ml_baselines(seed=C("SEED", 42))
+    run_deep_models(seed=C("SEED", 42))
 
 
 if __name__ == "__main__":

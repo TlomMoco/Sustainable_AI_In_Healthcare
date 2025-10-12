@@ -1,28 +1,12 @@
+# src_Connection/Experiments.py
 from __future__ import annotations
-import subprocess
+
 import argparse
+import subprocess
 import sys
 import time
 from pathlib import Path
-
-# Minimal holder to show where to add experiment loops/config sweeps
-
-CENTRALIZED_CMD = ["python", "-m", "src_Connection.Centralized"]
-SERVER_CMD = ["python", "-m", "src_Connection.Server"]
-CLIENT_CMD = lambda cid: ["python", "-m", "src_Connection.Client", "--cid", str(cid)]
-
-
-if __name__ == "__main__" and False:
-    # Example: run centralized once
-    subprocess.run(CENTRALIZED_CMD, check=True)
-    # For federated, open multiple terminals or use process manager (tmux, etc.))
-
-
-# ---------
-# ## 14) K-Fold CV for All Models (from notebook)
-# ---------
-from __future__ import annotations
-import time as _time, math
+import math
 import numpy as np
 import pandas as pd
 import torch
@@ -34,23 +18,31 @@ from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_sc
 from . import config as CFG
 from .models import create_model
 from .utils import torch_loader_kwargs, log, set_seed, ensure_dir
-from .data_loader import load_metadata as _dl_load_metadata  # legacy use (kept for context)
 from .data_loader import make_feature_table as _dl_make_feature_table
 from .data_preprocessing import make_label_encoder
 
-# -----------------------------
-# Core CV helpers (unchanged)
-# -----------------------------
+
+# --------------------------------------------------------------------------------------
+# Launch helpers (use current interpreter for cross-platform compatibility)
+# --------------------------------------------------------------------------------------
+PY = sys.executable
+CENTRALIZED_CMD = [PY, "-m", "src_Connection.Centralized"]
+SERVER_CMD      = [PY, "-m", "src_Connection.Server"]
+CLIENT_CMD      = lambda cid: [PY, "-m", "src_Connection.Client", "--cid", str(cid)]
+
+
+# --------------------------------------------------------------------------------------
+# CV utilities
+# --------------------------------------------------------------------------------------
 def _criterion(binary: bool, ce_weights=None, bce_pos_weight=None):
     if binary:
         if bce_pos_weight:
             return nn.BCEWithLogitsLoss(pos_weight=torch.tensor([float(bce_pos_weight)]))
         return nn.BCEWithLogitsLoss()
-    else:
-        if ce_weights is not None:
-            w = torch.tensor(ce_weights, dtype=torch.float32)
-            return nn.CrossEntropyLoss(weight=w)
-        return nn.CrossEntropyLoss()
+    if ce_weights is not None:
+        w = torch.tensor(ce_weights, dtype=torch.float32)
+        return nn.CrossEntropyLoss(weight=w)
+    return nn.CrossEntropyLoss()
 
 class _PairDS(Dataset):
     def __init__(self, paths, y):
@@ -63,19 +55,19 @@ class _PairDS(Dataset):
         x = load_waveform_np(self.paths[i], T=self.T, factor=CFG.DOWNSAMPLE_FACTOR)
         return torch.from_numpy(x), int(self.y[i])
 
+@torch.no_grad()
 def _eval_epoch(model, loader, binary, device):
     model.eval()
     crit = _criterion(binary)
     total, correct, loss_sum = 0, 0, 0.0
-    with torch.no_grad():
-        for xb, yb in loader:
-            xb, yb = xb.to(device), yb.to(device)
-            logits = model(xb)
-            loss = crit(logits.view(-1), yb.float()) if binary else crit(logits, yb)
-            loss_sum += loss.item() * xb.size(0)
-            preds = (torch.sigmoid(logits.view(-1)) >= 0.5).long() if binary else logits.argmax(1)
-            correct += (preds == yb).sum().item()
-            total += xb.size(0)
+    for xb, yb in loader:
+        xb, yb = xb.to(device), yb.to(device)
+        logits = model(xb)
+        loss = crit(logits.view(-1), yb.float()) if binary else crit(logits, yb)
+        loss_sum += loss.item() * xb.size(0)
+        preds = (torch.sigmoid(logits.view(-1)) >= 0.5).long() if binary else logits.argmax(1)
+        correct += (preds == yb).sum().item()
+        total += xb.size(0)
     loss = (loss_sum / total) if total else math.nan
     acc  = (correct / total) if total else math.nan
     return loss, acc
@@ -94,7 +86,8 @@ def _fit_for_epochs(model, dl_tr, dl_va, epochs, binary, device):
             logits = model(xb)
             loss = crit(logits.view(-1), yb.float()) if binary else crit(logits, yb)
             loss.backward()
-            if CFG.GRAD_CLIP_NORM: nn.utils.clip_grad_norm_(model.parameters(), float(CFG.GRAD_CLIP_NORM))
+            if CFG.GRAD_CLIP_NORM:
+                nn.utils.clip_grad_norm_(model.parameters(), float(CFG.GRAD_CLIP_NORM))
             opt.step()
         _, va_acc = _eval_epoch(model, dl_va, binary, device)
         if va_acc > best_acc:
@@ -114,16 +107,16 @@ def run_kfold_all(train_paths, y_train_encoded, label_encoder, *, device=None,
     for mdl_name in model_types:
         log(f"[CV-ALL] {mdl_name}: {K}-fold, epochs={CV_EPOCHS}")
         rows = []
-        start_m = _time.time()
+        start_m = time.time()
         for fold, (tr_i, va_i) in enumerate(skf.split(train_paths, y_train_encoded), 1):
             ds_tr = _PairDS(train_paths[tr_i], y_train_encoded[tr_i])
             ds_va = _PairDS(train_paths[va_i], y_train_encoded[va_i])
             dl_tr = DataLoader(ds_tr, **torch_loader_kwargs(True,  CFG.BATCH_SIZE, device.type))
             dl_va = DataLoader(ds_va, **torch_loader_kwargs(False, CFG.BATCH_SIZE, device.type))
-            t0 = _time.time()
+            t0 = time.time()
             model = create_model(mdl_name, n_classes=len(label_encoder.classes_), binary=(len(label_encoder.classes_)==2))
             model = _fit_for_epochs(model, dl_tr, dl_va, CV_EPOCHS, (len(label_encoder.classes_)==2), device)
-            t_fold = _time.time() - t0
+            t_fold = time.time() - t0
 
             # Evaluate
             y_pred_idx = []
@@ -149,7 +142,7 @@ def run_kfold_all(train_paths, y_train_encoded, label_encoder, *, device=None,
             })
             log(f"[CV-ALL] {mdl_name} fold {fold}/{K} time={t_fold:.2f}s")
 
-        total_m = _time.time() - start_m
+        total_m = time.time() - start_m
         log(f"[CV-ALL] {mdl_name} total time: {total_m:.2f}s")
         all_rows.extend(rows)
 
@@ -157,28 +150,32 @@ def run_kfold_all(train_paths, y_train_encoded, label_encoder, *, device=None,
     return cv_all_df
 
 
-# -----------------------------
+# --------------------------------------------------------------------------------------
 # Orchestration helpers/CLI
-# -----------------------------
+# --------------------------------------------------------------------------------------
 def run_centralized():
     log("[RUN] Centralized")
     subprocess.run(CENTRALIZED_CMD, check=True)
 
 def run_federated(n_clients: int):
     """
-    Launch the Flower server and N clients in this process.
-    (For production, prefer tmux/screen or a process manager.)
+    Launch the Flower server and N clients from this process.
+    For production runs, prefer separate terminals or a process manager.
     """
     log(f"[RUN] Federated: server + {n_clients} clients")
-    server = subprocess.Popen(SERVER_CMD)
+    creationflags = 0
+    # On Windows, avoid opening new console windows for each client
+    if sys.platform.startswith("win"):
+        creationflags = subprocess.CREATE_NO_WINDOW  # type: ignore[attr-defined]
+
+    server = subprocess.Popen(SERVER_CMD, creationflags=creationflags)
     procs = []
     try:
-        # Give the server a brief head start
-        time.sleep(1.0)
+        time.sleep(1.0)  # give server a head start
         for cid in range(n_clients):
-            p = subprocess.Popen(CLIENT_CMD(cid))
+            p = subprocess.Popen(CLIENT_CMD(cid), creationflags=creationflags)
             procs.append(p)
-        # Wait for clients to complete
+            time.sleep(0.2)  # tiny stagger helps logs
         rcodes = [p.wait() for p in procs]
         log(f"[RUN] Clients finished: {rcodes}")
     except KeyboardInterrupt:
@@ -202,23 +199,28 @@ def run_cv():
     # training pool = entire set (paths + labels), since this is CV
     paths = features_df["record_path"].astype(str).values
     y_series = features_df["label"].astype(str)
-    le = make_label_encoder(y_series, y_series)  # union(train,test) = same for CV
+    le = make_label_encoder(y_series, y_series)
     y_enc = le.transform(y_series.values)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    cv_df = run_kfold_all(paths, y_enc, le, device=device,
-                          model_types=tuple(m for m, flag in {
-                              "CNN":  CFG.RUN_TORCH_CNN,
-                              "RNN":  CFG.RUN_TORCH_RNN,
-                              "LSTM": CFG.RUN_TORCH_LSTM,
-                              "ANN":  CFG.RUN_TORCH_ANN,
-                          }.items() if flag))
+    enabled = {
+        "CNN":  CFG.RUN_TORCH_CNN,
+        "RNN":  CFG.RUN_TORCH_RNN,
+        "LSTM": CFG.RUN_TORCH_LSTM,
+        "ANN":  CFG.RUN_TORCH_ANN,
+    }
+    model_types = tuple([m for m, flag in enabled.items() if flag])
+
+    cv_df = run_kfold_all(paths, y_enc, le, device=device, model_types=model_types)
 
     ensure_dir(CFG.RESULTS_DIR)
     out = Path(CFG.RESULTS_DIR) / f"cv_all_{int(time.time())}.csv"
     cv_df.to_csv(out, index=False)
     log(f"[RUN] CV results saved → {out}")
-    print(cv_df.groupby("model")[["accuracy","f1_macro","f1_weighted"]].mean().round(4))
+    try:
+        print(cv_df.groupby("model")[["accuracy","f1_macro","f1_weighted"]].mean().round(4))
+    except Exception:
+        print(cv_df.head())
 
 
 def _parse_args(argv=None):
@@ -231,7 +233,6 @@ def _parse_args(argv=None):
     p_fed.add_argument("--clients", type=int, default=CFG.FL_N_CLIENTS, help="Number of clients to launch")
 
     sub.add_parser("cv", help="Run K-Fold CV over enabled deep models")
-
     return p.parse_args(argv)
 
 

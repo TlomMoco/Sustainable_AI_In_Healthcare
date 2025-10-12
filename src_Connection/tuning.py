@@ -1,3 +1,4 @@
+# src_Connection/tuning.py
 from __future__ import annotations
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional
@@ -28,14 +29,19 @@ def _tensor_dataset_from_df(
     """
     X, y = [], []
     for _, row in df.iterrows():
-        sig = load_waveform(row, sampling_rate=SAMPLE_RATE)  # (12, T)
-        sig = normalize_signal(sig, mu, sigma, eps=eps)
-        X.append(sig)
+        try:
+            sig = load_waveform(row, sampling_rate=SAMPLE_RATE)  # (12, T)
+        except Exception:
+            # Robustness: fall back to a minimal zero signal if read fails
+            sig = np.zeros((12, 1), dtype="float32")
+        sig = normalize_signal(sig, mu, sigma, eps=eps) if mu is not None and sigma is not None else sig
+        X.append(sig.astype("float32"))
         y.append(SUPERCLASSES.index(row["y"]))
     if not X:
         X_t = torch.zeros((0, 12, 1), dtype=torch.float32)
         y_t = torch.zeros((0,), dtype=torch.long)
     else:
+        # Stack along time dimension as given by loader (12, T)
         X_t = torch.tensor(np.stack(X), dtype=torch.float32)  # (N, 12, T)
         y_t = torch.tensor(np.array(y), dtype=torch.long)     # (N,)
     return torch.utils.data.TensorDataset(X_t, y_t)
@@ -45,7 +51,9 @@ def _make_loader(
     df: pd.DataFrame, mu: np.ndarray, sigma: np.ndarray, batch_size: int, shuffle: bool
 ) -> torch.utils.data.DataLoader:
     ds = _tensor_dataset_from_df(df, mu, sigma)
-    return torch.utils.data.DataLoader(ds, batch_size=int(batch_size), shuffle=shuffle)
+    batch = max(1, int(batch_size))
+    # Keep DataLoader defaults lightweight (workers=0) for cross-platform stability
+    return torch.utils.data.DataLoader(ds, batch_size=batch, shuffle=bool(shuffle))
 
 
 # -------------------------------------------------------------------------
@@ -177,6 +185,8 @@ def run_client_cv(
     rows: List[Dict] = []
     best_score, best_hp = -1.0, None
     for trial, hp in enumerate(grid, start=1):
+        # Guard: ensure minimal valid batch/epochs
+        hp = {**hp, "batch": max(1, int(hp.get("batch", 32))), "epochs": max(1, int(hp.get("epochs", 1)))}
         fold_losses, fold_accs = [], []
         for tr_idx, va_idx in gkf.split(idx, groups=groups, y=labels):
             tr_df = df_train.iloc[tr_idx]

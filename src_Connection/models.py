@@ -17,19 +17,35 @@ and output logits corresponding to the 5 diagnostic superclasses:
 from __future__ import annotations
 import torch
 import torch.nn as nn
+
+# Classical ML bits
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 from sklearn.linear_model import LogisticRegression
+from sklearn.impute import SimpleImputer
+from sklearn.multiclass import OneVsRestClassifier
 
 
 # -------------------------------------------------------------------------
-# Classical ML baseline (optional reference)
+# Classical ML baseline (imputed + scaled + OvR logistic regression)
 # -------------------------------------------------------------------------
-def create_logistic_baseline() -> Pipeline:
-    """Return a simple baseline model using logistic regression."""
+def create_logistic_baseline(class_weight: str | None = "balanced") -> Pipeline:
+    """
+    Logistic baseline with:
+      • median imputation (handles NaNs)
+      • standardization
+      • One-vs-Rest wrapper (avoids multi_class deprecation warning in sklearn>=1.5)
+      • optional class_weight='balanced' to help class imbalance
+    """
+    base_lr = LogisticRegression(
+        max_iter=500,
+        solver="lbfgs",
+        class_weight=class_weight,  # set to None to disable class balancing
+    )
     return Pipeline([
+        ("imp", SimpleImputer(strategy="median")),
         ("scaler", StandardScaler()),
-        ("logreg", LogisticRegression(max_iter=200, multi_class="ovr"))
+        ("clf", OneVsRestClassifier(base_lr, n_jobs=-1)),
     ])
 
 
@@ -45,18 +61,15 @@ def _to_NCT(x: torch.Tensor) -> torch.Tensor:
     if x.dim() != 3:
         raise ValueError(f"Expected a 3D tensor [N,T,C] or [N,C,T], got {tuple(x.shape)}")
     N, A, B = x.shape
-    # Heuristic: 12-lead ECG => channels likely 12
     if A == 12:  # [N, C, T]
         return x
     if B == 12:  # [N, T, C]
         return x.permute(0, 2, 1)
-    # Fall back: assume current is [N, C, T]
-    return x
+    return x  # fallback: assume already [N, C, T]
 
 
 def _time_dim(x: torch.Tensor) -> int:
     """Return the index of the time dimension (after we may have NCT)."""
-    # After standardization we use [N, C, T], so time dim is -1
     return -1
 
 
@@ -163,16 +176,13 @@ class TinyECGLSTM(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = _to_NCT(x)          # [N, C, T]
-        # To RNN: [N, T, C’]
         z = self.features[0](x) if self.use_stem else x
         if isinstance(self.features[0], nn.Sequential) and self.use_stem:
-            # stem output is [N, C’, T]
-            z = z.permute(0, 2, 1)
+            z = z.permute(0, 2, 1)  # [N, C’, T] → [N, T, C’]
         else:
-            # x is [N, C, T] → [N, T, C]
-            z = z.permute(0, 2, 1)
+            z = z.permute(0, 2, 1)  # [N, C, T]  → [N, T, C]
         z, _ = self.features[1](z)  # LSTM
-        z = z.mean(dim=1)           # temporal pooling
+        z = z.mean(dim=1)           # temporal mean pooling
         return self.head(z)
 
 
@@ -253,19 +263,16 @@ def create_model(*args, **kwargs) -> nn.Module:
     if len(args) == 0:
         n_classes = kwargs.pop("n_classes")
     elif len(args) == 1:
-        # Either (model_type) or (n_classes)
         if isinstance(args[0], str):
             model_type = args[0]
             n_classes = kwargs.pop("n_classes")
         else:
             n_classes = int(args[0])
     elif len(args) >= 2:
-        # (model_type, n_classes)
         if isinstance(args[0], str):
             model_type = args[0]
             n_classes = int(args[1])
         else:
-            # (n_classes, model_type) — tolerate swapped order
             n_classes = int(args[0])
             model_type = str(args[1])
     else:
