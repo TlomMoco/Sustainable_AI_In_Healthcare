@@ -12,10 +12,17 @@ Helper functions shared across modules in the Sustainable AI in Healthcare (DSP5
 """
 
 from __future__ import annotations
+
+import os
 import random
 from pathlib import Path
 from typing import Dict
-
+try:
+    import portalocker  # for atomic file writes
+except Exception:
+    portalocker = None
+    print("[warn] portalocker not installed; CSV writes are unguarded (okay for single-process).")
+import csv
 import numpy as np
 import torch
 import matplotlib.pyplot as plt
@@ -25,7 +32,7 @@ from src.config import RESULTS_DIR
 
 
 # -------------------------------------------------------------------------
-# 1) Reproducibility
+# Reproducibility
 # -------------------------------------------------------------------------
 def set_seed(seed: int = 42) -> None:
     """Set global random seed across Python, NumPy, and PyTorch."""
@@ -40,7 +47,7 @@ def set_seed(seed: int = 42) -> None:
 
 
 # -------------------------------------------------------------------------
-# 2) Files / directories
+# Files / directories
 # -------------------------------------------------------------------------
 def ensure_dir(p: Path) -> None:
     """Create directory (and parents) if it doesn’t exist."""
@@ -48,7 +55,7 @@ def ensure_dir(p: Path) -> None:
 
 
 # -------------------------------------------------------------------------
-# 3) Plotting
+# Plotting
 # -------------------------------------------------------------------------
 def plot_signal(sig: np.ndarray, title: str = "ECG (12xT)", save: str | None = None) -> None:
     """
@@ -71,7 +78,7 @@ def plot_signal(sig: np.ndarray, title: str = "ECG (12xT)", save: str | None = N
 
 
 # -------------------------------------------------------------------------
-# 4) Metrics
+# Metrics
 # -------------------------------------------------------------------------
 def compute_metrics(y_true, y_prob, labels) -> Dict[str, float]:
     """
@@ -98,7 +105,7 @@ def compute_metrics(y_true, y_prob, labels) -> Dict[str, float]:
 
 
 # -------------------------------------------------------------------------
-# 5) Dataset summary
+# Dataset summary
 # -------------------------------------------------------------------------
 def summarize_dataset(df, sample_rate: int = 100, title: str = "Global Dataset") -> None:
     """
@@ -132,7 +139,7 @@ def summarize_dataset(df, sample_rate: int = 100, title: str = "Global Dataset")
 
 
 # -------------------------------------------------------------------------
-# 6) Small extras for reporting (optional)
+# Small extras for reporting (optional)
 # -------------------------------------------------------------------------
 def format_time(seconds: float) -> str:
     """Format seconds as 'Xm Ys'."""
@@ -155,3 +162,20 @@ def print_model_summary(model: torch.nn.Module) -> None:
             print(f"{name:<35} {param.numel():>10,d}")
     print("-" * 40)
     print(f"Total trainable parameters: {total:,}\n")
+
+
+def append_csv_locked(path: Path, row: dict, fieldnames: list[str]) -> None:
+    """Append a CSV row atomically; creates header on first write."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    write_header = not path.exists()
+    mode = "a" if path.exists() else "w"
+    with open(path, mode, newline="") as f:
+        if portalocker:
+            portalocker.lock(f, portalocker.LOCK_EX)
+        w = csv.DictWriter(f, fieldnames=fieldnames)
+        if write_header:
+            w.writeheader()
+        w.writerow(row)
+        f.flush(); os.fsync(f.fileno())
+        if portalocker:
+            portalocker.unlock(f)

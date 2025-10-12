@@ -22,11 +22,11 @@ Then start each client in separate terminals:
 from __future__ import annotations
 from typing import Dict, List, Tuple
 
-import csv
 import flwr as fl
 import numpy as np
 import matplotlib.pyplot as plt
 from src.config import CLIENTS, FREEZE_CFG, ROUNDS, RESULTS_DIR, EXPERIMENT, N_CLASSES, TUNING, SUPERCLASSES
+from src.utils import append_csv_locked
 
 # -------------------------------------------------------------------------
 # Global results logging
@@ -76,71 +76,52 @@ def _append_global_row(server_round: int, acc: float, loss: float) -> None:
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     exp = EXPERIMENT["run_name"]
 
+    # Compute phase consistent with clients
     if TUNING.get("log_phase"):
-        phase = (TUNING["phase_labels"]["enabled"] if TUNING.get("enabled") else
-                 TUNING["phase_labels"]["disabled"])
+        if TUNING.get("enabled"):
+            phase = TUNING["phase_labels"]["enabled"]    # "post_cv"
+        elif TUNING.get("use_cached_best"):
+            phase = TUNING["phase_labels"]["cached"]     # "cached_cv"
+        else:
+            phase = TUNING["phase_labels"]["disabled"]   # "no_cv"
     else:
         phase = ""
 
-    if TUNING.get("log_phase") and TUNING.get("log_mode") == "separate":
+    separate = (TUNING.get("log_phase") and TUNING.get("log_mode") == "separate")
+    if separate:
         path = RESULTS_DIR / f"{exp}_{phase or 'no_cv'}.csv"
-        header = ["client_id","round","accuracy","loss",
-                  "frozen_layers","is_frozen","wall_time_sec","trainable_params"]
-        row = ["GLOBAL", server_round, f"{acc:.4f}", f"{loss:.4f}", "", "", "", ""]
+        fieldnames = ["client_id","round","accuracy","loss",
+                      "frozen_layers","is_frozen","wall_time_sec","trainable_params"]
+        row = {"client_id":"GLOBAL","round":server_round,"accuracy":f"{acc:.4f}","loss":f"{loss:.4f}",
+               "frozen_layers":"","is_frozen":"","wall_time_sec":"","trainable_params":""}
     else:
         path = RESULTS_DIR / f"{exp}.csv"
-        header = ["client_id","round","accuracy","loss",
-                  "frozen_layers","is_frozen","wall_time_sec","trainable_params","phase"]
-        row = ["GLOBAL", server_round, f"{acc:.4f}", f"{loss:.4f}", "", "", "", "", phase]
+        fieldnames = ["client_id","round","accuracy","loss",
+                      "frozen_layers","is_frozen","wall_time_sec","trainable_params","phase"]
+        row = {"client_id":"GLOBAL","round":server_round,"accuracy":f"{acc:.4f}","loss":f"{loss:.4f}",
+               "frozen_layers":"","is_frozen":"","wall_time_sec":"","trainable_params":"","phase":phase}
 
-    write_header = not path.exists()
-    with open(path, "a", newline="") as f:
-        w = csv.writer(f)
-        if write_header:
-            w.writerow(header)
-        w.writerow(row)
+    append_csv_locked(path, row, fieldnames)
+
 
 # --- Append per-class accuracy and confusion matrix -----------------------
 def _append_perclass_row(server_round: int, cm: np.ndarray) -> None:
     path = RESULTS_DIR / f"{EXPERIMENT['run_name']}_perclass.csv"
-    header = ["round"] + [f"acc_{c}" for c in SUPERCLASSES]
-    write_header = not path.exists()
+    fieldnames = ["round"] + [f"acc_{c}" for c in SUPERCLASSES]
     support = cm.sum(axis=1)
     accs = [(cm[i, i] / support[i]) if support[i] > 0 else 0.0 for i in range(len(SUPERCLASSES))]
-    with open(path, "a", newline="") as f:
-        w = csv.writer(f)
-        if write_header:
-            w.writerow(header)
-        w.writerow([server_round] + [f"{a:.4f}" for a in accs])
+    row = {"round": server_round, **{f"acc_{c}": f"{a:.4f}" for c, a in zip(SUPERCLASSES, accs)}}
+    append_csv_locked(path, row, fieldnames)
+
 
 # --- Append confusion matrix in long format ------------------------------
 def _append_confusion_rows(server_round: int, cm: np.ndarray) -> None:
     path = RESULTS_DIR / f"{EXPERIMENT['run_name']}_cm.csv"
-    write_header = not path.exists()
-    with open(path, "a", newline="") as f:
-        w = csv.writer(f)
-        if write_header:
-            w.writerow(["round", "true", "pred", "count"])
-        n = cm.shape[0]
-        for i in range(n):
-            for j in range(n):
-                w.writerow([server_round, i, j, int(cm[i, j])])
-
-# --- Save confusion matrix heatmap --------------------------------------
-def _save_confusion_heatmap(cm: np.ndarray, server_round: int) -> None:
-    viz = RESULTS_DIR / "viz"
-    viz.mkdir(parents=True, exist_ok=True)
-    with np.errstate(invalid="ignore", divide="ignore"):
-        cmn = cm / cm.sum(axis=1, keepdims=True)
-        cmn = np.nan_to_num(cmn)
-    plt.figure(figsize=(6, 5))
-    plt.imshow(cmn, aspect="auto")
-    plt.title(f"Confusion Matrix — {EXPERIMENT['run_name']} (round {server_round})")
-    plt.xlabel("Predicted"); plt.ylabel("True")
-    plt.colorbar(label="Row-normalized")
-    plt.tight_layout()
-    plt.savefig(viz / f"confusion_{EXPERIMENT['run_name']}_r{server_round:02d}.png", dpi=150)
-    plt.close()
+    fieldnames = ["round", "true", "pred", "count"]
+    for i in range(cm.shape[0]):
+        for j in range(cm.shape[1]):
+            row = {"round": server_round, "true": i, "pred": j, "count": int(cm[i, j])}
+            append_csv_locked(path, row, fieldnames)
 
 
 # -------------------------------------------------------------------------

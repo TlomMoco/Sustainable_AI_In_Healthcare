@@ -35,6 +35,9 @@ SCP_CSV = DATA_DIR / "scp_statements.csv"
 # Directory containing waveform records (e.g., records100/, records500/)
 DATA_ROOT = DATA_DIR
 
+# Subdirectory for hyperparameter tuning results
+TUNING_DIR = RESULTS_DIR / "tuning"
+
 
 # -------------------------------------------------------------------------
 # Data and Split Settings
@@ -67,7 +70,7 @@ FREEZE_CFG = {
     "freeze_mode": "gated", # "gated" or "static"
 }
 # For logging (results/[name].csv) frozen layers vs not (True/False) manually
-FREEZE_ENABLED = False       # toggle this for frozen/non-frozen run
+FREEZE_ENABLED = True       # toggle this for frozen/non-frozen run
 EXPERIMENT = {
     "freeze_enabled": FREEZE_ENABLED,
     "run_name": "frozen_run" if FREEZE_ENABLED else "non_frozen_run",
@@ -94,9 +97,8 @@ MODEL = {
 }
 
 TUNING = {
-    "enabled": False,                   # run CV now?
-    "reuse_cached_if_exists": False,
-    "use_cached_best": False,            # if enabled=False, load best params from disk if available
+    "enabled": True,                   # run CV now?
+    "use_cached_best": True,           # if enabled=False, load best params from disk if available
     "log_phase": True,                  # log tuning phase in results?
     "log_mode": "same",                 # "same" or "separate" CSV for tuning vs non-tuning
     "phase_labels": {
@@ -105,7 +107,6 @@ TUNING = {
         "cached":   "cached_cv"         # tuning disabled but cached params used
     },
 }
-
 GRIDSEARCH = {
     "cv": 5,
     "grid": [
@@ -116,3 +117,16 @@ GRIDSEARCH = {
         {"lr": 2e-3, "batch": 128, "epochs": 4, "fedprox": 0.001},
     ],
 }
+
+def tuning_paths(run_name: str, cid: int, freeze_enabled: bool):
+    """
+    Always use a single shared cache, independent of freezing/run name.
+
+    Produces:
+      results/tuning/client{cid}_best.json
+      results/tuning/client{cid}_cv.csv
+    """
+    base = TUNING_DIR
+    best_json = base / f"client{cid}_best.json"
+    cv_csv = base / f"client{cid}_cv.csv"
+    return best_json, cv_csv

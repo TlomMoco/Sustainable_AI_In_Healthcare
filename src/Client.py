@@ -31,11 +31,12 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import flwr as fl
+import json
 
 from src.config import (
     LR, BATCH_SIZE, EPOCHS_LOCAL, FREEZE_THRESHOLD, FEDPROX_MU,
     SEED, RESULTS_DIR, FREEZE_CFG, SPLITS, NORM, MODEL, EXPERIMENT,
-    SAMPLE_RATE, N_CLASSES, TUNING, GRIDSEARCH
+    SAMPLE_RATE, N_CLASSES, TUNING, GRIDSEARCH, tuning_paths, FREEZE_ENABLED
 )
 from src.data_loader import (
     load_metadata, map_superclasses, filter_single_label,
@@ -44,7 +45,7 @@ from src.data_loader import (
 )
 from src.tuning import run_client_cv
 from src.models import create_model
-from src.utils import set_seed, ensure_dir
+from src.utils import set_seed, ensure_dir, append_csv_locked
 
 
 # -------------------------------------------------------------------------
@@ -78,11 +79,11 @@ def make_tensor_dataset(df, mu=None, sigma=None):
     return X, y
 
 
-def get_loaders(df, batch_size=BATCH_SIZE, mu=None, sigma=None):
+def get_loaders(df, batch_size=BATCH_SIZE, mu=None, sigma=None, shuffle=True):
     """Return a DataLoader for the given DataFrame."""
     X, y = make_tensor_dataset(df, mu, sigma)
     ds = torch.utils.data.TensorDataset(X, y)
-    return torch.utils.data.DataLoader(ds, batch_size=batch_size, shuffle=True)
+    return torch.utils.data.DataLoader(ds, batch_size=batch_size, shuffle=shuffle)
 
 
 # -------------------------------------------------------------------------
@@ -163,13 +164,14 @@ class PTBClient(fl.client.NumPyClient):
         # ----------------------------------------------------------------
         # Hyperparameter tuning via CV (pre-flight) + cached reuse
         # ----------------------------------------------------------------
-        import json
 
         self.cv_done = False
         self.hp_source = "default"  # "default" | "cached" | "tuned"
 
-        outdir = RESULTS_DIR / "tuning" / EXPERIMENT["run_name"]
-        best_path = outdir / f"client{self.cid}_best.json"
+        best_path, cv_csv_path = tuning_paths(
+            run_name=EXPERIMENT["run_name"], cid=self.cid, freeze_enabled=FREEZE_ENABLED
+        )
+        outdir = best_path.parent
 
         def _apply_hparams(hp: dict, src: str):
             self.lr = float(hp["lr"])
@@ -178,49 +180,57 @@ class PTBClient(fl.client.NumPyClient):
             self.fedprox_mu = float(hp.get("fedprox", 0.0))
             self.hp_source = src
 
-        if TUNING.get("enabled", False):
-            outdir.mkdir(parents=True, exist_ok=True)
+        # --- Unified tuning/caching policy (drop-in replacement) ---
+        # Preference order:
+        # 1) If use_cached_best and cache exists -> load cached (skip CV)
+        # 2) Else if enabled -> run CV, save + apply best
+        # 3) Else -> use defaults
 
-            # Reuse cached best if allowed and present
-            if TUNING.get("reuse_cached_if_exists", True) and best_path.exists():
-                with open(best_path, "r", encoding="utf-8") as f:
-                    best = (json.load(f) or {}).get("params", {})
-                if best:
-                    _apply_hparams(best, "cached")
-                    print(f"[Client {self.cid}] Using cached tuned HPs → "
-                          f"lr={self.lr}, batch={self.batch_size}, epochs={self.local_epochs}, μ={self.fedprox_mu}")
-            else:
-                # Run CV now
-                print(f"[Client {self.cid}] Starting pre-flight CV: grid={len(GRIDSEARCH.get('grid', []))}, "
-                      f"k={GRIDSEARCH.get('cv', 5)}")
-                res = run_client_cv(
-                    self.train_df,
-                    k=GRIDSEARCH.get("cv"),
-                    grid=GRIDSEARCH.get("grid"),
-                    device=self.device,
-                    save_csv=outdir / f"client{self.cid}_cv.csv",
-                    save_json=best_path,
-                )
-                best = (res or {}).get("best") or {}
-                if best:
-                    _apply_hparams(best, "tuned")
-                    print(f"[Client {self.cid}] CV best={res.get('best_mean_acc', 0):.4f} → "
-                          f"lr={self.lr}, batch={self.batch_size}, epochs={self.local_epochs}, μ={self.fedprox_mu}")
-                else:
-                    print(f"[Client {self.cid}] CV skipped/insufficient groups; using defaults.")
+        # Single policy: if tuned files exist, reuse them; otherwise run CV only if enabled.
+        prefer_cached = True
+        do_cv = TUNING.get("enabled", False)
 
-            print(f"[Client {self.cid}] Pre-flight CV finished.")
-            self.cv_done = True
-
-        # If CV is OFF but we want to reuse cached best from a previous run
-        elif TUNING.get("use_cached_best", True) and best_path.exists():
+        used = False
+        if prefer_cached and best_path.exists():
             with open(best_path, "r", encoding="utf-8") as f:
                 best = (json.load(f) or {}).get("params", {})
             if best:
                 _apply_hparams(best, "cached")
-                print(f"[Client {self.cid}] Reusing cached tuned HPs (CV off) → "
+                print(f"[Client {self.cid}] Using cached tuned HPs → "
                       f"lr={self.lr}, batch={self.batch_size}, epochs={self.local_epochs}, μ={self.fedprox_mu}")
+                used = True
 
+        if (not used) and do_cv:
+            outdir.mkdir(parents=True, exist_ok=True)
+            print(f"[Client {self.cid}] Starting pre-flight CV: grid={len(GRIDSEARCH.get('grid', []))}, "
+                  f"k={GRIDSEARCH.get('cv', 5)}")
+            res = run_client_cv(
+                self.train_df,
+                k=GRIDSEARCH.get("cv"),
+                grid=GRIDSEARCH.get("grid"),
+                device=self.device,
+                save_csv=outdir / f"client{self.cid}_cv.csv",
+                save_json=best_path,
+            )
+            best = (res or {}).get("best") or {}
+            if best:
+                _apply_hparams(best, "tuned")
+                print(f"[Client {self.cid}] CV best={res.get('best_mean_acc', 0):.4f} → "
+                      f"lr={self.lr}, batch={self.batch_size}, epochs={self.local_epochs}, μ={self.fedprox_mu}")
+                used = True
+            else:
+                print(f"[Client {self.cid}] CV skipped/insufficient groups; using defaults.")
+
+        if not used and not do_cv:
+            # Explicitly note we’re on defaults
+            print(f"[Client {self.cid}] No cache and CV disabled → using default HPs.")
+
+        # Optional: remember source if you want to write it to CSV later
+        self.hp_source = "cached" if prefer_cached and best_path.exists() else (
+            "tuned" if (do_cv and used) else "default")
+
+        # If you rely on this flag later:
+        self.cv_done = do_cv  # True iff we actually ran CV this session
 
         # Static/head-only start for very small clients (only when freezing is enabled)
         if EXPERIMENT["freeze_enabled"] and len(self.train_df) < FREEZE_THRESHOLD:
@@ -371,7 +381,7 @@ class PTBClient(fl.client.NumPyClient):
     def _evaluate_dataset(self, df) -> Tuple[float, float]:
         if len(df) == 0:
             return 0.0, 0.0
-        loader = get_loaders(df, 128, mu=self.mu, sigma=self.sigma)
+        loader = get_loaders(df, 128, mu=self.mu, sigma=self.sigma, shuffle=False)
         self.model.eval()
         correct, total, loss_sum = 0, 0, 0.0
         with torch.no_grad():
@@ -389,7 +399,7 @@ class PTBClient(fl.client.NumPyClient):
         self.set_parameters(parameters)
 
         # Compute metrics + confusion counts on TEST split
-        loader = get_loaders(self.test_df, 128, mu=self.mu, sigma=self.sigma)
+        loader = get_loaders(self.test_df, 128, mu=self.mu, sigma=self.sigma, shuffle=False)
         self.model.eval()
         correct, total, loss_sum = 0, 0, 0.0
 
@@ -426,41 +436,55 @@ class PTBClient(fl.client.NumPyClient):
     # Logging
     # ---------------------------------------------------------------------
     def _log_metrics(self, round_num: int, acc: float, loss: float, wall_s: float):
+        from pathlib import Path
         ensure_dir(RESULTS_DIR)
         exp = EXPERIMENT["run_name"]
 
-        # Determine phase label (simple: tuned vs no_cv)
+        # --- Phase label based on what we actually used this run -------------
+        # self.hp_source is set to: "tuned" | "cached" | "default"
         if TUNING.get("log_phase"):
-            phase = (TUNING["phase_labels"]["enabled"] if TUNING.get("enabled") else
-                     TUNING["phase_labels"]["disabled"])
+            if getattr(self, "hp_source", "default") == "tuned":
+                phase = TUNING["phase_labels"]["enabled"]  # "post_cv"
+            elif getattr(self, "hp_source", "default") == "cached":
+                phase = TUNING["phase_labels"]["cached"]  # "cached_cv"
+            else:
+                phase = TUNING["phase_labels"]["disabled"]  # "no_cv"
         else:
             phase = ""
 
-        # Choose file path depending on log mode
-        if TUNING.get("log_phase") and TUNING.get("log_mode") == "separate":
+        # --- Choose file & columns ------------------------------------------
+        separate = (TUNING.get("log_phase") and TUNING.get("log_mode") == "separate")
+        if separate:
             path = RESULTS_DIR / f"{exp}_{phase or 'no_cv'}.csv"
-            header = ["client_id", "round", "accuracy", "loss",
-                      "frozen_layers", "is_frozen", "wall_time_sec", "trainable_params"]
-            write_phase = False
+            fieldnames = ["client_id", "round", "accuracy", "loss",
+                          "frozen_layers", "is_frozen", "wall_time_sec", "trainable_params"]
+            row = {
+                "client_id": str(self.cid),
+                "round": int(round_num),
+                "accuracy": f"{acc:.4f}",
+                "loss": f"{loss:.4f}",
+                "frozen_layers": self.state.last_frozen,
+                "is_frozen": int(self.state.last_frozen > 0),
+                "wall_time_sec": f"{wall_s:.2f}",
+                "trainable_params": sum(p.numel() for p in self.model.parameters() if p.requires_grad),
+            }
         else:
             path = RESULTS_DIR / f"{exp}.csv"
-            header = ["client_id", "round", "accuracy", "loss",
-                      "frozen_layers", "is_frozen", "wall_time_sec", "trainable_params", "phase"]
-            write_phase = True
+            fieldnames = ["client_id", "round", "accuracy", "loss",
+                          "frozen_layers", "is_frozen", "wall_time_sec", "trainable_params", "phase"]
+            row = {
+                "client_id": str(self.cid),
+                "round": int(round_num),
+                "accuracy": f"{acc:.4f}",
+                "loss": f"{loss:.4f}",
+                "frozen_layers": self.state.last_frozen,
+                "is_frozen": int(self.state.last_frozen > 0),
+                "wall_time_sec": f"{wall_s:.2f}",
+                "trainable_params": sum(p.numel() for p in self.model.parameters() if p.requires_grad),
+                "phase": phase,
+            }
 
-        write_header = not path.exists()
-        trainable_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
-        is_frozen = self.state.last_frozen > 0
-
-        with open(path, "a", newline="") as f:
-            w = csv.writer(f)
-            if write_header:
-                w.writerow(header)
-            row = [self.cid, round_num, f"{acc:.4f}", f"{loss:.4f}",
-                   self.state.last_frozen, int(is_frozen), f"{wall_s:.2f}", trainable_params]
-            if write_phase:
-                row.append(phase)
-            w.writerow(row)
+        append_csv_locked(Path(path), row, fieldnames)
 
 
 # -------------------------------------------------------------------------
@@ -471,10 +495,12 @@ def main():
     parser.add_argument("--cid", type=int, required=True)
     args = parser.parse_args()
     client = PTBClient(args.cid)
-    fl.client.start_client(
-        server_address="127.0.0.1:8080",
-        client=client.to_client(),
-    )
+    try:
+        # Flower ≥ 1.4
+        fl.client.start_client(server_address="127.0.0.1:8080", client=client.to_client())
+    except AttributeError:
+        # Older Flower: fall back to NumPy API
+        fl.client.start_numpy_client(server_address="127.0.0.1:8080", client=client)
 
 
 if __name__ == "__main__":
