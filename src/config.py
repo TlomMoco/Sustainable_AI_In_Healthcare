@@ -70,11 +70,7 @@ FREEZE_CFG = {
     "freeze_mode": "gated", # "gated" or "static"
 }
 # For logging (results/[name].csv) frozen layers vs not (True/False) manually
-FREEZE_ENABLED = True       # toggle this for frozen/non-frozen run
-EXPERIMENT = {
-    "freeze_enabled": FREEZE_ENABLED,
-    "run_name": "frozen_run" if FREEZE_ENABLED else "non_frozen_run",
-}
+FREEZE_ENABLED = False       # toggle this for frozen/non-frozen run
 
 # -------------------------------------------------------------------------
 # Normalization Parameters
@@ -90,14 +86,19 @@ NORM = {
 # Model Selection & Tuning / CV
 # -------------------------------------------------------------------------
 MODEL = {
-    "type": "cnn",              # "cnn" or "lstm"
+    "type": "cnn",              # "cnn" or "lstm" for now
     "lstm_hidden": 128,
     "lstm_layers": 1,
     "bidirectional": True,
 }
 
+EXPERIMENT = {
+    "freeze_enabled": FREEZE_ENABLED,
+    "run_name": f"{MODEL['type']}_{'frozen_run' if FREEZE_ENABLED else 'non_frozen_run'}",
+}
+
 TUNING = {
-    "enabled": True,                   # run CV now?
+    "enabled": False,                   # run CV now?
     "use_cached_best": True,           # if enabled=False, load best params from disk if available
     "log_phase": True,                  # log tuning phase in results?
     "log_mode": "same",                 # "same" or "separate" CSV for tuning vs non-tuning

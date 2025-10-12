@@ -11,7 +11,7 @@ import torch.optim as optim
 from sklearn.model_selection import GroupKFold
 
 from src.config import (
-    SAMPLE_RATE, N_CLASSES, MODEL, GRIDSEARCH, SUPERCLASSES, tuning_paths
+    SAMPLE_RATE, N_CLASSES, MODEL, GRIDSEARCH, SUPERCLASSES
 )
 from src.data_loader import compute_perlead_norm_stats, load_waveform, normalize_signal
 from src.models import create_model

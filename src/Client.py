@@ -24,7 +24,6 @@ from collections import OrderedDict
 from typing import List, Tuple
 from dataclasses import dataclass
 import argparse
-import csv
 import time
 import numpy as np
 import torch
@@ -187,7 +186,7 @@ class PTBClient(fl.client.NumPyClient):
         # 3) Else -> use defaults
 
         # Single policy: if tuned files exist, reuse them; otherwise run CV only if enabled.
-        prefer_cached = True
+        prefer_cached = TUNING.get("use_cached_best", True)
         do_cv = TUNING.get("enabled", False)
 
         used = False
@@ -238,11 +237,26 @@ class PTBClient(fl.client.NumPyClient):
             # 1) freeze backbone (features)
             for p in self.model.features.parameters():
                 p.requires_grad = False
-            # 2) within the head, train ONLY the last Linear (keep other head layers frozen)
-            for j, m in enumerate(self.model.head):
-                req_grad = (j == len(self.model.head) - 1)  # last module is Linear(96->N_CLASSES) in your CNN
-                for p in getattr(m, "parameters", lambda: [])():
-                    p.requires_grad = req_grad
+            # 2) within the head, train ONLY the last Linear (keep others frozen)
+            head = getattr(self.model, "head", None)
+
+            # freeze entire head first (handles Sequential or single Linear)
+            if isinstance(head, nn.Module):
+                for p in head.parameters():
+                    p.requires_grad = False
+
+            # find last Linear inside head (Sequential or Linear)
+            last_linear = None
+            if isinstance(head, nn.Linear):
+                last_linear = head
+            elif isinstance(head, nn.Module):
+                for m in head.modules():
+                    if isinstance(m, nn.Linear):
+                        last_linear = m  # keep updating: ends as last Linear
+            # unfreeze that Linear only
+            if last_linear is not None:
+                for p in last_linear.parameters():
+                    p.requires_grad = True
 
         print(f"[Client {self.cid}] Initialized model: {MODEL['type']} on {self.device}")
 
@@ -304,8 +318,20 @@ class PTBClient(fl.client.NumPyClient):
 
         if len(self.train_df) < FREEZE_THRESHOLD and improved and self.state.no_improve == 0:
             # allow the Linear(160->96) to train too
-            for p in self.model.head[1].parameters():  # head[1] is Linear(160->96)
-                p.requires_grad = True
+            next_linear = None
+            head = getattr(self.model, "head", None)
+            if isinstance(head, nn.Linear):
+                next_linear = head
+            elif isinstance(head, nn.Module):
+                # modules() also covers Sequential/ModuleList trees
+                for m in head.modules():
+                    if isinstance(m, nn.Linear):
+                        next_linear = m
+                        break
+
+            if next_linear is not None:
+                for p in next_linear.parameters():
+                    p.requires_grad = True
 
         # Apply the actual freezing pattern
         for i, layer in enumerate(self.model.features):
