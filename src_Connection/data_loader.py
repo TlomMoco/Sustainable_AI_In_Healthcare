@@ -24,7 +24,7 @@ import wfdb
 import ast
 from pathlib import Path
 
-from src.config import (
+from src_Connection.config import (
     PTBXL_CSV, SCP_CSV, DATA_ROOT, SAMPLE_RATE,
     N_CLASSES, SUPERCLASSES,
     # Notebook/deep config values:
@@ -260,7 +260,7 @@ def build_scp_mapping(db: pd.DataFrame, scp_raw: pd.DataFrame):
     valid_codes = set(diag_only.index)
 
     # Label field chosen by config (5-class or 10-class)
-    from src.config import LABEL_MODE, SCP_MIN_CONF
+    from src_Connection.config import LABEL_MODE, SCP_MIN_CONF
     label_field = "diagnostic_class" if LABEL_MODE == "5class" else "diagnostic_subclass"
 
     def to_diag_label(scp_codes_dict, min_conf=float(SCP_MIN_CONF)):
@@ -434,7 +434,7 @@ def make_feature_table(save_csv: bool = True) -> tuple[pd.DataFrame, pd.DataFram
         feature_df: DataFrame of engineered features (+label)
         features_df: minimal table with record_path/label/metadata for deep loaders
     """
-    from src.config import MAX_RECORDS  # defer to avoid circular import issues
+    from src_Connection.config import MAX_RECORDS  # defer to avoid circular import issues
     db, scp_raw = load_metadata_raw()
     diag_only, valid_codes, to_diag_label = build_scp_mapping(db, scp_raw)
 

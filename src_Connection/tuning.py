@@ -11,9 +11,9 @@ import torch.nn as nn
 import torch.optim as optim
 from sklearn.model_selection import GroupKFold
 
-from src.config import SAMPLE_RATE, N_CLASSES, MODEL, GRIDSEARCH, SUPERCLASSES
-from src.data_loader import compute_perlead_norm_stats, load_waveform, normalize_signal
-from src.models import create_model
+from src_Connection.config import SAMPLE_RATE, N_CLASSES, MODEL, GRIDSEARCH, SUPERCLASSES
+from src_Connection.data_loader import compute_perlead_norm_stats, load_waveform, normalize_signal
+from src_Connection.models import create_model
 
 
 # -------------------------------------------------------------------------

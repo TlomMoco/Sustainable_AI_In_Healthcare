@@ -8,8 +8,8 @@ import numpy as np
 import matplotlib.pyplot as plt
 from pathlib import Path
 
-from src.config import RESULTS_DIR, SUPERCLASSES
-from src.utils import ensure_dir
+from src_Connection.config import RESULTS_DIR, SUPERCLASSES
+from src_Connection.utils import ensure_dir
 
 # -------------------------------------------------------------------------
 # I/O - loading results
@@ -357,8 +357,8 @@ try:
     from .utils import torch_loader_kwargs as _torch_loader_kwargs
 except Exception:
     # Fallback if imported as a standalone script (optional)
-    from src import config as CFG  # type: ignore
-    from src.utils import torch_loader_kwargs as _torch_loader_kwargs  # type: ignore
+    from src_Connection import config as CFG  # type: ignore
+    from src_Connection.utils import torch_loader_kwargs as _torch_loader_kwargs  # type: ignore
 
 
 class TorchAdapter:

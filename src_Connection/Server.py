@@ -10,11 +10,11 @@ Responsibilities:
   • Aggregate metrics across clients (weighted by number of examples)
 
 Launch order (multi-terminal):
-    $ python -m src.Server         # Terminal 1
-    $ python -m src.Client --cid 0 # Terminal 2
-    $ python -m src.Client --cid 1 # Terminal 3
-    $ python -m src.Client --cid 2 # ...
-    $ python -m src.Client --cid 3
+    $ python -m src_Connection.Server         # Terminal 1
+    $ python -m src_Connection.Client --cid 0 # Terminal 2
+    $ python -m src_Connection.Client --cid 1 # Terminal 3
+    $ python -m src_Connection.Client --cid 2 # ...
+    $ python -m src_Connection.Client --cid 3
 """
 
 from __future__ import annotations
@@ -24,7 +24,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 import flwr as fl
 
-from src.config import (
+from src_Connection.config import (
     CLIENTS,
     FREEZE_CFG,
     ROUNDS,

@@ -1,36 +1,36 @@
-# src/__init__.py
+# src_Connection/__init__.py
 """
-src — Sustainable AI in Healthcare (DSP5100)
+src_Connection — Federated/connection-focused variant of the DSP5100 project.
 
-Lightweight package initializer:
-  • Defines package version/metadata
+Lightweight initializer:
+  • Package metadata
+  • Resolves project paths safely
   • Ensures results directory exists
-  • Exposes common config knobs and convenience helpers without heavy imports
+  • Exposes a few convenience helpers via lazy imports (no heavy deps on import)
 """
 
 from __future__ import annotations
+from pathlib import Path
 
-# --- Package metadata ----------------------------------------------------
-__title__   = "sustainable-ai-healthcare"
+# --- Metadata -------------------------------------------------------------
+__title__   = "sustainable-ai-healthcare-connection"
 __version__ = "0.1.0"
 __author__  = "DSP5100 Team"
 
-# --- Minimal, safe imports (no heavy deps like torch/wfdb here) ----------
-from pathlib import Path
-
+# --- Paths / results dir --------------------------------------------------
 try:
+    # Prefer the package's own config (doesn't pull torch/wfdb at import)
     from .config import RESULTS_DIR, PROJ_ROOT  # type: ignore
 except Exception:
-    # Fallbacks if config can’t be imported during early setups
+    # Safe fallbacks if config isn't ready yet
     PROJ_ROOT  = Path(__file__).resolve().parent.parent
     RESULTS_DIR = PROJ_ROOT / "results"
 
-# Ensure results dir exists at import-time (cheap and helpful)
 RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
-# --- Tiny convenience wrappers (lazy heavy imports inside functions) -----
+# --- Lazy convenience wrappers (avoid heavy imports on import) ------------
 def set_seed(seed: int | None = None) -> None:
-    """Project-wide seeding (lazy-imports utils to avoid torch cost on import)."""
+    """Project-wide seeding (lazy import)."""
     from .utils import set_seed as _set_seed
     _set_seed(seed)
 
@@ -40,7 +40,7 @@ def pick_device():
     return _pick()
 
 def load_metadata():
-    """Load PTB-XL metadata (lazy import to avoid pandas/wfdb at package import)."""
+    """Load PTB-XL metadata (lazy import)."""
     from .data_loader import load_metadata as _load
     return _load()
 
@@ -49,7 +49,6 @@ def create_model(model_type: str, n_classes: int, **kwargs):
     from .models import create_model as _create
     return _create(model_type, n_classes, **kwargs)
 
-# --- What we publicly expose from the package ----------------------------
 __all__ = [
     "__title__", "__version__", "__author__",
     "PROJ_ROOT", "RESULTS_DIR",

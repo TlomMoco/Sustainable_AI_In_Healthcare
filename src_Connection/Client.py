@@ -34,18 +34,18 @@ except ImportError as e:
     raise ImportError("Please install Flower: pip install flwr==1.*") from e
 
 # --- Project imports (absolute) ---
-from src.config import (
+from src_Connection.config import (
     LR, BATCH_SIZE, EPOCHS_LOCAL, FREEZE_THRESHOLD, FEDPROX_MU,
     SEED, RESULTS_DIR, FREEZE_CFG, SPLITS, NORM, MODEL, EXPERIMENT,
     SAMPLE_RATE, N_CLASSES, TUNING, GRIDSEARCH, CLIENTS, FL_SERVER_ADDRESS,
 )
-from src.data_loader import (
+from src_Connection.data_loader import (
     load_metadata, map_superclasses, filter_single_label,
     stratified_patient_split_3way, load_waveform,
     compute_perlead_norm_stats, normalize_signal,
 )
-from src.models import create_model
-from src.utils import set_seed, ensure_dir
+from src_Connection.models import create_model
+from src_Connection.utils import set_seed, ensure_dir
 
 
 # -------------------------------------------------------------------------
@@ -175,7 +175,7 @@ class PTBClient(fl.client.NumPyClient):
             self.hp_source = source
 
         if TUNING.get("enabled", False):
-            from src.tuning import run_client_cv
+            from src_Connection.tuning import run_client_cv
             outdir.mkdir(parents=True, exist_ok=True)
 
             if TUNING.get("reuse_cached_if_exists", True) and best_path.exists():
@@ -231,7 +231,7 @@ class PTBClient(fl.client.NumPyClient):
                     for p in getattr(module, "parameters", lambda: [])():
                         p.requires_grad = req
 
-        print(f"[Client {self.cid}] Model: {MODEL['type']} on {self.device} | HP src: {self.hp_source}")
+        print(f"[Client {self.cid}] Model: {MODEL['type']} on {self.device} | HP src_Connection: {self.hp_source}")
 
     # ---------------------------------------------------------------------
     # Flower API

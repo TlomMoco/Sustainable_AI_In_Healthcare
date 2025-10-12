@@ -18,9 +18,9 @@ from sklearn.dummy import DummyClassifier
 from sklearn.ensemble import RandomForestClassifier
 
 # --- Project imports (use absolute package imports consistently)
-from src import config as CFG
-from src.utils import set_seed, pick_device, log, sanitize_mps_env
-from src.data_loader import (
+from src_Connection import config as CFG
+from src_Connection.utils import set_seed, pick_device, log, sanitize_mps_env
+from src_Connection.data_loader import (
     load_metadata,
     map_superclasses,
     filter_single_label,
@@ -28,9 +28,9 @@ from src.data_loader import (
     make_feature_table,             # returns (feature_df, minimal_meta_df)
     train_test_split as mask_split  # boolean-mask split for deep set
 )
-from src.data_preprocessing import make_label_encoder, make_train_val_loaders
-from src.models import create_model, create_logistic_baseline
-from src.results_visualization import TorchAdapter, evaluate_models, plot_confusion, plot_learning_curves
+from src_Connection.data_preprocessing import make_label_encoder, make_train_val_loaders
+from src_Connection.models import create_model, create_logistic_baseline
+from src_Connection.results_visualization import TorchAdapter, evaluate_models, plot_confusion, plot_learning_curves
 
 
 # =============================================================================

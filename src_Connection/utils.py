@@ -25,7 +25,7 @@ import torch
 import matplotlib.pyplot as plt
 from sklearn.metrics import accuracy_score, f1_score, roc_auc_score
 
-from src.config import RESULTS_DIR, SEED, LOW_RAM
+from src_Connection.config import RESULTS_DIR, SEED, LOW_RAM
 
 
 # -------------------------------------------------------------------------

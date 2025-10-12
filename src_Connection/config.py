@@ -133,7 +133,7 @@ GRIDSEARCH = {
 # NOTE:
 # - We do NOT redefine globals above (no shadowing of SEED, PTBXL_CSV, BATCH_SIZE, etc.).
 # - Everything here is wrapped in NOTEBOOK so notebooks/scripts can import safely:
-#       from src.config import NOTEBOOK
+#       from src_Connection.config import NOTEBOOK
 # - Paths reuse the top-level PTBXL_CSV/SCP_CSV and are cast to str when needed.
 
 NOTEBOOK = {
