@@ -51,18 +51,18 @@ import torch.nn as nn
 import torch.optim as optim
 from sklearn.model_selection import GroupKFold
 
-from src_Connection.config import (
+from src_Connection import (
     SAMPLE_RATE, N_CLASSES, MODEL, GRIDSEARCH, SUPERCLASSES, SEED
 )
-from src_Connection.data_loader import (
+from src_Connection import (
     compute_perlead_norm_stats, load_waveform, normalize_signal
 )
-from src_Connection.models import create_model
-from src_Connection.utils import ensure_dir, set_seed
+from src_Connection import create_model
+from src_Connection import ensure_dir, set_seed
 
 # Optional grad clip from config (if defined)
 try:
-    from src_Connection.config import GRAD_CLIP_NORM as _GRAD_CLIP
+    from src_Connection import GRAD_CLIP_NORM as _GRAD_CLIP
 except Exception:
     _GRAD_CLIP = 0.0
 

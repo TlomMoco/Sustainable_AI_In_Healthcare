@@ -1,43 +1,31 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-results_visualization.py — unified plotting script
+results_visualization.py — unified plotting script (prettified + numbers)
 
-Goal
-----
-Bring (most of) the plots you produce in the PTB-XL notebook (EDA sections 6/6b/6c/6d,
-plus confusion matrices & learning curves when available) into a single Python module.
-
-This script is resilient: it will generate everything it can from the inputs it can find,
-while printing friendly "Missing:" notes for anything that isn't available.
-
-Inputs (auto-discovered, but can be overridden via CLI flags):
-- PTB-XL database CSVs:
-    dataset/ptb-xl-a-large-publicly-available-electrocardiography-dataset-1.0.3/ptbxl_database.csv
-    dataset/ptb-xl-a-large-publicly-available-electrocardiography-dataset-1.0.3/scp_statements.csv
-- Engineered features table (from the notebook §5c):
-    test/artifacts/basic_signal_features.csv  (or artifacts/basic_signal_features.csv)
-- Federated results (optional — will plot if present):
-    results/non_frozen_run.csv
-    results/non_frozen_run_perclass.csv
-    results/non_frozen_run_cm.csv
-    (and the "frozen_*.csv" counterparts if available)
-
-Outputs:
-- Figures saved to: results/viz (default)
-
-Usage
------
-python -m src_Connection.results_visualization \
-  --dataset-root dataset/ptb-xl-a-large-publicly-available-electrocardiography-dataset-1.0.3 \
-  --features-csv test/artifacts/basic_signal_features.csv \
-  --outdir results/viz
-
-Notes
------
-- If features CSV is missing, EDA that needs HRV/engineered features will be skipped.
-- If PTB-XL CSVs are missing, EDA that relies on demographics/strat folds will be skipped.
-- If FL CSVs are missing, FL-comparison figures/ANOVAs will be skipped; EDA still runs.
+Enhancements in this update
+---------------------------
+- Fix Matplotlib 3.9 deprecation: boxplot(labels=...) -> boxplot(tick_labels=...)
+- Add value labels on bars across EDA plots
+- Export the numbers behind every figure to CSVs:
+    results/viz/eda/tables/
+      - table_class_counts.csv
+      - table_sex_overall_counts.csv
+      - table_class_by_sex_counts.csv
+      - table_class_by_sex_percent.csv
+      - table_records_per_year.csv
+      - table_class_by_fold_counts.csv
+      - table_age_summary_overall.csv
+      - table_age_summary_by_class.csv
+      - table_age_summary_by_sex.csv
+      - table_feature_corr_spearman.csv
+      - table_feature_corr_pruned_spearman.csv
+      - table_hrv_summary_by_class.csv
+      - table_hrv_summary_by_sex.csv
+      - table_anova_top.csv
+    results/viz/
+      - confusion_<tag>_rXX_counts.csv
+      - confusion_<tag>_rXX_percent.csv
 """
 from __future__ import annotations
 import os
@@ -68,11 +56,9 @@ def ts():
 def log(msg: str):
     print(f"[{ts()}] {msg}")
 
-
 def ensure_outdir(p: Path) -> Path:
     p.mkdir(parents=True, exist_ok=True)
     return p
-
 
 def savefig(fig: plt.Figure, outdir: Path, name: str):
     ensure_outdir(outdir)
@@ -81,6 +67,12 @@ def savefig(fig: plt.Figure, outdir: Path, name: str):
     plt.close(fig)
     print(f"Saved: {fp}")
 
+def _savetab(df: pd.DataFrame | pd.Series, outdir: Path, name: str):
+    """Save numbers to CSV, printing a friendly line."""
+    ensure_outdir(outdir)
+    fp = outdir / name
+    (df.to_frame() if isinstance(df, pd.Series) else df).to_csv(fp)
+    print(f"Saved table: {fp}")
 
 # --------------------------------------------------------------------------------------
 # Paths & defaults
@@ -202,19 +194,15 @@ BAR_BASE = 0.32
 SPREAD_BASE = 1.00
 GAP_FRAC_GROUPED = 0.08
 
-
 def _wrap(names: Iterable[str], width: int = 12) -> list[str]:
     import textwrap
     return ["\n".join(textwrap.wrap(str(n), width=width)) for n in names]
 
-
 def _x_positions(n: int, spread: float = SPREAD_BASE):
     return np.arange(n) * spread
 
-
 def _bar_width(n: int, base: float = BAR_BASE):
     return float(np.clip(base, 0.18, 0.45))
-
 
 def _sex_norm(series: pd.Series) -> pd.Series:
     out = pd.Series("unknown", index=series.index, dtype="string")
@@ -228,7 +216,6 @@ def _sex_norm(series: pd.Series) -> pd.Series:
     out.loc[s.isin({"female","woman"})] = "female"
     return out
 
-
 def _prettify_axes(ax: plt.Axes):
     ax.grid(axis="y", alpha=0.25, linestyle="--", linewidth=0.6)
     for s in ("top", "right"):
@@ -236,12 +223,10 @@ def _prettify_axes(ax: plt.Axes):
     ax.tick_params(axis="both", labelsize=10)
     ax.yaxis.set_major_formatter(FuncFormatter(lambda v, p: f"{int(v):,}"))
 
-
 def _text_with_outline(ax, x, y, s, fontsize=10, color="#111", outline_width=2.0, outline_color="white", **kwargs):
     t = ax.text(x, y, s, ha="center", va="bottom", fontsize=fontsize, color=color, **kwargs)
     t.set_path_effects([pe.Stroke(linewidth=outline_width, foreground=outline_color), pe.Normal()])
     return t
-
 
 def _fd_bins(x: np.ndarray, min_bins=20, max_bins=60):
     x = np.asarray(x, dtype=float)
@@ -257,9 +242,19 @@ def _fd_bins(x: np.ndarray, min_bins=20, max_bins=60):
     bins = int(np.ceil((x.max() - x.min()) / bw))
     return int(np.clip(bins, min_bins, max_bins))
 
+def _annot_bars(ax, xs, ys, fmt="{:,}", dy_frac=0.02, fontsize=10):
+    """Add numbers above bars."""
+    if len(ys) == 0:
+        return
+    ymax = float(np.nanmax(ys)) if len(ys) else 1.0
+    dy = max(1.0, ymax * dy_frac)
+    for x, y in zip(xs, ys):
+        if np.isfinite(y):
+            s = fmt.format(int(round(y))) if fmt == "{:,}" else fmt.format(y)
+            _text_with_outline(ax, x, y + dy, s, fontsize=fontsize)
 
 # --------------------------------------------------------------------------------------
-# EDA plotters (mostly 1:1 with notebook)
+# EDA plotters (with table exports)
 # --------------------------------------------------------------------------------------
 
 def plot_missingness_top(features_df: pd.DataFrame, outdir: Path):
@@ -290,7 +285,7 @@ def plot_missingness_top(features_df: pd.DataFrame, outdir: Path):
         ax.text(v + ymax * 0.01, y, f"{v:.2f}%", va="center", fontsize=9)
     plt.tight_layout()
     savefig(fig, outdir, "eda_missingness_top.png")
-
+    _savetab(nz.sort_values(ascending=False), outdir / "tables", "table_missingness_percent.csv")
 
 def plot_class_counts(meta_df: pd.DataFrame, outdir: Path):
     if meta_df.empty or "label" not in meta_df.columns:
@@ -298,6 +293,10 @@ def plot_class_counts(meta_df: pd.DataFrame, outdir: Path):
     labs = meta_df["label"].astype(str)
     order = [c for c in ORDER_5 if c in set(labs)] or sorted(labs.unique())
     cls_counts = labs.value_counts().reindex(order).fillna(0).astype(int)
+
+    # Save numbers
+    tab = pd.DataFrame({"count": cls_counts, "percent": (cls_counts / cls_counts.sum() * 100).round(2)})
+    _savetab(tab, outdir / "tables", "table_class_counts.csv")
 
     n = len(order)
     xs = _x_positions(n, 1.00)
@@ -312,20 +311,21 @@ def plot_class_counts(meta_df: pd.DataFrame, outdir: Path):
     ax.set_title("Class counts")
     ax.set_ylabel("Count")
     ax.grid(axis="y", alpha=0.3)
-    for x, y in zip(xs, cls_counts.values):
-        ax.text(x, y + max(1, 0.015 * ymax), f"{int(y):,}", ha="center", va="bottom", fontsize=9)
+    _annot_bars(ax, xs, cls_counts.values)
     plt.tight_layout()
     savefig(fig, outdir, "eda_class_counts.png")
-
 
 def plot_sex_overall_and_by_class(meta_df: pd.DataFrame, outdir: Path):
     if meta_df.empty or "sex" not in meta_df.columns:
         return
     df = meta_df.copy()
     df["sex_norm"] = _sex_norm(df["sex"])
+    tables_dir = outdir / "tables"
 
     # overall
     vc = df["sex_norm"].value_counts().reindex(["female","male","unknown"]).dropna().astype(int)
+    _savetab(vc, tables_dir, "table_sex_overall_counts.csv")
+
     k = len(vc)
     group_width = 0.80
     bar_gap_frac = 0.10
@@ -350,7 +350,9 @@ def plot_sex_overall_and_by_class(meta_df: pd.DataFrame, outdir: Path):
     # class x sex
     if "label" in df.columns:
         ct = pd.crosstab(df["label"].astype(str), df["sex_norm"]).reindex(ORDER_5, fill_value=0).fillna(0).astype(int)
+        _savetab(ct, tables_dir, "table_class_by_sex_counts.csv")
         sex_order = [s for s in ["female","male","unknown"] if s in ct.columns] or list(ct.columns)
+
         x = _x_positions(len(ct.index), 1.00)
         k = len(sex_order)
         group_width = 0.80
@@ -363,7 +365,9 @@ def plot_sex_overall_and_by_class(meta_df: pd.DataFrame, outdir: Path):
             offs = -group_width/2 + j*bar_w + bar_w/2
             vals = ct[col].values
             ymax = max(ymax, float(np.nanmax(vals)) if len(vals) else 0.0)
-            ax.bar(x + offs, vals, width=eff_w, label=col, color=SEX_COLORS.get(col), edgecolor="white", linewidth=0.6)
+            bars = ax.bar(x + offs, vals, width=eff_w, label=col, color=SEX_COLORS.get(col),
+                          edgecolor="white", linewidth=0.6)
+            _annot_bars(ax, x + offs, vals)
         ax.set_ylim(0, ymax * 1.18)
         ax.set_xticks(x)
         ax.set_xticklabels(_wrap(ct.index, 10))
@@ -374,28 +378,43 @@ def plot_sex_overall_and_by_class(meta_df: pd.DataFrame, outdir: Path):
         plt.tight_layout()
         savefig(fig, outdir, "eda_class_by_sex_counts.png")
 
-        pct = (ct.div(ct.sum(axis=1).replace(0, np.nan), axis=0) * 100).fillna(0)
+        pct = (ct.div(ct.sum(axis=1).replace(0, np.nan), axis=0) * 100).fillna(0).round(2)
+        _savetab(pct, tables_dir, "table_class_by_sex_percent.csv")
+
         fig, ax = plt.subplots(figsize=(10.6, 5.6))
         for j, col in enumerate(sex_order):
             offs = -group_width/2 + j*bar_w + bar_w/2
-            ax.bar(x + offs, pct[col].values, width=eff_w, label=col, color=SEX_COLORS.get(col), edgecolor="white", linewidth=0.6)
+            vals = pct[col].values
+            ax.bar(x + offs, vals, width=eff_w, label=col, color=SEX_COLORS.get(col), edgecolor="white", linewidth=0.6)
+            _annot_bars(ax, x + offs, vals, fmt="{:.2f}")
         ax.set_xticks(x)
         ax.set_xticklabels(_wrap(pct.index, 10))
         ax.set_ylabel("Percentage (%)")
         ax.set_ylim(0, 100)
         ax.set_title("Class × Sex (normalized)")
         ax.legend()
-        _prettify_axes(ax)
+        # override y formatter to raw (not thousands)
+        ax.yaxis.set_major_formatter(FuncFormatter(lambda v, p: f"{v:g}"))
+        ax.grid(axis="y", alpha=0.25, linestyle="--", linewidth=0.6)
         plt.tight_layout()
         savefig(fig, outdir, "eda_class_by_sex_percent.png")
-
 
 def plot_age_distributions(meta_df: pd.DataFrame, outdir: Path):
     if meta_df.empty or "age" not in meta_df.columns:
         return
+    tables_dir = outdir / "tables"
     df = meta_df.copy()
     a = pd.to_numeric(df["age"], errors="coerce").dropna().values
     if a.size:
+        # overall age summary
+        overall = pd.Series({
+            "n": int(a.size),
+            "mean": float(np.mean(a)),
+            "std": float(np.std(a, ddof=1)) if a.size > 1 else float("nan"),
+            "median": float(np.median(a))
+        }).to_frame("age_overall")
+        _savetab(overall.T.round(2), tables_dir, "table_age_summary_overall.csv")
+
         bins = _fd_bins(a, min_bins=24, max_bins=64)
         fig, ax = plt.subplots(figsize=(11.5, 5.6))
         ax.hist(a, bins=bins, rwidth=0.94, edgecolor="white", linewidth=0.6, alpha=0.9)
@@ -419,8 +438,20 @@ def plot_age_distributions(meta_df: pd.DataFrame, outdir: Path):
                 data_c.append(v)
                 labs_c.append(c)
         if data_c:
+            # summary table
+            rows = []
+            for c, v in zip(labs_c, data_c):
+                rows.append({"label": c, "n": int(v.size), "mean": np.mean(v), "std": (np.std(v, ddof=1) if v.size > 1 else np.nan),
+                             "median": np.median(v)})
+            _savetab(pd.DataFrame(rows).set_index("label").round(2).loc[labs_c], tables_dir, "table_age_summary_by_class.csv")
+
             fig, ax = plt.subplots(figsize=(10.8, 5.2))
-            ax.boxplot(data_c, labels=_wrap(labs_c, 10), showfliers=False)
+            ax.boxplot(data_c, tick_labels=_wrap(labs_c, 10), showfliers=False)  # CHANGED: tick_labels
+            # annotate n & medians
+            ymin, ymax = ax.get_ylim(); dy = 0.03*(ymax - ymin)
+            for i, v in enumerate(data_c, start=1):
+                ax.text(i, np.percentile(v, 75) + dy, f"n={len(v):,}\nmed={np.median(v):.1f}",
+                        ha="center", va="bottom", fontsize=9)
             ax.set_title("Age by diagnostic class", fontsize=14)
             ax.set_ylabel("Age")
             _prettify_axes(ax)
@@ -432,14 +463,24 @@ def plot_age_distributions(meta_df: pd.DataFrame, outdir: Path):
         df["sex_norm"] = _sex_norm(df["sex"]) if "sex_norm" not in df.columns else df["sex_norm"]
         af = pd.to_numeric(df.loc[df["sex_norm"] == "female", "age"], errors="coerce").dropna().values
         am = pd.to_numeric(df.loc[df["sex_norm"] == "male", "age"], errors="coerce").dropna().values
-        base = a if a.size else (np.concatenate([af, am]) if (af.size and am.size) else (af if af.size else am))
+
         if af.size or am.size:
+            # summary by sex
+            ss = []
+            if af.size: ss.append({"sex":"female","n":int(af.size),"mean":np.mean(af),"std":(np.std(af, ddof=1) if af.size>1 else np.nan),"median":np.median(af)})
+            if am.size: ss.append({"sex":"male","n":int(am.size),"mean":np.mean(am),"std":(np.std(am, ddof=1) if am.size>1 else np.nan),"median":np.median(am)})
+            if ss:
+                _savetab(pd.DataFrame(ss).set_index("sex").round(2), tables_dir, "table_age_summary_by_sex.csv")
+
+            base = (np.concatenate([af, am]) if (af.size and am.size) else (af if af.size else am))
             bins = _fd_bins(base, min_bins=24, max_bins=64)
             fig, ax = plt.subplots(figsize=(11.5, 5.6))
             if af.size:
-                ax.hist(af, bins=bins, rwidth=0.90, alpha=0.55, label="female", color=SEX_COLORS.get("female"), edgecolor="white", linewidth=0.6)
+                ax.hist(af, bins=bins, rwidth=0.90, alpha=0.55, label="female", color=SEX_COLORS.get("female"),
+                        edgecolor="white", linewidth=0.6)
             if am.size:
-                ax.hist(am, bins=bins, rwidth=0.90, alpha=0.55, label="male", color=SEX_COLORS.get("male"), edgecolor="white", linewidth=0.6)
+                ax.hist(am, bins=bins, rwidth=0.90, alpha=0.55, label="male", color=SEX_COLORS.get("male"),
+                        edgecolor="white", linewidth=0.6)
             ax.set_title("Age distribution by sex (overlay)", fontsize=14)
             ax.set_xlabel("Age")
             ax.set_ylabel("Count")
@@ -452,7 +493,7 @@ def plot_age_distributions(meta_df: pd.DataFrame, outdir: Path):
                 fig, ax = plt.subplots(figsize=(8.2, 5.0))
                 sexes = ["female", "male"]
                 data = [af, am]
-                bp = ax.boxplot(data, labels=sexes, showfliers=False, patch_artist=True,
+                bp = ax.boxplot(data, tick_labels=sexes, showfliers=False, patch_artist=True,  # CHANGED
                                 boxprops=dict(linewidth=1.2), medianprops=dict(linewidth=1.6),
                                 whiskerprops=dict(linewidth=1.0), capprops=dict(linewidth=1.0))
                 for i, lab in enumerate(sexes):
@@ -461,12 +502,13 @@ def plot_age_distributions(meta_df: pd.DataFrame, outdir: Path):
                     bp["boxes"][i].set_alpha(0.25)
                     bp["boxes"][i].set_edgecolor(c)
                     bp["medians"][i].set_color(c)
+                    ax.text(i+1, np.percentile(data[i], 75) + 1.5, f"n={len(data[i]):,}\nmed={np.median(data[i]):.1f}",
+                            ha="center", va="bottom", fontsize=9)
                 ax.set_title("Age by sex", fontsize=14)
                 ax.set_ylabel("Age")
                 _prettify_axes(ax)
                 plt.tight_layout()
                 savefig(fig, outdir, "eda_age_by_sex_box_pretty.png")
-
 
 def plot_records_per_year(meta_df: pd.DataFrame, outdir: Path):
     if meta_df.empty or "recording_date" not in meta_df.columns:
@@ -475,6 +517,8 @@ def plot_records_per_year(meta_df: pd.DataFrame, outdir: Path):
     yrs = dt.dt.year.value_counts().sort_index()
     if yrs.size == 0:
         return
+    _savetab(yrs, outdir / "tables", "table_records_per_year.csv")
+
     fig, ax = plt.subplots(figsize=(11.8, 5.6))
     xs = _x_positions(len(yrs), spread=1.00)
     bar_width = 0.72
@@ -486,12 +530,9 @@ def plot_records_per_year(meta_df: pd.DataFrame, outdir: Path):
     _prettify_axes(ax)
     ymax = float(yrs.values.max())
     ax.set_ylim(0, ymax * 1.14)
-    dy = max(1.0, 0.02 * ymax)
-    for x, y in zip(xs, yrs.values):
-        _text_with_outline(ax, x, y + dy, f"{int(y):,}", fontsize=10)
+    _annot_bars(ax, xs, yrs.values)
     plt.tight_layout()
     savefig(fig, outdir, "eda_records_per_year_pretty_alllabels.png")
-
 
 def plot_strat_fold_grouped(meta_df: pd.DataFrame, outdir: Path):
     if meta_df.empty or "strat_fold" not in meta_df.columns or "label" not in meta_df.columns:
@@ -499,6 +540,7 @@ def plot_strat_fold_grouped(meta_df: pd.DataFrame, outdir: Path):
     ct = pd.crosstab(meta_df["strat_fold"].astype(int), meta_df["label"].astype(str))
     cols = [c for c in ORDER_5 if c in ct.columns] or list(ct.columns)
     ct = ct[cols]
+    _savetab(ct, outdir / "tables", "table_class_by_fold_counts.csv")
 
     folds = ct.index.astype(str).tolist()
     x = _x_positions(len(folds), 1.00)
@@ -518,7 +560,7 @@ def plot_strat_fold_grouped(meta_df: pd.DataFrame, outdir: Path):
             x + offs, vals, width=eff_w,
             label=str(lab), color=CLASS_COLORS.get(lab, None), edgecolor="white", linewidth=0.6, alpha=0.92
         )
-
+        _annot_bars(ax, x + offs, vals)
     ax.set_xticks(x)
     ax.set_xticklabels(folds)
     ax.set_xlabel("strat_fold")
@@ -530,7 +572,6 @@ def plot_strat_fold_grouped(meta_df: pd.DataFrame, outdir: Path):
     plt.tight_layout()
     savefig(fig, outdir, "eda_fold_class_counts_grouped_pretty.png")
 
-
 # --------------------------------------------------------------------------------------
 # Engineered-features EDA: correlation heatmaps & pruning
 # --------------------------------------------------------------------------------------
@@ -538,6 +579,7 @@ def plot_strat_fold_grouped(meta_df: pd.DataFrame, outdir: Path):
 def plot_feature_correlations(feature_df: pd.DataFrame, outdir: Path):
     if feature_df.empty:
         return
+    tables_dir = outdir / "tables"
     num = feature_df.drop(columns=["label"], errors="ignore").select_dtypes(include=[np.number])
     if num.shape[1] < 2:
         print("(Not enough numeric columns for correlation heatmap.)")
@@ -568,19 +610,20 @@ def plot_feature_correlations(feature_df: pd.DataFrame, outdir: Path):
                     order.append(c)
     order += [c for c in cols if c not in order]
 
-    corr = num[order].corr().abs()
+    corr = num[order].corr(method="spearman").round(3).abs()
+    _savetab(corr, tables_dir, "table_feature_corr_spearman.csv")
+
     fig, ax = plt.subplots(figsize=(9.5, 8.0))
     im = ax.imshow(corr.values, vmin=0, vmax=1, cmap="viridis", interpolation="nearest")
     cb = fig.colorbar(im, ax=ax)
     cb.set_label("|r|")
     ax.set_title("Feature correlation heatmap — grouped by family (|r|)")
-    ax.set_xticks([])
-    ax.set_yticks([])
+    ax.set_xticks([]); ax.set_yticks([])
     plt.tight_layout()
     savefig(fig, outdir, "eda_feature_corr_heatmap_grouped_simple.png")
 
-    # Prune
-    C = num[order].corr().abs()
+    # Prune highly correlated features
+    C = corr.copy()
     keep = []
     dropped = []
     seen = set()
@@ -597,16 +640,19 @@ def plot_feature_correlations(feature_df: pd.DataFrame, outdir: Path):
                 dropped.append((d, c, float(C.loc[d, c])))
 
     num_p = num[keep]
-    corr_p = num_p.corr().abs()
+    corr_p = num_p.corr(method="spearman").round(3).abs()
+    _savetab(pd.DataFrame({"kept_features": keep}), tables_dir, "table_feature_corr_pruned_kept.csv")
+    _savetab(pd.DataFrame(dropped, columns=["dropped","kept_with","|r|"]).sort_values("|r|", ascending=False),
+             tables_dir, "table_feature_corr_pruned_dropped.csv")
+    _savetab(corr_p, tables_dir, "table_feature_corr_pruned_spearman.csv")
+
     fig, ax = plt.subplots(figsize=(8.5, 7.5))
     im = ax.imshow(corr_p.values, vmin=0, vmax=1, cmap="viridis", interpolation="nearest")
     fig.colorbar(im, ax=ax).set_label("|r|")
     ax.set_title(f"Correlation heatmap after pruning (|r|≥0.95) — {num_p.shape[1]} features kept")
-    ax.set_xticks([])
-    ax.set_yticks([])
+    ax.set_xticks([]); ax.set_yticks([])
     plt.tight_layout()
     savefig(fig, outdir, "eda_feature_corr_heatmap_pruned.png")
-
 
 # --------------------------------------------------------------------------------------
 # HR/HRV boxplots by class/sex (from engineered features table)
@@ -624,6 +670,27 @@ def plot_hrv_boxes(feature_df: pd.DataFrame, outdir: Path):
         print("(HR/HRV columns not found in features CSV; skipping HRV boxplots.)")
         return
 
+    # Summary tables
+    tables_dir = (outdir / "tables")
+    if "label" in df.columns:
+        g = df.groupby("label")[METRICS].agg(["count","mean","std","median"])
+        # flatten multiindex
+        g.columns = [f"{m}_{stat}" for m, stat in g.columns]
+        _savetab(g.sort_index(), tables_dir, "table_hrv_summary_by_class.csv")
+
+    sex_col = None
+    for c in ["sex_norm", "sex"]:
+        if c in df.columns:
+            sex_col = c
+            break
+    if sex_col is not None:
+        if sex_col == "sex":
+            df["sex_norm"] = _sex_norm(df["sex"])
+            sex_col = "sex_norm"
+        g2 = df.groupby(sex_col)[METRICS].agg(["count","mean","std","median"])
+        g2.columns = [f"{m}_{stat}" for m, stat in g2.columns]
+        _savetab(g2, tables_dir, "table_hrv_summary_by_sex.csv")
+
     def _boxplot(df: pd.DataFrame, metric: str, group_col: str, order=None, title=None, fname=None, figsize=(10,5)):
         g_order = (order or sorted(df[group_col].dropna().astype(str).unique()))
         groups, labels = [], []
@@ -635,7 +702,12 @@ def plot_hrv_boxes(feature_df: pd.DataFrame, outdir: Path):
         if not groups:
             return
         fig, ax = plt.subplots(figsize=figsize)
-        ax.boxplot(groups, labels=labels, showfliers=False)
+        ax.boxplot(groups, tick_labels=labels, showfliers=False)  # CHANGED
+        # annotate n & med
+        ymin, ymax = ax.get_ylim(); dy = 0.03*(ymax - ymin)
+        for i, arr in enumerate(groups, start=1):
+            ax.text(i, np.percentile(arr, 75) + dy, f"n={len(arr):,}\nmed={np.median(arr):.1f}",
+                    ha="center", va="bottom", fontsize=9)
         ax.set_title(title or f"{metric} by {group_col}")
         ax.set_ylabel(metric)
         ax.grid(alpha=0.3, axis="y")
@@ -647,19 +719,10 @@ def plot_hrv_boxes(feature_df: pd.DataFrame, outdir: Path):
         for m in METRICS:
             _boxplot(df, m, "label", order=class_order, title=f"{m} by diagnostic class", fname=f"box_{m}_by_class_side.png")
 
-    sex_col = None
-    for c in ["sex_norm", "sex"]:
-        if c in df.columns:
-            sex_col = c
-            break
     if sex_col is not None:
-        if sex_col == "sex":
-            df["sex_norm"] = _sex_norm(df["sex"])
-            sex_col = "sex_norm"
         sex_order = [s for s in ["female","male","unknown"] if s in set(df[sex_col].astype(str))]
         for m in METRICS:
             _boxplot(df, m, sex_col, order=sex_order, title=f"{m} by sex", fname=f"box_{m}_by_sex_side.png", figsize=(7.5,4.8))
-
 
 # --------------------------------------------------------------------------------------
 # ANOVA F-test on engineered features (SelectKBest) — robust to NaNs & constants
@@ -691,7 +754,6 @@ def run_anova_selectkbest(feature_df: pd.DataFrame, outdir: Path):
         print("(ANOVA) All numeric features were constant or removed.")
         return
 
-    from sklearn.impute import SimpleImputer
     imp = SimpleImputer(strategy="median")
     X_imp = imp.fit_transform(X_vt)
 
@@ -702,6 +764,9 @@ def run_anova_selectkbest(feature_df: pd.DataFrame, outdir: Path):
     selector = SelectKBest(score_func=f_classif, k=k).fit(X_imp, y_enc)
     scores_series = pd.Series(selector.scores_, index=cols_vt).sort_values(ascending=False)
 
+    # Save numbers
+    _savetab(scores_series.rename("F_score"), outdir / "tables", "table_anova_top.csv")
+
     top = scores_series.head(25)
     fig, ax = plt.subplots(figsize=(10, 5.5))
     xs = np.arange(len(top))
@@ -711,12 +776,13 @@ def run_anova_selectkbest(feature_df: pd.DataFrame, outdir: Path):
     ax.set_title("ANOVA F-scores (top 25)")
     ax.set_ylabel("F-score")
     ax.grid(axis="y", alpha=0.3)
+    # labels
+    _annot_bars(ax, xs, top.values, fmt="{:.1f}", dy_frac=0.015, fontsize=9)
     plt.tight_layout()
     savefig(fig, outdir, "anova_selectkbest_top25.png")
 
-
 # --------------------------------------------------------------------------------------
-# Optional: confusion heatmaps from FL CSVs (if present)
+# Optional: confusion heatmaps from FL CSVs (if present) + tables
 # --------------------------------------------------------------------------------------
 
 def try_plot_confusions_from_csv(cm_csv: Path, superclasses: Iterable[str], name: str, outdir: Path, last_k: int = 3):
@@ -725,9 +791,14 @@ def try_plot_confusions_from_csv(cm_csv: Path, superclasses: Iterable[str], name
         return
     df = pd.read_csv(cm_csv)
     req = {"round","true","pred","count"}
-    if not req.issubset(df.columns):
+    if not req.issubset(set(df.columns.str.lower())):
         print(f"Confusion CSV {cm_csv} missing columns {req}")
         return
+
+    # normalize column cases
+    m = {c.lower(): c for c in df.columns}
+    df = df.rename(columns={m.get("round"): "round", m.get("true"): "true", m.get("pred"): "pred", m.get("count"): "count"})
+
     rounds = sorted(df["round"].dropna().unique())[-int(last_k):]
     sc = list(superclasses)
     n = len(sc)
@@ -736,28 +807,31 @@ def try_plot_confusions_from_csv(cm_csv: Path, superclasses: Iterable[str], name
         piv = sub.pivot_table(index="true", columns="pred", values="count", aggfunc="sum", fill_value=0)
         piv.index = pd.to_numeric(piv.index, errors="coerce")
         piv.columns = pd.to_numeric(piv.columns, errors="coerce")
-        cm = (piv.reindex(index=range(n), columns=range(n), fill_value=0).to_numpy(dtype=float))
+        cm_counts = (piv.reindex(index=range(n), columns=range(n), fill_value=0).astype(int))
+        _savetab(cm_counts, outdir, f"confusion_{name}_r{int(r):02d}_counts.csv")
+
+        cm = cm_counts.to_numpy(dtype=float)
         with np.errstate(invalid="ignore", divide="ignore"):
             row_sum = cm.sum(axis=1, keepdims=True)
             cmn = np.nan_to_num(cm / np.maximum(row_sum, 1), nan=0.0, posinf=0.0, neginf=0.0)
+        _savetab(pd.DataFrame(cmn * 100, index=sc, columns=sc).round(2),
+                 outdir, f"confusion_{name}_r{int(r):02d}_percent.csv")
+
         fig, ax = plt.subplots(figsize=(6.4, 5.3))
         im = ax.imshow(cmn, aspect="auto", vmin=0, vmax=1.0, cmap="Blues")
         ax.set_title(f"Confusion Matrix — {name} (round {int(r)})")
         ax.set_xlabel("Predicted")
         ax.set_ylabel("True")
-        ax.set_xticks(range(n))
-        ax.set_xticklabels(sc, rotation=45, ha="right")
-        ax.set_yticks(range(n))
-        ax.set_yticklabels(sc)
-        cbar = fig.colorbar(im, ax=ax)
-        cbar.set_label("Row-normalized")
+        ax.set_xticks(range(n)); ax.set_xticklabels(sc, rotation=45, ha="right")
+        ax.set_yticks(range(n)); ax.set_yticklabels(sc)
+        cbar = fig.colorbar(im, ax=ax); cbar.set_label("Row-normalized")
         for i in range(n):
             for j in range(n):
                 val = cmn[i, j] * 100.0
-                ax.text(j, i, f"{val:0.2f}", ha="center", va="center", color=("white" if val >= 50 else "black"), fontsize=9)
+                ax.text(j, i, f"{val:0.2f}", ha="center", va="center",
+                        color=("white" if val >= 50 else "black"), fontsize=9)
         plt.tight_layout()
         savefig(fig, outdir, f"confusion_{name}_r{int(r):02d}.png")
-
 
 # --------------------------------------------------------------------------------------
 # Driver: orchestrate everything
@@ -797,7 +871,7 @@ def run_eda_and_optional_fl(args):
         except Exception as e:
             print(f"Failed to read features CSV ({feats_path}): {e}")
 
-    # 3) EDA plots (mostly notebook parity)
+    # 3) EDA plots (mostly notebook parity + numbers)
     if not features_df.empty:
         plot_missingness_top(features_df, eda_dir)
         plot_class_counts(features_df, eda_dir)
@@ -821,7 +895,6 @@ def run_eda_and_optional_fl(args):
 
     print(f"Saved plots to: {outdir}")
 
-
 # --------------------------------------------------------------------------------------
 # CLI
 # --------------------------------------------------------------------------------------
@@ -835,14 +908,12 @@ def build_argparser():
     p.add_argument("--scp-min-conf", type=float, default=0.0, help="Min confidence for SCP code to count toward label")
     p.add_argument("--features-csv", type=str, default=None, help="Engineered features CSV (from notebook §5c)")
     p.add_argument("--results-dir", type=str, default="results", help="Folder where FL CSVs live")
-    p.add_argument("--outdir", type=str, default=str(DEFAULT_OUTDIR), help="Where to save figures")
+    p.add_argument("--outdir", type=str, default=str(DEFAULT_OUTDIR), help="Where to save figures and tables")
     return p
-
 
 def main():
     args = build_argparser().parse_args()
     run_eda_and_optional_fl(args)
-
 
 if __name__ == "__main__":
     main()

@@ -50,7 +50,7 @@ except ImportError as e:
     ) from e
 
 # --- Project configuration (server knobs, output dirs, label space) ---------
-from src_Connection.config import (
+from src_Connection import (
     CLIENTS,              # total number of clients expected to connect
     FREEZE_CFG,           # passed to clients to coordinate unfreeze schedule
     ROUNDS,               # total FL rounds
@@ -61,7 +61,7 @@ from src_Connection.config import (
     SUPERCLASSES,         # label order for per-class accuracy header
     FL_SERVER_BIND,       # <-- server bind address (e.g., "0.0.0.0:8080")
 )
-from src_Connection.utils import ensure_dir
+from src_Connection import ensure_dir
 
 
 # -------------------------------------------------------------------------

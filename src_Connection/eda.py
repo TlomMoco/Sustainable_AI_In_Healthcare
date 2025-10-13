@@ -54,8 +54,8 @@ except Exception:
     # Fallback when relative import fails (e.g., running as plain script).
     from src_Connection import config as CFG  # type: ignore
 
-from src_Connection.utils import ensure_dir, log
-from src_Connection.data_loader import (
+from src_Connection import ensure_dir, log
+from src_Connection import (
     load_metadata,
     make_feature_table as build_feature_tables,  # returns (feature_df, features_df)
     train_test_split as mask_split,              # patient-safe boolean split

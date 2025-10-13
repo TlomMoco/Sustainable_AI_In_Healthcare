@@ -38,7 +38,6 @@ import json
 import time
 from dataclasses import dataclass
 from typing import List, Tuple, Optional
-from collections import OrderedDict
 
 import numpy as np
 import torch
@@ -51,19 +50,19 @@ except ImportError as e:
     raise ImportError("Please install Flower: pip install 'flwr==1.*'") from e
 
 # --- Project imports (absolute) ---
-from src_Connection.config import (
+from src_Connection import (
     LR, BATCH_SIZE, EPOCHS_LOCAL, FREEZE_THRESHOLD, FEDPROX_MU,
     SEED, RESULTS_DIR, FREEZE_CFG, SPLITS, NORM, MODEL, EXPERIMENT,
     SAMPLE_RATE, N_CLASSES, TUNING, GRIDSEARCH, CLIENTS, FL_SERVER_ADDRESS,
     SUPERCLASSES,
 )
-from src_Connection.data_loader import (
+from src_Connection import (
     load_metadata, map_superclasses, filter_single_label,
     stratified_patient_split_3way, load_waveform,
     compute_perlead_norm_stats, normalize_signal,
 )
-from src_Connection.models import create_model
-from src_Connection.utils import (
+from src_Connection import create_model
+from src_Connection import (
     set_seed, ensure_dir, pick_device, sanitize_mps_env, torch_loader_kwargs
 )
 
@@ -306,7 +305,7 @@ class PTBClient(fl.client.NumPyClient):
             self.hp_source = source
 
         if TUNING.get("enabled", False):
-            from src_Connection.tuning import run_client_cv
+            from src_Connection import run_client_cv
             outdir.mkdir(parents=True, exist_ok=True)
 
             # Reuse cached results if allowed and present.

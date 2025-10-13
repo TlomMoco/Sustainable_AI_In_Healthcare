@@ -60,24 +60,24 @@ from torch import nn, optim
 from torch.utils.data import DataLoader
 
 from src_Connection import config as CFG
-from src_Connection.utils import (
+from src_Connection import (
     set_seed,
     pick_device,
     log,
     sanitize_mps_env,
     torch_loader_kwargs,
 )
-from src_Connection.data_loader import (
+from src_Connection import (
     make_feature_table as build_feature_tables,  # returns (feature_df, features_df)
     train_test_split as mask_split,              # boolean-mask split for deep set
 )
-from src_Connection.data_preprocessing import (
+from src_Connection import (
     make_label_encoder,
     make_train_val_loaders,
     ECGDataset,
 )
-from src_Connection.models import create_model
-from src_Connection.results_visualization import (
+from src_Connection import create_model
+from src_Connection import (
     TorchAdapter,
     evaluate_models,
     plot_confusion,

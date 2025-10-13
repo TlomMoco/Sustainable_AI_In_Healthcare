@@ -57,7 +57,7 @@ except Exception:
 
 # --- Paths / results dir --------------------------------------------------
 try:
-    from .config import RESULTS_DIR, PROJ_ROOT  # type: ignore
+    from src_Connection.config import RESULTS_DIR, PROJ_ROOT  # type: ignore
 except Exception:
     PROJ_ROOT = Path(__file__).resolve().parent.parent
     RESULTS_DIR = PROJ_ROOT / "results"
@@ -98,7 +98,7 @@ def create_model(model_type: str, n_classes: int, **kwargs):
 
 
 if TYPE_CHECKING:  # pragma: no cover
-    from . import (  # noqa: F401
+    from src_Connection import (  # noqa: F401
         config,
         models,
         data_loader,

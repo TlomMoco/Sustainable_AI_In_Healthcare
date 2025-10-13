@@ -41,7 +41,7 @@ import numpy as np
 import torch
 from sklearn.metrics import accuracy_score, f1_score, roc_auc_score
 
-from src_Connection.config import RESULTS_DIR, SEED, LOW_RAM
+from src_Connection import RESULTS_DIR, SEED, LOW_RAM
 
 __all__ = [
     "ts", "log",

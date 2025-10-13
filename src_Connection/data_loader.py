@@ -46,7 +46,7 @@ import pandas as pd
 import wfdb
 from joblib import Parallel, delayed
 
-from src_Connection.config import (
+from src_Connection import (
     PTBXL_CSV, SCP_CSV, DATA_ROOT, SAMPLE_RATE,
     N_CLASSES, SUPERCLASSES,
     # notebook/deep config values
@@ -59,10 +59,10 @@ from src_Connection.config import (
 # -------------------------------------------------------------------------
 try:
     # If exported at top-level in config.py
-    from src_Connection.config import LABEL_MODE as _LABEL_MODE, SCP_MIN_CONF as _SCP_MIN_CONF  # type: ignore
+    from src_Connection import LABEL_MODE as _LABEL_MODE, SCP_MIN_CONF as _SCP_MIN_CONF  # type: ignore
 except Exception:
     # Fallback to NOTEBOOK dict
-    from src_Connection.config import NOTEBOOK  # type: ignore
+    from src_Connection import NOTEBOOK  # type: ignore
     _LABEL_MODE = NOTEBOOK.get("LABEL_MODE", "5class")
     _SCP_MIN_CONF = float(NOTEBOOK.get("SCP_MIN_CONF", 0.0))
 
@@ -737,7 +737,7 @@ def make_feature_table(save_csv: bool = True) -> tuple[pd.DataFrame, pd.DataFram
     -------
     • Centralized.py (as build_feature_tables alias)
     """
-    from src_Connection.config import MAX_RECORDS  # defer to avoid circular import
+    from src_Connection import MAX_RECORDS  # defer to avoid circular import
     db, scp_raw = load_metadata_raw()
     diag_only, valid_codes, to_diag_label = build_scp_mapping(db, scp_raw)
 
