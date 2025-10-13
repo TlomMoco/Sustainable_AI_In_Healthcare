@@ -38,6 +38,19 @@ DATA_ROOT = DATA_DIR
 # Subdirectory for hyperparameter tuning results
 TUNING_DIR = RESULTS_DIR / "tuning"
 
+# Feature/EDA artifacts
+ART_DIR = RESULTS_DIR / "artifacts"           # where feature CSVs or EDA dumps can go
+ART_DIR.mkdir(parents=True, exist_ok=True)
+
+# Choose which feature set make_feature_table() should produce:
+#   "basic36"  -> your current mean/std/rms per lead (36D)
+#   "friend_v1"-> your friend's engineered features (we'll wire next)
+FEATURES = {"kind": "basic36"}                # change to "friend_v1" to use his features
+
+# If True, whenever we build a feature table, also cache it to CSV for reuse
+SAVE_FEATURES_CSV = True
+FEATURES_CSV_NAME = "features.csv"            # filename under ART_DIR
+
 
 # -------------------------------------------------------------------------
 # Data and Split Settings
