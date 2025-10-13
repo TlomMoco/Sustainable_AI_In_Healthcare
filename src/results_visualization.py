@@ -5,9 +5,9 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-from sklearn.feature_selection import f_classif
 
-from src.config import RESULTS_DIR, SUPERCLASSES, TUNING_DIR  # TUNING_DIR ok if unused
+
+from src.config import RESULTS_DIR, SUPERCLASSES, TUNING_DIR, MODEL  # TUNING_DIR ok if unused
 from src.utils import ensure_dir
 
 # -------------------------------------------------------------------------
@@ -44,13 +44,14 @@ def title_of(base: str, run_name: str, model_key: str) -> str:
     return f"{base} — {PRETTY_RUN.get(run_name, run_name)} — {PRETTY_MODEL.get(model_key, model_key.upper())}"
 
 RUNS, PERCLS_MAP, CONF_MAP = _discover_runs()
-OUT = RESULTS_DIR / "viz"
+OUT = RESULTS_DIR / "viz" / f"FL_Training_{MODEL['type'].upper()}"
 ensure_dir(OUT)
 
 # Phase labels written by training
 PHASE_ENABLED  = "post_cv"
 PHASE_DISABLED = "no_cv"
 PHASE_CACHED   = "cached_cv"  # if you log cached phase
+
 
 # -------------------------------------------------------------------------
 # CSV loaders
@@ -116,137 +117,6 @@ def _collapse_rows(df: pd.DataFrame, keys: list[str]) -> pd.DataFrame:
                   .drop(columns="_p"))
     return df.sort_values(keys).drop_duplicates(keys, keep="last")
 
-# --------------------------------------------------------------------------------------
-# ANOVA F-test on engineered features (SelectKBest) — robust to NaNs & constants
-# --------------------------------------------------------------------------------------
-def _load_features_csv_or_inline():
-    """
-    Return a DataFrame with numeric features + 'label'.
-    1) Prefer RESULTS_DIR/'features.csv' if it exists.
-    2) Otherwise, build features inline from PTB-XL using your data_loader.
-    """
-    path = RESULTS_DIR / "features.csv"
-    if path.exists():
-        try:
-            df = pd.read_csv(path)
-            if "label" in df.columns:
-                return df
-            else:
-                print("[anova] features.csv missing 'label' column; building inline.")
-        except Exception as e:
-            print(f"[anova] failed reading features.csv ({e}); building inline.")
-
-    # ---- Inline build (uses your repo's helpers) ----
-    try:
-        from src.data_loader import (
-            load_metadata, map_superclasses, filter_single_label,
-            stratified_patient_split, make_feature_table
-        )
-        from src.config import SEED, SUPERCLASSES
-
-        ptb = load_metadata()
-        df_meta = filter_single_label(map_superclasses(ptb))
-        # Use train split to avoid leakage into your test if you later compare
-        train_df, _ = stratified_patient_split(df_meta, test_size=0.2, seed=SEED)
-
-        # limit=None uses all; set a number for speed if you like
-        X, y, _ = make_feature_table(train_df, limit=None)
-
-        cols = (
-            [f"mean_{i}" for i in range(12)] +
-            [f"std_{i}"  for i in range(12)] +
-            [f"rms_{i}"  for i in range(12)]
-        )
-        feat = pd.DataFrame(X, columns=cols)
-        feat["label"] = y
-        feat["y_name"] = [SUPERCLASSES[int(i)] for i in y]
-        return feat
-    except Exception as e:
-        print(f"[anova] inline feature build failed: {e}")
-        return pd.DataFrame()
-
-def run_anova_selectkbest(outdir: Path):
-    """
-    Loads/creates a feature table and runs ANOVA (f_classif) with SelectKBest.
-    Saves a top-25 bar chart and a CSV with all features ranked by F-score.
-    """
-    try:
-        from sklearn.feature_selection import SelectKBest, f_classif, VarianceThreshold
-        from sklearn.impute import SimpleImputer
-        from sklearn.preprocessing import LabelEncoder
-    except Exception:
-        print("[anova] scikit-learn not available — skipping.")
-        return
-
-    feature_df = _load_features_csv_or_inline()
-    if feature_df.empty or "label" not in feature_df.columns:
-        print("[anova] no features available — skipping.")
-        return
-
-    # numeric features only; handle inf/NaN
-    X_num = (
-        feature_df.drop(columns=["label"], errors="ignore")
-                  .select_dtypes(include=[np.number])
-                  .replace([np.inf, -np.inf], np.nan)
-                  .copy()
-    )
-    y_all = feature_df["label"].astype(str).copy()
-
-    # drop constant columns
-    try:
-        vt = VarianceThreshold(threshold=1e-12)
-        X_vt = vt.fit_transform(X_num)
-        cols_vt = X_num.columns[vt.get_support()]
-    except Exception:
-        print("[anova] no numeric features after preprocessing.")
-        return
-    if X_vt.shape[1] == 0:
-        print("[anova] all numeric features were constant or removed.")
-        return
-
-    # impute missing values
-    imp = SimpleImputer(strategy="median")
-    X_imp = imp.fit_transform(X_vt)
-
-    # encode labels
-    le = LabelEncoder()
-    y_enc = le.fit_transform(y_all.values)
-
-    # SelectKBest with ANOVA F
-    k = int(min( max(1, X_imp.shape[1]), 20 ))  # up to 20 for the bar chart
-    selector = SelectKBest(score_func=f_classif, k=k).fit(X_imp, y_enc)
-
-    # Full ranking (not just top-k)
-    # We need scores for all cols_vt; selector.scores_ is length == n_features after VT
-    scores_all = pd.Series(selector.scores_, index=cols_vt).sort_values(ascending=False)
-    scores_all = scores_all.replace({np.nan: 0.0})
-
-    # Save full CSV
-    scores_csv = RESULTS_DIR / "anova_fscores.csv"
-    scores_all.to_frame("F_score").to_csv(scores_csv)
-    print(f"[anova] wrote {scores_csv} (n={len(scores_all)})")
-
-    # Plot top-25
-    top = scores_all.head(25)
-    fig, ax = plt.subplots(figsize=(10.0, 5.5))
-    xs = np.arange(len(top))
-    ax.bar(xs, top.values)
-    ax.set_xticks(xs)
-    ax.set_xticklabels(top.index, rotation=65, ha="right")
-    ax.set_title("ANOVA F-scores (top 25)")
-    ax.set_ylabel("F-score")
-    ax.grid(axis="y", alpha=0.3)
-    plt.tight_layout()
-    outdir.mkdir(parents=True, exist_ok=True)
-    fig.savefig(outdir / "anova_selectkbest_top25.png", dpi=150)
-    plt.close(fig)
-    print(f"[anova] saved {outdir / 'anova_selectkbest_top25.png'}")
-
-# ---- Run it (will execute once when you call the viz script) ----
-try:
-    run_anova_selectkbest(OUT)
-except Exception as _e:
-    print(f"[anova] step skipped due to error: {_e}")
 
 # -------------------------------------------------------------------------
 # Plotting

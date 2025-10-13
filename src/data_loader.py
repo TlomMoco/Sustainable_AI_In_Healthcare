@@ -22,10 +22,9 @@ import numpy as np
 import pandas as pd
 import wfdb
 import ast
-
+from src.config import SAMPLE_RATE as _FS
 from src.config import (
-    PTBXL_CSV, SCP_CSV, DATA_ROOT, SAMPLE_RATE,
-    N_CLASSES, SUPERCLASSES
+    PTBXL_CSV, SCP_CSV, DATA_ROOT, SAMPLE_RATE,SUPERCLASSES
 )
 
 # -------------------------------------------------------------------------
@@ -39,6 +38,66 @@ class PTBXL:
 
 
 # -------------------------------------------------------------------------
+# Metadata cleaning
+# -------------------------------------------------------------------------
+def clean_metadata(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    PTB-XL hygiene:
+      - Parse dtypes
+      - Handle 'age == 300' (PTB-XL privacy code for 90+) → set NaN for analysis
+      - Clamp impossible ages (<0 or >120) to NaN
+      - Normalize 'sex' to {'Male','Female','Unknown'}
+      - Drop rows missing waveform paths
+      - Drop exact duplicate ecg_id rows if any
+    """
+    out = df.copy()
+
+    # Dtypes
+    for col in ["age", "patient_id", "ecg_id"]:
+        if col in out.columns:
+            out[col] = pd.to_numeric(out[col], errors="coerce")
+
+    # Age cleaning: 300 means 90+ in PTB-XL → use NaN for analysis/EDA
+    # (Your coworker already treated it this way in EDA; we make it systematic here.)
+    if "age" in out.columns:
+        out.loc[out["age"] == 300, "age"] = np.nan
+        out.loc[(out["age"] < 0) | (out["age"] > 120), "age"] = np.nan
+
+    # Sex normalization
+    if "sex" in out.columns:
+        s = out["sex"].astype("string")  # preserves <NA>
+        s = s.str.strip()
+
+        # numeric encodings first (common pitfalls)
+        # adjust the map if your CSV uses the opposite convention
+        s = s.replace({"0": "Female", "1": "Male", "2": "Unknown"})
+
+        # textual encodings (case-insensitive)
+        txt = s.str.lower()
+        txt_map = {
+            "female": "Female", "f": "Female", "woman": "Female",
+            "male": "Male", "m": "Male", "man": "Male",
+        }
+        s2 = txt.map(txt_map)
+
+        # prefer mapped textual label when available, else keep numeric-mapped value
+        out["sex"] = s2.fillna(s).fillna("Unknown")
+
+    # Ensure waveform paths exist
+    need_cols = ["filename_lr", "filename_hr"]
+    have = [c for c in need_cols if c in out.columns]
+    if have:
+        mask_paths = out[have].notna().any(axis=1)
+        out = out[mask_paths].copy()
+
+    # Drop exact duplicated ecg_id rows (rare, safety net)
+    if "ecg_id" in out.columns:
+        out = out.drop_duplicates(subset=["ecg_id"])
+
+    return out
+
+
+# -------------------------------------------------------------------------
 # Metadata loading
 # -------------------------------------------------------------------------
 def load_metadata() -> PTBXL:
@@ -48,11 +107,13 @@ def load_metadata() -> PTBXL:
     Returns:
         PTBXL: dataclass containing main dataframe and diagnostic mappings.
     """
-    # Load PTB-XL database
+    # Load main PTB-XL CSV
     df = pd.read_csv(PTBXL_CSV)
     df["scp_codes"] = df["scp_codes"].apply(ast.literal_eval)
 
-    # Load diagnostic class mapping
+    # Clean metadata before any label mapping/splitting
+    df = clean_metadata(df)
+
     agg = pd.read_csv(SCP_CSV, index_col=0)
     agg = agg[agg["diagnostic"] == 1][["diagnostic_class"]]
     return PTBXL(df=df, agg=agg)
@@ -202,23 +263,134 @@ def basic_features(signal: np.ndarray) -> np.ndarray:
     rms = np.sqrt((signal ** 2).mean(axis=1))
     return np.concatenate([means, stds, rms], axis=0)
 
+# --- Engineered features (extend this with your extra stats/HRV/bands) ----
+def engineered_features(signal: np.ndarray) -> np.ndarray:
+    """
+    Parameters
+    ----------
+    signal : np.ndarray of shape (12, T)
+        Lead-major ECG (12 leads by time).
 
-def make_feature_table(df: pd.DataFrame, limit: int | None = None) -> Tuple[np.ndarray, np.ndarray, List[str]]:
+    Returns
+    -------
+    np.ndarray, shape (87,)
+        [ per-lead stats (48) | per-lead bandpowers (36) | HRV (3) ]
+
+    Notes
+    -----
+    • Per-lead stats: mean, std, RMS, peak-to-peak
+    • Bandpowers per lead: 0–5 Hz, 5–15 Hz, 15–40 Hz (FFT PSD average in band)
+    • HR/HRV on the "most peaky" lead (chosen by highest std): HR_bpm, SDNN_ms, RMSSD_ms
+    """
+    X = np.asarray(signal, dtype=np.float32)
+    assert X.ndim == 2 and X.shape[0] == 12, "engineered_features expects (12, T)"
+
+    # ---------- per-lead stats ----------
+    means = X.mean(axis=1)  # 12
+    stds = X.std(axis=1)  # 12
+    rms = np.sqrt((X ** 2).mean(axis=1))  # 12
+    ptp = np.ptp(X, axis=1) # 12
+    stats_vec = np.concatenate([means, stds, rms, ptp], axis=0)  # (48,)
+
+    # ---------- per-lead bandpowers via FFT PSD ----------
+    def _bandpower(sig1d: np.ndarray, fs: float, f_lo: float, f_hi: float) -> float:
+        x = np.asarray(sig1d, dtype=np.float32)
+        n = int(x.size)
+        if n == 0:
+            return 0.0
+        freqs = np.fft.rfftfreq(n, d=1.0 / fs)
+        spec = np.abs(np.fft.rfft(x)) ** 2
+        m = (freqs >= f_lo) & (freqs < f_hi)
+        cnt = int(m.sum())
+        return float(spec[m].sum() / max(1, cnt))
+
+    bands = [(0.0, 5.0), (5.0, 15.0), (15.0, 40.0)]
+    bp_list = []
+    for lead in range(12):
+        s = X[lead]
+        for (a, b) in bands:
+            bp_list.append(_bandpower(s, float(_FS), a, b))
+    bp_vec = np.array(bp_list, dtype=np.float32)  # (36,)
+
+    # ---------- HR/HRV from R-peaks on the "best" lead ----------
+    # choose lead with highest std to increase chance of clear R-peaks
+    best_lead = int(np.argmax(stds))
+    s = X[best_lead].astype(np.float32, copy=False)
+
+    # Simple Pan–Tompkins-style energy envelope (NumPy only):
+    y = s - np.median(s)  # detrend a bit
+    y = y ** 2  # energy
+    win = max(1, int(0.150 * _FS))  # 150 ms moving-average
+    env = np.convolve(y, np.ones(win, dtype=np.float32) / win, mode="same")
+
+    # Adaptive threshold + refractory period (250 ms)
+    thr = float(env.mean() + 1.0 * env.std())
+    refractory = max(1, int(0.250 * _FS))
+
+    # Peak picking (local maxima over threshold with refractory)
+    cand = np.where((env[1:-1] > env[:-2]) & (env[1:-1] > env[2:]) & (env[1:-1] >= thr))[0] + 1
+    peaks = []
+    last = -10 ** 9
+    for p in cand:
+        if (p - last) >= refractory:
+            peaks.append(int(p))
+            last = p
+    peaks = np.array(peaks, dtype=int)
+
+    # RR intervals (s) and HRV metrics
+    if peaks.size >= 3:
+        rr = np.diff(peaks) / float(_FS)  # seconds
+        hr_bpm = 60.0 / rr.mean()
+        sdnn_ms = rr.std(ddof=1) * 1000.0
+        rmssd_ms = np.sqrt(np.mean(np.diff(rr) ** 2)) * 1000.0
+    else:
+        hr_bpm, sdnn_ms, rmssd_ms = np.nan, np.nan, np.nan
+
+    hrv_vec = np.array([hr_bpm, sdnn_ms, rmssd_ms], dtype=np.float32)  # (3,)
+
+    # ---------- merge ----------
+    out = np.concatenate([stats_vec, bp_vec, hrv_vec], axis=0)  # (87,)
+    return out
+
+
+# Feature names for inspection/ANOVA labeling:
+def engineered_feature_names() -> list[str]:
+    names = []
+    for j in range(12):
+        names += [f"L{j+1}_mean", f"L{j+1}_std", f"L{j+1}_rms", f"L{j+1}_ptp"]
+    for j in range(12):
+        names += [f"L{j+1}_bp_0_5Hz", f"L{j+1}_bp_5_15Hz", f"L{j+1}_bp_15_40Hz"]
+    names += ["HR_bpm", "SDNN_ms", "RMSSD_ms"]
+    return names
+
+
+def make_feature_table(
+    df: pd.DataFrame,
+    limit: int | None = None,
+    feature_set: str = "basic",   # "basic" (default) or "engineered"
+) -> Tuple[np.ndarray, np.ndarray, List[str]]:
     """
     Materialize ML features for a subset (or all) rows.
 
     Returns:
-        X: (n, 36) feature matrix
+        X: (n, d) feature matrix (d depends on feature_set)
         y: (n,) class indices
         CLASSES: list of class names
     """
     sel = df if limit is None else df.iloc[:limit]
+
+    # Choose feature function
+    feat_fn = engineered_features if feature_set == "engineered" else basic_features
+
     X, y = [], []
     for _, row in sel.iterrows():
-        sig = load_waveform(row)
-        X.append(basic_features(sig))
-        y.append(SUPERCLASSES.index(row["y"]))
-    return np.vstack(X), np.array(y), SUPERCLASSES
+        sig = load_waveform(row)                   # (12, T)
+        X.append(feat_fn(sig))                     # 1D vector
+        y.append(SUPERCLASSES.index(row["y"]))     # int label
+
+    X = np.vstack(X)
+    y = np.array(y, dtype=int)
+    return X, y, SUPERCLASSES
 
 
 # -------------------------------------------------------------------------
