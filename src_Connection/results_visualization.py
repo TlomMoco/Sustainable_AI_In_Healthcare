@@ -1,1028 +1,848 @@
-# results_visualization.py
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
 """
-Visualization utilities for FL runs and centralized evaluation.
+results_visualization.py — unified plotting script
 
-What this module does
----------------------
-• Loads CSV logs produced by federated and centralized runs.
-• Produces publication-ready plots (matplotlib/Agg headless backend).
-• Runs optional ANOVAs to compare:
-  - Global accuracy between runs
-  - Per-class accuracy between runs
-  - Client accuracy by phase (within run)
+Goal
+----
+Bring (most of) the plots you produce in the PTB-XL notebook (EDA sections 6/6b/6c/6d,
+plus confusion matrices & learning curves when available) into a single Python module.
 
-Where this plugs into the project
----------------------------------
-• src_Connection.Centralized:
-    - Uses TorchAdapter, evaluate_models, plot_confusion, plot_learning_curves.
-• src_Connection.Experiments:
-    - Uses centralized pipeline → the CSVs loaded here.
-• src_Connection.Client / Server:
-    - Their CSV logging is consumed here for time/accuracy/phase plots.
+This script is resilient: it will generate everything it can from the inputs it can find,
+while printing friendly "Missing:" notes for anything that isn't available.
 
-Outputs
--------
-• Figures saved to RESULTS_DIR / "viz"
-• ANOVA tables (CSV) saved to the same viz directory
+Inputs (auto-discovered, but can be overridden via CLI flags):
+- PTB-XL database CSVs:
+    dataset/ptb-xl-a-large-publicly-available-electrocardiography-dataset-1.0.3/ptbxl_database.csv
+    dataset/ptb-xl-a-large-publicly-available-electrocardiography-dataset-1.0.3/scp_statements.csv
+- Engineered features table (from the notebook §5c):
+    test/artifacts/basic_signal_features.csv  (or artifacts/basic_signal_features.csv)
+- Federated results (optional — will plot if present):
+    results/non_frozen_run.csv
+    results/non_frozen_run_perclass.csv
+    results/non_frozen_run_cm.csv
+    (and the "frozen_*.csv" counterparts if available)
+
+Outputs:
+- Figures saved to: results/viz (default)
+
+Usage
+-----
+python -m src_Connection.results_visualization \
+  --dataset-root dataset/ptb-xl-a-large-publicly-available-electrocardiography-dataset-1.0.3 \
+  --features-csv test/artifacts/basic_signal_features.csv \
+  --outdir results/viz
 
 Notes
 -----
-• All plotting uses the "Agg" backend for headless environments.
-• The optional stats dependencies (scipy, statsmodels) are guarded at call sites.
+- If features CSV is missing, EDA that needs HRV/engineered features will be skipped.
+- If PTB-XL CSVs are missing, EDA that relies on demographics/strat folds will be skipped.
+- If FL CSVs are missing, FL-comparison figures/ANOVAs will be skipped; EDA still runs.
 """
-
 from __future__ import annotations
-
-import matplotlib
-matplotlib.use("Agg")  # headless-safe backend
-
-import pandas as pd
-import numpy as np
-import matplotlib.pyplot as plt
+import os
+import re
+import ast
+import json
+import math
+import argparse
 from pathlib import Path
+from typing import Dict, Any, Iterable, Tuple, Optional
 
-from src_Connection.config import RESULTS_DIR, SUPERCLASSES
-from src_Connection.utils import ensure_dir
+import numpy as np
+import pandas as pd
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from matplotlib.ticker import FuncFormatter
+from matplotlib import patheffects as pe
 
-# Optional stats deps (guarded below)
-try:
-    import scipy.stats as ss
-except Exception:  # pragma: no cover
-    ss = None  # we'll guard at call sites
+# --------------------------------------------------------------------------------------
+# Basic setup & helpers
+# --------------------------------------------------------------------------------------
 
-try:
-    import statsmodels.api as sm                     # type: ignore
-    from statsmodels.formula.api import ols         # type: ignore
-    _HAS_SM = True
-except Exception:  # pragma: no cover
-    _HAS_SM = False
+def ts():
+    import time
+    return time.strftime("%Y-%m-%d %H:%M:%S")
 
-# -------------------------------------------------------------------------
-# I/O - loading results
-# -------------------------------------------------------------------------
-FILES = {
-    "non_frozen": RESULTS_DIR / "non_frozen_run.csv",
-    "frozen":     RESULTS_DIR / "frozen_run.csv",
-}
-PERCLASS = {
-    "non_frozen": RESULTS_DIR / "non_frozen_run_perclass.csv",
-    "frozen":     RESULTS_DIR / "frozen_run_perclass.csv",
-}
-CONFUSION = {
-    "non_frozen": RESULTS_DIR / "non_frozen_run_cm.csv",
-    "frozen":     RESULTS_DIR / "frozen_run_cm.csv",
-}
-OUT = RESULTS_DIR / "viz"
-ensure_dir(OUT)
-
-PHASE_ENABLED  = "post_cv"
-PHASE_DISABLED = "no_cv"
-
-# --- small helper: moving average (rounds) -----------------------------------
-MA_WINDOW = 3  # change if you want a smoother/rougher overlay
-
-def _ma_xy(x, y, k: int = MA_WINDOW):
-    """Return (x_ma, y_ma) for a simple moving average over rounds.
-
-    Parameters
-    ----------
-    x, y : array-like
-        Original x/y arrays (e.g., rounds, accuracies).
-    k : int
-        Window length for the moving average.
-
-    Returns
-    -------
-    (x_ma, y_ma) : np.ndarray, np.ndarray
-        x truncated to match the valid convolution window, y averaged.
-    """
-    try:
-        x = np.asarray(list(x), dtype=float)
-        y = np.asarray(list(y), dtype=float)
-    except Exception:
-        return x, y
-    if k is None or k <= 1 or y.size < k:
-        return x, y
-    y_ma = np.convolve(y, np.ones(k, dtype=float) / k, mode="valid")
-    x_ma = x[k - 1 :]
-    return x_ma, y_ma
+def log(msg: str):
+    print(f"[{ts()}] {msg}")
 
 
-def _print_missing(path: Path):
-    """Tiny helper to consistently report missing CSVs."""
-    print(f"Missing: {path}")
+def ensure_outdir(p: Path) -> Path:
+    p.mkdir(parents=True, exist_ok=True)
+    return p
 
 
-# --- Load CSVs with numeric columns coerced to numbers (NaN if invalid) ---
-def load_numeric_csv(path: Path):
-    """Load a CSV, coerce common numeric columns, and normalize client_id type.
+def savefig(fig: plt.Figure, outdir: Path, name: str):
+    ensure_outdir(outdir)
+    fp = outdir / name
+    fig.savefig(fp, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Saved: {fp}")
 
-    Used by:
-        • This module's top-level loaders for run/per-class/confusion CSVs.
 
-    Returns
-    -------
-    pd.DataFrame | None
-        A DataFrame with numeric columns parsed, or None on failure/missing.
-    """
-    if not path.exists():
-        _print_missing(path)
-        return None
-    try:
-        df = pd.read_csv(path, low_memory=False)
-    except Exception as e:
-        print(f"Failed to read {path}: {e}")
-        return None
-    if df is None or df.empty:
-        return df
+# --------------------------------------------------------------------------------------
+# Paths & defaults
+# --------------------------------------------------------------------------------------
 
-    # Normalize common columns if present
-    for col in ["round", "accuracy", "loss", "wall_time_sec", "trainable_params", "true", "pred", "count"]:
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
+DEFAULT_DATASET_ROOT = Path("dataset/ptb-xl-a-large-publicly-available-electrocardiography-dataset-1.0.3")
+DEFAULT_DB_CSV = DEFAULT_DATASET_ROOT / "ptbxl_database.csv"
+DEFAULT_SCP_CSV = DEFAULT_DATASET_ROOT / "scp_statements.csv"
+DEFAULT_FEATURES_CSV_CANDIDATES = [
+    Path("test/artifacts/basic_signal_features.csv"),
+    Path("artifacts/basic_signal_features.csv"),
+    Path("results/basic_signal_features.csv"),
+]
+DEFAULT_OUTDIR = Path("results/viz")
 
-    # Normalize client_id to string (GLOBAL vs numeric client ids)
-    if "client_id" in df.columns:
-        df["client_id"] = df["client_id"].astype(str)
+# Ordered class palette (5-class)
+ORDER_5 = ["NORM","MI","CD","STTC","HYP"]
+SEX_COLORS = {"female": "#E66BB5", "male": "#4A90E2", "unknown": "#9B9B9B"}
+CLASS_COLORS = {"NORM": "#4C78A8", "MI": "#F58518", "CD": "#54A24B", "STTC": "#E45756", "HYP": "#B279A2"}
 
+# --------------------------------------------------------------------------------------
+# PTB-XL label mapping (SCP → diagnostic_class/subclass) as in the notebook
+# --------------------------------------------------------------------------------------
+
+def load_db_and_scp(db_csv: Path, scp_csv: Path) -> Tuple[pd.DataFrame, pd.DataFrame, str]:
+    if not db_csv.exists():
+        print(f"Missing: {db_csv}")
+        return pd.DataFrame(), pd.DataFrame(), "code"
+    if not scp_csv.exists():
+        print(f"Missing: {scp_csv}")
+        return pd.DataFrame(), pd.DataFrame(), "code"
+    db = pd.read_csv(db_csv)
+    scp_raw = pd.read_csv(scp_csv, encoding="utf-8-sig")
+    scp_raw.columns = [str(c).strip() for c in scp_raw.columns]
+
+    # Pick the column that best intersects with db[scp_codes]
+    def _extract_scp_keys(db_series, n=2000):
+        keys = set()
+        for s in db_series.head(min(n, len(db_series))):
+            try: keys.update(map(str, ast.literal_eval(s).keys()))
+            except Exception: pass
+        return keys
+
+    known_keys = _extract_scp_keys(db.get("scp_codes", pd.Series([], dtype=object)))
+    obj_cols = [c for c in scp_raw.columns if scp_raw[c].dtype == "object"]
+    scores = {c: len(set(scp_raw[c].astype(str)).intersection(known_keys)) for c in obj_cols} or {obj_cols[0]:1}
+    code_col = max(scores, key=scores.get)
+
+    scp_raw["code"] = scp_raw[code_col].astype(str)
+    scp = scp_raw.set_index("code", drop=False)
+    return db, scp, code_col
+
+
+def make_label_mapper(scp: pd.DataFrame, label_mode: str = "5class"):
+    for req in ["diagnostic", "diagnostic_class", "diagnostic_subclass"]:
+        if req not in scp.columns:
+            raise ValueError(f"scp_statements.csv missing column: {req}")
+
+    diag_col = scp["diagnostic"].astype(str).str.strip().str.lower()
+    diag_mask = pd.to_numeric(diag_col, errors="coerce").fillna(0).gt(0) | diag_col.isin({"1","1.0","true","t","yes","y","on"})
+    diag_only = scp.loc[diag_mask, ["diagnostic_class","diagnostic_subclass"]].copy()
+    valid_codes = set(diag_only.index)
+
+    label_field = "diagnostic_class" if label_mode == "5class" else "diagnostic_subclass"
+
+    def to_diag_label(scp_codes_dict, min_conf=0.0):
+        try:
+            items = [(str(k), float(v)) for k, v in scp_codes_dict.items()]
+        except Exception:
+            return None
+        items = [(k, v) for k, v in items if k in valid_codes and v >= min_conf]
+        if not items: return None
+        agg: Dict[str, float] = {}
+        for k, w in items:
+            lab = diag_only.loc[k, label_field]
+            agg[lab] = agg.get(lab, 0.0) + w
+        return max(agg.items(), key=lambda kv: kv[1])[0]
+
+    return to_diag_label, valid_codes, diag_only, label_field
+
+
+def build_minimal_table(db: pd.DataFrame, to_diag_label, record_file_col: str = "filename_lr", min_conf: float = 0.0) -> pd.DataFrame:
+    META_FIELDS = ["ecg_id","patient_id","age","sex","device","recording_date","scp_codes","strat_fold"]
+    rows = []
+    for _, r in db.iterrows():
+        row: Dict[str, Any] = {}
+        for k in META_FIELDS:
+            v = r.get(k, np.nan)
+            if k == "recording_date":
+                try:
+                    row[k] = pd.to_datetime(v).date().isoformat()
+                except Exception:
+                    row[k] = np.nan
+            else:
+                row[k] = v
+        try:
+            scp_codes = ast.literal_eval(r.get("scp_codes", "{}"))
+        except Exception:
+            continue
+        y = to_diag_label(scp_codes, min_conf)
+        if y is None:
+            continue
+        rec_dat = (DEFAULT_DATASET_ROOT / r[record_file_col]) if not os.path.isabs(str(r[record_file_col])) else Path(r[record_file_col])
+        rec_noext = str(rec_dat)[:-4] if str(rec_dat).endswith(".dat") else str(rec_dat)
+        row["record_path"] = rec_noext
+        row["label"] = y
+        rows.append(row)
+    if not rows:
+        raise RuntimeError("No rows produced — check PTB-XL paths/mappings.")
+    df = pd.DataFrame(rows)
     return df
 
 
-# --- Load all dataframes (calling load_numeric_csv) ---------------------
-dfs       = {name: load_numeric_csv(p) for name, p in FILES.items()}
-percls    = {name: load_numeric_csv(p) for name, p in PERCLASS.items()}
-conf_long = {name: load_numeric_csv(p) for name, p in CONFUSION.items()}
+# --------------------------------------------------------------------------------------
+# EDA helpers (styling etc.) — parity with notebook visuals
+# --------------------------------------------------------------------------------------
 
-# Keep only non-empty frames
-dfs       = {k: v for k, v in dfs.items() if v is not None and not v.empty}
-percls    = {k: v for k, v in percls.items() if v is not None and not v.empty}
-conf_long = {k: v for k, v in conf_long.items() if v is not None and not v.empty}
+BAR_BASE = 0.32
+SPREAD_BASE = 1.00
+GAP_FRAC_GROUPED = 0.08
 
 
-# -------------------------------------------------------------------------
-# Helper functions
-# -------------------------------------------------------------------------
-def perclass_columns(df: pd.DataFrame):
-    """Extract mapping of label → per-class accuracy Series from a long CSV.
-
-    Accepts both:
-        • acc_<label>  (named by SUPERCLASSES)
-        • acc_<index>  (integer index mapping to SUPERCLASSES)
-
-    Returns
-    -------
-    dict[str, pd.Series]
-        Keys are class labels compatible with SUPERCLASSES.
-    """
-    cols = [c for c in df.columns if str(c).startswith("acc_")]
-    mapping = {}
-    for c in cols:
-        key = str(c)[4:]
-        if key.isdigit():
-            idx = int(key)
-            if 0 <= idx < len(SUPERCLASSES):
-                mapping[SUPERCLASSES[idx]] = df[c]
-        else:
-            mapping[key] = df[c]
-    return mapping
+def _wrap(names: Iterable[str], width: int = 12) -> list[str]:
+    import textwrap
+    return ["\n".join(textwrap.wrap(str(n), width=width)) for n in names]
 
 
-def _safe_save(fig, name: str):
-    """Save a figure into OUT/name with tight layout; always close."""
-    out = OUT / name
-    try:
-        fig.savefig(out, dpi=150, bbox_inches="tight")
-        print("Saved:", out)
-    finally:
-        plt.close(fig)
-
-def _safe_save_table(df: pd.DataFrame, name: str):
-    """Save a DataFrame as CSV into OUT/name."""
-    out = OUT / name
-    out.parent.mkdir(parents=True, exist_ok=True)
-    df.to_csv(out, index=False)
-    print("Saved:", out)
+def _x_positions(n: int, spread: float = SPREAD_BASE):
+    return np.arange(n) * spread
 
 
-# --------------------------- ANOVA SECTION -----------------------------------
-def _effect_sizes_from_groups(groups: list[np.ndarray]) -> tuple[float, float]:
-    """Compute eta-squared and omega-squared effect sizes for one-way ANOVA.
+def _bar_width(n: int, base: float = BAR_BASE):
+    return float(np.clip(base, 0.18, 0.45))
 
-    Parameters
-    ----------
-    groups : list[np.ndarray]
-        Each array contains the values for one group.
 
-    Returns
-    -------
-    (eta^2, omega^2) : tuple[float, float]
-        Standard effect size estimates for ANOVA.
-    """
-    ns   = [len(g) for g in groups if len(g)]
-    means= [np.mean(g) for g in groups if len(g)]
-    if not ns:
-        return (np.nan, np.nan)
-    N    = sum(ns); k = len(ns)
-    grand= np.average(means, weights=ns)
-    ss_between = float(sum(n * (m - grand)**2 for n, m in zip(ns, means)))
-    ss_within  = float(sum(((g - np.mean(g))**2).sum() for g in groups if len(g)))
-    ss_total   = ss_between + ss_within
-    eta2   = (ss_between / ss_total) if ss_total > 0 else np.nan
-    dfb = k - 1
-    dfw = N - k
-    msw = (ss_within / dfw) if dfw > 0 else np.nan
-    omega2 = ((ss_between - dfb * msw) / (ss_total + msw)) if (ss_total + msw) > 0 else np.nan
-    return float(eta2), float(omega2)
+def _sex_norm(series: pd.Series) -> pd.Series:
+    out = pd.Series("unknown", index=series.index, dtype="string")
+    s_num = pd.to_numeric(series, errors="coerce")
+    out.loc[s_num == 1] = "male"
+    out.loc[s_num == 0] = "female"
+    s = series.astype("string").str.strip().str.lower()
+    out.loc[s.str.startswith("m", na=False)] = "male"
+    out.loc[s.str.startswith("f", na=False)] = "female"
+    out.loc[s.isin({"male","man"})] = "male"
+    out.loc[s.isin({"female","woman"})] = "female"
+    return out
 
-def anova_global_between_runs(dfs_dict: dict[str, pd.DataFrame]) -> pd.DataFrame | None:
-    """One-way ANOVA comparing GLOBAL accuracy distributions across runs.
 
-    Inputs
-    ------
-    dfs_dict : dict[str, DataFrame]
-        Mapping of run name → run CSV DataFrame.
+def _prettify_axes(ax: plt.Axes):
+    ax.grid(axis="y", alpha=0.25, linestyle="--", linewidth=0.6)
+    for s in ("top", "right"):
+        ax.spines[s].set_visible(False)
+    ax.tick_params(axis="both", labelsize=10)
+    ax.yaxis.set_major_formatter(FuncFormatter(lambda v, p: f"{int(v):,}"))
 
-    Output
-    ------
-    • Saves group stats and ANOVA summary CSVs.
-    • Returns the ANOVA summary DataFrame (or None if not enough data).
 
-    Connected to
-    ------------
-    • Non-frozen vs Frozen FL runs (see config.EXPERIMENT 'run_name').
-    """
-    if not ss or not dfs_dict:
-        print("ANOVA skipped: SciPy not available or no data.")
-        return None
-    groups = []
-    labels = []
-    desc = []
-    for name, df in dfs_dict.items():
-        if df is None or df.empty or "client_id" not in df.columns:
-            continue
-        g = df[df["client_id"].astype(str) == "GLOBAL"]
-        if g.empty or "accuracy" not in g.columns:
-            continue
-        vals = g["accuracy"].dropna().values.astype(float)
-        if vals.size < 2:
-            continue
-        groups.append(vals); labels.append(name)
-        desc.append({"run": name, "n": int(vals.size), "mean": float(np.mean(vals)), "std": float(np.std(vals, ddof=1))})
-    if len(groups) < 2:
-        print("ANOVA (global between runs): need ≥2 runs with data.")
-        return None
-    F, p = ss.f_oneway(*groups)
-    eta2, omega2 = _effect_sizes_from_groups(groups)
-    summary = pd.DataFrame([{"test": "oneway_ANOVA", "F": float(F), "p": float(p),
-                             "eta_sq": eta2, "omega_sq": omega2, "k_groups": len(groups),
-                             "labels": ",".join(labels)}])
-    _safe_save_table(pd.DataFrame(desc), "anova_global_between_runs_groups.csv")
-    _safe_save_table(summary, "anova_global_between_runs_summary.csv")
+def _text_with_outline(ax, x, y, s, fontsize=10, color="#111", outline_width=2.0, outline_color="white", **kwargs):
+    t = ax.text(x, y, s, ha="center", va="bottom", fontsize=fontsize, color=color, **kwargs)
+    t.set_path_effects([pe.Stroke(linewidth=outline_width, foreground=outline_color), pe.Normal()])
+    return t
 
-    # If just 2 groups, also report Welch t-test
-    if len(groups) == 2:
-        t, pw = ss.ttest_ind(groups[0], groups[1], equal_var=False)
-        pair = pd.DataFrame([{"comparison": f"{labels[0]} vs {labels[1]}", "t_welch": float(t), "p": float(pw)}])
-        _safe_save_table(pair, "anova_global_between_runs_pairwise_welch.csv")
-    print("ANOVA (global between runs):", summary.to_dict("records")[0])
-    return summary
 
-def anova_perclass_between_runs(perclass_dict: dict[str, pd.DataFrame]) -> pd.DataFrame | None:
-    """One-way ANOVA for each superclass comparing per-class accuracy across runs.
+def _fd_bins(x: np.ndarray, min_bins=20, max_bins=60):
+    x = np.asarray(x, dtype=float)
+    x = x[np.isfinite(x)]
+    if x.size == 0:
+        return min_bins
+    iqr = np.subtract(*np.percentile(x, [75, 25]))
+    if iqr <= 0:
+        return min(max_bins, max(min_bins, int(np.sqrt(x.size))))
+    bw = 2 * iqr * (x.size ** (-1/3))
+    if bw <= 0:
+        return min(max_bins, max(min_bins, int(np.sqrt(x.size))))
+    bins = int(np.ceil((x.max() - x.min()) / bw))
+    return int(np.clip(bins, min_bins, max_bins))
 
-    Inputs
-    ------
-    perclass_dict : dict[str, DataFrame]
-        Mapping run → per-class CSV (with columns acc_<label> or acc_<index>).
 
-    Output
-    ------
-    • CSV saved to viz/ 'anova_perclass_between_runs.csv' with F, p, effect sizes.
-    • Returns the DataFrame or None if insufficient data.
-    """
-    if not ss or not perclass_dict:
-        print("Per-class ANOVA skipped: SciPy not available or no data.")
-        return None
-    rows = []
-    for cls in SUPERCLASSES:
-        groups = []
-        labs   = []
-        for name, df in perclass_dict.items():
-            if df is None or df.empty:
-                continue
-            df = df.sort_values("round")
-            mapping = perclass_columns(df)
-            if cls not in mapping:
-                continue
-            vals = pd.to_numeric(mapping[cls], errors="coerce").dropna().values.astype(float)
-            if vals.size >= 2:
-                groups.append(vals); labs.append(name)
-        if len(groups) >= 2:
-            F, p = ss.f_oneway(*groups)
-            eta2, omega2 = _effect_sizes_from_groups(groups)
-            rows.append({"class": cls, "k_runs": len(groups), "F": float(F), "p": float(p),
-                         "eta_sq": eta2, "omega_sq": omega2, "labels": ",".join(labs)})
-    if not rows:
-        print("Per-class ANOVA: insufficient data.")
-        return None
-    df_out = pd.DataFrame(rows).sort_values("p")
-    _safe_save_table(df_out, "anova_perclass_between_runs.csv")
-    print("Per-class ANOVA — saved CSV.")
-    return df_out
+# --------------------------------------------------------------------------------------
+# EDA plotters (mostly 1:1 with notebook)
+# --------------------------------------------------------------------------------------
 
-def anova_client_accuracy_by_phase(dfs_dict: dict[str, pd.DataFrame]) -> None:
-    """Within each run: compare client accuracy between phases (no_cv vs post_cv).
-
-    Behavior
-    --------
-    • Computes pooled one-way ANOVA across clients.
-    • Computes per-client one-way ANOVAs.
-    • Optionally runs a two-way ANOVA (Client × Phase) when statsmodels is present.
-
-    Outputs
-    -------
-    • Saves multiple CSVs under viz/ with per-run results.
-    """
-    if not ss:
-        print("Client-by-phase ANOVA skipped: SciPy not available.")
+def plot_missingness_top(features_df: pd.DataFrame, outdir: Path):
+    if features_df.empty:
         return
-    for run, df in dfs_dict.items():
-        if df is None or df.empty or "phase" not in df.columns or "client_id" not in df.columns:
+    NA_TOKENS = {"", " ", "nan", "none", "null", "NaN", "None", "NULL"}
+    edf2 = features_df.copy()
+    for col in edf2.columns:
+        if edf2[col].dtype == "object":
+            edf2[col] = edf2[col].replace(list(NA_TOKENS), np.nan)
+    na_rate = edf2.isna().mean().sort_values(ascending=False)
+    nz = (100 * na_rate[na_rate > 0]).sort_values(ascending=False)
+    if nz.empty:
+        print("No missing values detected — skipping missingness plot.")
+        return
+    top = nz.iloc[:15].iloc[::-1]
+    fig, ax = plt.subplots(figsize=(9.0, 4.2))
+    ys = _x_positions(len(top), 1.00)
+    ax.barh(ys, top.values, height=_bar_width(len(top)))
+    ax.set_yticks(ys)
+    ax.set_yticklabels(top.index)
+    ymax = float(top.max())
+    ax.set_xlim(0, ymax * 1.08)
+    ax.set_xlabel("NA rate (%)")
+    ax.set_title("Missingness (top columns)")
+    ax.grid(axis="x", alpha=0.3)
+    for y, v in zip(ys, top.values):
+        ax.text(v + ymax * 0.01, y, f"{v:.2f}%", va="center", fontsize=9)
+    plt.tight_layout()
+    savefig(fig, outdir, "eda_missingness_top.png")
+
+
+def plot_class_counts(meta_df: pd.DataFrame, outdir: Path):
+    if meta_df.empty or "label" not in meta_df.columns:
+        return
+    labs = meta_df["label"].astype(str)
+    order = [c for c in ORDER_5 if c in set(labs)] or sorted(labs.unique())
+    cls_counts = labs.value_counts().reindex(order).fillna(0).astype(int)
+
+    n = len(order)
+    xs = _x_positions(n, 1.00)
+    w = _bar_width(n)
+    fig, ax = plt.subplots(figsize=(10.2, 5.6))
+    colors = [CLASS_COLORS.get(c, None) for c in order]
+    ax.bar(xs, cls_counts.values, width=w, color=colors)
+    ymax = float(np.nanmax(cls_counts.values)) if len(cls_counts) else 1.0
+    ax.set_ylim(0, ymax * 1.08)
+    ax.set_xticks(xs)
+    ax.set_xticklabels(_wrap(order, 10))
+    ax.set_title("Class counts")
+    ax.set_ylabel("Count")
+    ax.grid(axis="y", alpha=0.3)
+    for x, y in zip(xs, cls_counts.values):
+        ax.text(x, y + max(1, 0.015 * ymax), f"{int(y):,}", ha="center", va="bottom", fontsize=9)
+    plt.tight_layout()
+    savefig(fig, outdir, "eda_class_counts.png")
+
+
+def plot_sex_overall_and_by_class(meta_df: pd.DataFrame, outdir: Path):
+    if meta_df.empty or "sex" not in meta_df.columns:
+        return
+    df = meta_df.copy()
+    df["sex_norm"] = _sex_norm(df["sex"])
+
+    # overall
+    vc = df["sex_norm"].value_counts().reindex(["female","male","unknown"]).dropna().astype(int)
+    k = len(vc)
+    group_width = 0.80
+    bar_gap_frac = 0.10
+    bar_w = group_width / max(k, 1)
+    eff_w = bar_w * (1 - bar_gap_frac)
+    xs = [(-group_width/2 + j*bar_w + bar_w/2) for j in range(k)]
+
+    fig, ax = plt.subplots(figsize=(10.0, 5.0))
+    ymax = float(max(vc.values)) if k else 1.0
+    for xi, (lab, v) in zip(xs, vc.items()):
+        ax.bar(xi, v, width=eff_w, color=SEX_COLORS.get(lab), edgecolor="white", linewidth=0.6, alpha=0.95)
+        _text_with_outline(ax, xi, v + max(1, 0.02*ymax), f"{int(v):,}", fontsize=10)
+    ax.set_ylim(0, ymax*1.10)
+    ax.set_xticks(xs)
+    ax.set_xticklabels(list(vc.index))
+    ax.set_title("Sex distribution (overall)")
+    ax.set_ylabel("Count")
+    ax.grid(axis="y", alpha=0.25, linestyle="--", linewidth=0.6)
+    plt.tight_layout()
+    savefig(fig, outdir, "eda_sex_overall.png")
+
+    # class x sex
+    if "label" in df.columns:
+        ct = pd.crosstab(df["label"].astype(str), df["sex_norm"]).reindex(ORDER_5, fill_value=0).fillna(0).astype(int)
+        sex_order = [s for s in ["female","male","unknown"] if s in ct.columns] or list(ct.columns)
+        x = _x_positions(len(ct.index), 1.00)
+        k = len(sex_order)
+        group_width = 0.80
+        bar_w = group_width / max(k, 1)
+        eff_w = bar_w * (1 - GAP_FRAC_GROUPED)
+
+        fig, ax = plt.subplots(figsize=(10.6, 5.6))
+        ymax = 0.0
+        for j, col in enumerate(sex_order):
+            offs = -group_width/2 + j*bar_w + bar_w/2
+            vals = ct[col].values
+            ymax = max(ymax, float(np.nanmax(vals)) if len(vals) else 0.0)
+            ax.bar(x + offs, vals, width=eff_w, label=col, color=SEX_COLORS.get(col), edgecolor="white", linewidth=0.6)
+        ax.set_ylim(0, ymax * 1.18)
+        ax.set_xticks(x)
+        ax.set_xticklabels(_wrap(ct.index, 10))
+        ax.set_ylabel("Count")
+        ax.set_title("Class × Sex (counts)")
+        ax.legend()
+        _prettify_axes(ax)
+        plt.tight_layout()
+        savefig(fig, outdir, "eda_class_by_sex_counts.png")
+
+        pct = (ct.div(ct.sum(axis=1).replace(0, np.nan), axis=0) * 100).fillna(0)
+        fig, ax = plt.subplots(figsize=(10.6, 5.6))
+        for j, col in enumerate(sex_order):
+            offs = -group_width/2 + j*bar_w + bar_w/2
+            ax.bar(x + offs, pct[col].values, width=eff_w, label=col, color=SEX_COLORS.get(col), edgecolor="white", linewidth=0.6)
+        ax.set_xticks(x)
+        ax.set_xticklabels(_wrap(pct.index, 10))
+        ax.set_ylabel("Percentage (%)")
+        ax.set_ylim(0, 100)
+        ax.set_title("Class × Sex (normalized)")
+        ax.legend()
+        _prettify_axes(ax)
+        plt.tight_layout()
+        savefig(fig, outdir, "eda_class_by_sex_percent.png")
+
+
+def plot_age_distributions(meta_df: pd.DataFrame, outdir: Path):
+    if meta_df.empty or "age" not in meta_df.columns:
+        return
+    df = meta_df.copy()
+    a = pd.to_numeric(df["age"], errors="coerce").dropna().values
+    if a.size:
+        bins = _fd_bins(a, min_bins=24, max_bins=64)
+        fig, ax = plt.subplots(figsize=(11.5, 5.6))
+        ax.hist(a, bins=bins, rwidth=0.94, edgecolor="white", linewidth=0.6, alpha=0.9)
+        mu, med = float(np.mean(a)), float(np.median(a))
+        ax.axvline(mu, linestyle="--", linewidth=1.4, color="k", label=f"Mean {mu:.1f}")
+        ax.axvline(med, linestyle=":", linewidth=1.6, color="k", label=f"Median {med:.1f}")
+        ax.set_title("Age distribution", fontsize=14)
+        ax.set_xlabel("Age")
+        ax.set_ylabel("Count")
+        _prettify_axes(ax)
+        ax.legend(frameon=False, loc="upper center", ncol=2)
+        plt.tight_layout()
+        savefig(fig, outdir, "eda_age_hist_overall_pretty.png")
+
+    # Age by class
+    if "label" in df.columns:
+        data_c, labs_c = [], []
+        for c in [c for c in ORDER_5 if c in set(df["label"])]:
+            v = pd.to_numeric(df.loc[df["label"].astype(str) == c, "age"], errors="coerce").dropna().values
+            if v.size >= 5:
+                data_c.append(v)
+                labs_c.append(c)
+        if data_c:
+            fig, ax = plt.subplots(figsize=(10.8, 5.2))
+            ax.boxplot(data_c, labels=_wrap(labs_c, 10), showfliers=False)
+            ax.set_title("Age by diagnostic class", fontsize=14)
+            ax.set_ylabel("Age")
+            _prettify_axes(ax)
+            plt.tight_layout()
+            savefig(fig, outdir, "eda_age_by_class_box_pretty.png")
+
+    # Age by sex (overlay + box)
+    if "sex" in df.columns:
+        df["sex_norm"] = _sex_norm(df["sex"]) if "sex_norm" not in df.columns else df["sex_norm"]
+        af = pd.to_numeric(df.loc[df["sex_norm"] == "female", "age"], errors="coerce").dropna().values
+        am = pd.to_numeric(df.loc[df["sex_norm"] == "male", "age"], errors="coerce").dropna().values
+        base = a if a.size else (np.concatenate([af, am]) if (af.size and am.size) else (af if af.size else am))
+        if af.size or am.size:
+            bins = _fd_bins(base, min_bins=24, max_bins=64)
+            fig, ax = plt.subplots(figsize=(11.5, 5.6))
+            if af.size:
+                ax.hist(af, bins=bins, rwidth=0.90, alpha=0.55, label="female", color=SEX_COLORS.get("female"), edgecolor="white", linewidth=0.6)
+            if am.size:
+                ax.hist(am, bins=bins, rwidth=0.90, alpha=0.55, label="male", color=SEX_COLORS.get("male"), edgecolor="white", linewidth=0.6)
+            ax.set_title("Age distribution by sex (overlay)", fontsize=14)
+            ax.set_xlabel("Age")
+            ax.set_ylabel("Count")
+            _prettify_axes(ax)
+            ax.legend(frameon=False, ncol=2, loc="upper center")
+            plt.tight_layout()
+            savefig(fig, outdir, "eda_age_hist_by_sex_overlay_pretty.png")
+
+            if af.size and am.size:
+                fig, ax = plt.subplots(figsize=(8.2, 5.0))
+                sexes = ["female", "male"]
+                data = [af, am]
+                bp = ax.boxplot(data, labels=sexes, showfliers=False, patch_artist=True,
+                                boxprops=dict(linewidth=1.2), medianprops=dict(linewidth=1.6),
+                                whiskerprops=dict(linewidth=1.0), capprops=dict(linewidth=1.0))
+                for i, lab in enumerate(sexes):
+                    c = SEX_COLORS.get(lab)
+                    bp["boxes"][i].set_facecolor(c)
+                    bp["boxes"][i].set_alpha(0.25)
+                    bp["boxes"][i].set_edgecolor(c)
+                    bp["medians"][i].set_color(c)
+                ax.set_title("Age by sex", fontsize=14)
+                ax.set_ylabel("Age")
+                _prettify_axes(ax)
+                plt.tight_layout()
+                savefig(fig, outdir, "eda_age_by_sex_box_pretty.png")
+
+
+def plot_records_per_year(meta_df: pd.DataFrame, outdir: Path):
+    if meta_df.empty or "recording_date" not in meta_df.columns:
+        return
+    dt = pd.to_datetime(meta_df["recording_date"], errors="coerce")
+    yrs = dt.dt.year.value_counts().sort_index()
+    if yrs.size == 0:
+        return
+    fig, ax = plt.subplots(figsize=(11.8, 5.6))
+    xs = _x_positions(len(yrs), spread=1.00)
+    bar_width = 0.72
+    ax.bar(xs, yrs.values, width=bar_width, edgecolor="white", linewidth=0.6)
+    ax.set_xticks(xs)
+    ax.set_xticklabels(yrs.index.astype(str), rotation=50, ha="right")
+    ax.set_title("Records per year", fontsize=14)
+    ax.set_ylabel("Count")
+    _prettify_axes(ax)
+    ymax = float(yrs.values.max())
+    ax.set_ylim(0, ymax * 1.14)
+    dy = max(1.0, 0.02 * ymax)
+    for x, y in zip(xs, yrs.values):
+        _text_with_outline(ax, x, y + dy, f"{int(y):,}", fontsize=10)
+    plt.tight_layout()
+    savefig(fig, outdir, "eda_records_per_year_pretty_alllabels.png")
+
+
+def plot_strat_fold_grouped(meta_df: pd.DataFrame, outdir: Path):
+    if meta_df.empty or "strat_fold" not in meta_df.columns or "label" not in meta_df.columns:
+        return
+    ct = pd.crosstab(meta_df["strat_fold"].astype(int), meta_df["label"].astype(str))
+    cols = [c for c in ORDER_5 if c in ct.columns] or list(ct.columns)
+    ct = ct[cols]
+
+    folds = ct.index.astype(str).tolist()
+    x = _x_positions(len(folds), 1.00)
+
+    k = len(cols)
+    group_width = 0.84
+    bar_w = group_width / max(k, 1)
+    eff_w = bar_w * (1 - GAP_FRAC_GROUPED)
+
+    fig, ax = plt.subplots(figsize=(12.0, 5.9))
+    ymax = 0.0
+    for j, lab in enumerate(cols):
+        offs = -group_width/2 + j*bar_w + bar_w/2
+        vals = ct[lab].values
+        ymax = max(ymax, float(np.nanmax(vals)) if len(vals) else 0.0)
+        ax.bar(
+            x + offs, vals, width=eff_w,
+            label=str(lab), color=CLASS_COLORS.get(lab, None), edgecolor="white", linewidth=0.6, alpha=0.92
+        )
+
+    ax.set_xticks(x)
+    ax.set_xticklabels(folds)
+    ax.set_xlabel("strat_fold")
+    ax.set_ylabel("Count")
+    ax.set_title("Class counts per strat_fold (grouped)")
+    _prettify_axes(ax)
+    ax.set_ylim(0, ymax * 1.30)
+    ax.legend(ncol=min(5, len(cols)), frameon=False, loc="upper center", bbox_to_anchor=(0.5, 1.10), handlelength=1.2, columnspacing=1.2)
+    plt.tight_layout()
+    savefig(fig, outdir, "eda_fold_class_counts_grouped_pretty.png")
+
+
+# --------------------------------------------------------------------------------------
+# Engineered-features EDA: correlation heatmaps & pruning
+# --------------------------------------------------------------------------------------
+
+def plot_feature_correlations(feature_df: pd.DataFrame, outdir: Path):
+    if feature_df.empty:
+        return
+    num = feature_df.drop(columns=["label"], errors="ignore").select_dtypes(include=[np.number])
+    if num.shape[1] < 2:
+        print("(Not enough numeric columns for correlation heatmap.)")
+        return
+
+    import re as _re
+
+    def parse_col(c):
+        m = _re.match(r"L(\d+)_(mean|std|rms|ptp)$", c)
+        if m:
+            return ("stat", m.group(2), int(m.group(1)))
+        m = _re.match(r"L(\d+)_bp_(\d+)_(\d+)Hz$", c)
+        if m:
+            band = f"bp{m.group(2)}_{m.group(3)}"
+            return ("bp", band, int(m.group(1)))
+        return ("other", c, 999)
+
+    families = [("stat","mean"),("stat","std"),("stat","rms"),("stat","ptp"),
+                ("bp","bp0_5"),("bp","bp5_15"),("bp","bp15_40")]
+
+    cols = list(num.columns)
+    parsed = [parse_col(c) for c in cols]
+    order = []
+    for kind, fam in families:
+        for lead in range(1, 13):
+            for c, p in zip(cols, parsed):
+                if p[0]==kind and p[1]==fam and p[2]==lead:
+                    order.append(c)
+    order += [c for c in cols if c not in order]
+
+    corr = num[order].corr().abs()
+    fig, ax = plt.subplots(figsize=(9.5, 8.0))
+    im = ax.imshow(corr.values, vmin=0, vmax=1, cmap="viridis", interpolation="nearest")
+    cb = fig.colorbar(im, ax=ax)
+    cb.set_label("|r|")
+    ax.set_title("Feature correlation heatmap — grouped by family (|r|)")
+    ax.set_xticks([])
+    ax.set_yticks([])
+    plt.tight_layout()
+    savefig(fig, outdir, "eda_feature_corr_heatmap_grouped_simple.png")
+
+    # Prune
+    C = num[order].corr().abs()
+    keep = []
+    dropped = []
+    seen = set()
+    thr = 0.95
+    for c in C.columns:
+        if c in seen:
             continue
-        sub = df[df["client_id"].astype(str) != "GLOBAL"].copy()
-        if sub.empty:
-            continue
+        keep.append(c)
+        seen.add(c)
+        drop_mask = (C[c] >= thr) & (C.index != c)
+        for d in C.index[drop_mask]:
+            if d not in seen:
+                seen.add(d)
+                dropped.append((d, c, float(C.loc[d, c])))
 
-        # Pooled across clients
-        g1 = pd.to_numeric(sub.loc[sub["phase"].astype(str).eq(PHASE_DISABLED), "accuracy"], errors="coerce").dropna().values
-        g2 = pd.to_numeric(sub.loc[sub["phase"].astype(str).eq(PHASE_ENABLED),  "accuracy"], errors="coerce").dropna().values
-        if g1.size >= 2 and g2.size >= 2:
-            F, p = ss.f_oneway(g1, g2)
-            eta2, omega2 = _effect_sizes_from_groups([g1, g2])
-            overall = pd.DataFrame([{"run": run, "groups": "pooled_clients", "F": float(F), "p": float(p),
-                                     "eta_sq": eta2, "omega_sq": omega2, "n_no_cv": int(g1.size), "n_post_cv": int(g2.size)}])
-            _safe_save_table(overall, f"anova_client_phase_{run}_overall.csv")
-
-        # Per-client one-way (two groups) + optional two-way with statsmodels
-        rows = []
-        for cid, grp in sub.groupby("client_id"):
-            a = pd.to_numeric(grp.loc[grp["phase"].astype(str).eq(PHASE_DISABLED), "accuracy"], errors="coerce").dropna().values
-            b = pd.to_numeric(grp.loc[grp["phase"].astype[str].eq(PHASE_ENABLED),  "accuracy"], errors="coerce").dropna().values
-            if a.size >= 2 and b.size >= 2:
-                F, p = ss.f_oneway(a, b)
-                eta2, omega2 = _effect_sizes_from_groups([a, b])
-                rows.append({"run": run, "client_id": str(cid), "F": float(F), "p": float(p),
-                             "eta_sq": eta2, "omega_sq": omega2, "n_no_cv": int(a.size), "n_post_cv": int(b.size),
-                             "mean_no_cv": float(np.mean(a)), "mean_post_cv": float(np.mean(b))})
-        if rows:
-            dfc = pd.DataFrame(rows).sort_values("p")
-            _safe_save_table(dfc, f"anova_client_phase_{run}_perclient.csv")
-
-        # Optional two-way (Client × Phase)
-        if _HAS_SM:
-            try:
-                tmp = sub.dropna(subset=["accuracy", "phase", "client_id"]).copy()
-                tmp["phase"] = tmp["phase"].astype(str)
-                tmp["client_id"] = tmp["client_id"].astype(str)
-                model = ols("accuracy ~ C(client_id) + C(phase) + C(client_id):C(phase)", data=tmp).fit()
-                anova_tbl = sm.stats.anova_lm(model, typ=2)
-                out = anova_tbl.reset_index().rename(columns={"index": "term"})
-                _safe_save_table(out, f"anova_two_way_client_phase_{run}.csv")
-            except Exception as e:
-                print(f"[ANOVA two-way] {run}: {e}")
+    num_p = num[keep]
+    corr_p = num_p.corr().abs()
+    fig, ax = plt.subplots(figsize=(8.5, 7.5))
+    im = ax.imshow(corr_p.values, vmin=0, vmax=1, cmap="viridis", interpolation="nearest")
+    fig.colorbar(im, ax=ax).set_label("|r|")
+    ax.set_title(f"Correlation heatmap after pruning (|r|≥0.95) — {num_p.shape[1]} features kept")
+    ax.set_xticks([])
+    ax.set_yticks([])
+    plt.tight_layout()
+    savefig(fig, outdir, "eda_feature_corr_heatmap_pruned.png")
 
 
-# -------------------------------------------------------------------------
-# Plotting + ANOVA runner (no side effects on import)
-# -------------------------------------------------------------------------
-def _run_plots_and_anova():
-    """Generate standard plots from CSVs and run ANOVAs if possible.
+# --------------------------------------------------------------------------------------
+# HR/HRV boxplots by class/sex (from engineered features table)
+# --------------------------------------------------------------------------------------
 
-    Produces
-    --------
-    • Global accuracy per round
-    • Client vs Global accuracy per run
-    • Per-round total client wall-time
-    • Per-client trajectories (frozen vs non-frozen)
-    • Per-class accuracy trajectories and final-round bars
-    • Confusion matrices for last round of each run
-    • Global and per-client accuracy by phase
-    • ANOVA CSVs (global between runs, per-class between runs, client-by-phase)
-    """
-    # -- Global accuracy vs round --------------------------------------------
-    if dfs:
-        fig = plt.figure()
-        ax = fig.add_subplot(111)
-        for name, df in dfs.items():
-            if df is None or df.empty or "client_id" not in df.columns:
-                continue
-            g = df.loc[df["client_id"].astype(str) == "GLOBAL"].copy()
-            if g.empty or "round" not in g.columns or "accuracy" not in g.columns:
-                continue
-            g = g.sort_values("round")
-            ax.plot(g["round"], g["accuracy"], label=f"Global ({name})")
-        ax.set_xlabel("Round"); ax.set_ylabel("Accuracy"); ax.set_title("Global Accuracy per Round")
-        ax.legend(); ax.grid(True); fig.tight_layout()
-        _safe_save(fig, "global_accuracy.png")
+def plot_hrv_boxes(feature_df: pd.DataFrame, outdir: Path):
+    if feature_df.empty:
+        return
+    df = feature_df.copy()
+    for c in ["HR_bpm","SDNN_ms","RMSSD_ms"]:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+    METRICS = [c for c in ["HR_bpm","SDNN_ms","RMSSD_ms"] if c in df.columns]
+    if not METRICS:
+        print("(HR/HRV columns not found in features CSV; skipping HRV boxplots.)")
+        return
 
-    # -- Client accuracies vs round ------------------------------------------
-    for name, df in dfs.items():
-        if df is None or df.empty or "client_id" not in df.columns:
-            continue
-        sub = df[df["client_id"].astype(str) != "GLOBAL"].copy()
-        if sub.empty or "round" not in sub.columns or "accuracy" not in sub.columns:
-            continue
-        sub = sub.sort_values(["client_id", "round"])
-        fig = plt.figure()
-        ax = fig.add_subplot(111)
-        for cid, grp in sub.groupby("client_id"):
-            if grp.empty:
-                continue
-            ax.plot(grp["round"], grp["accuracy"], alpha=0.6, label=f"Client {cid}")
-        g = df[df["client_id"].astype(str) == "GLOBAL"].copy()
-        if not g.empty and "round" in g.columns and "accuracy" in g.columns:
-            g = g.sort_values("round")
-            ax.plot(g["round"], g["accuracy"], linewidth=3, linestyle="--", label="GLOBAL")
-        ax.set_xlabel("Round"); ax.set_ylabel("Accuracy")
-        ax.set_title(f"Client vs Global Accuracy — {name}")
-        ax.legend(ncol=2); ax.grid(True); fig.tight_layout()
-        _safe_save(fig, f"clients_vs_global_{name}.png")
+    def _boxplot(df: pd.DataFrame, metric: str, group_col: str, order=None, title=None, fname=None, figsize=(10,5)):
+        g_order = (order or sorted(df[group_col].dropna().astype(str).unique()))
+        groups, labels = [], []
+        for g in g_order:
+            v = pd.to_numeric(df.loc[df[group_col].astype(str)==g, metric], errors="coerce").dropna().values
+            if v.size >= 5:
+                groups.append(v)
+                labels.append(str(g))
+        if not groups:
+            return
+        fig, ax = plt.subplots(figsize=figsize)
+        ax.boxplot(groups, labels=labels, showfliers=False)
+        ax.set_title(title or f"{metric} by {group_col}")
+        ax.set_ylabel(metric)
+        ax.grid(alpha=0.3, axis="y")
+        plt.tight_layout()
+        savefig(fig, outdir, fname)
 
-    # -- Total wall-time per round (sum across clients) ----------------------
-    for name, df in dfs.items():
-        if df is None or df.empty or "wall_time_sec" not in df.columns or "round" not in df.columns:
-            continue
-        sub = df[df["client_id"].astype(str) != "GLOBAL"].copy()
-        if sub.empty:
-            continue
-        agg = (sub.groupby("round", as_index=False)
-                  .agg(wall_time_sec=("wall_time_sec", "sum"))
-                  .sort_values(by="round"))
-        if agg.empty:
-            continue
-        fig = plt.figure()
-        ax = fig.add_subplot(111)
-        ax.plot(agg["round"], agg["wall_time_sec"])
-        ax.set_xlabel("Round"); ax.set_ylabel("Total client wall-time (s)")
-        ax.set_title(f"Total Wall-Time per Round — {name}")
-        ax.grid(True); fig.tight_layout()
-        _safe_save(fig, f"walltime_{name}.png")
+    if "label" in df.columns:
+        class_order = [c for c in ["CD","HYP","MI","NORM","STTC"] if c in set(df["label"].astype(str))] or sorted(df["label"].astype(str).unique())
+        for m in METRICS:
+            _boxplot(df, m, "label", order=class_order, title=f"{m} by diagnostic class", fname=f"box_{m}_by_class_side.png")
 
-    # -- Per-client trajectories (frozen vs non-frozen, one figure) ----------
-    if all(k in dfs for k in ("frozen", "non_frozen")):
-        nf = dfs.get("non_frozen"); fr = dfs.get("frozen")
-        if nf is not None and fr is not None and not nf.empty and not fr.empty:
-            fig = plt.figure()
-            ax = fig.add_subplot(111)
-            cids = set(nf.query("client_id!='GLOBAL'")["client_id"]).union(
-                   set(fr.query("client_id!='GLOBAL'")["client_id"]))
-            for cid in sorted(cids):
-                for run_name, dfi, style in [("non_frozen", nf, "-"), ("frozen", fr, "--")]:
-                    sub_df = dfi.loc[dfi["client_id"] == cid].copy()
-                    if sub_df.empty or "round" not in sub_df.columns or "accuracy" not in sub_df.columns:
-                        continue
-                    sub_df.sort_values(by="round", inplace=True)
-                    lbl = f"Client {cid} ({'unfrozen' if run_name=='non_frozen' else 'frozen'})"
-                    ax.plot(sub_df["round"], sub_df["accuracy"], linestyle=style, label=lbl, alpha=0.8)
-            ax.set_xlabel("Round"); ax.set_ylabel("Local Accuracy")
-            ax.set_title("Per-Client Accuracy Trajectories (Frozen vs Unfrozen)")
-            ax.legend(ncol=2); ax.grid(True); fig.tight_layout()
-            _safe_save(fig, "per_client_trajectories.png")
+    sex_col = None
+    for c in ["sex_norm", "sex"]:
+        if c in df.columns:
+            sex_col = c
+            break
+    if sex_col is not None:
+        if sex_col == "sex":
+            df["sex_norm"] = _sex_norm(df["sex"])
+            sex_col = "sex_norm"
+        sex_order = [s for s in ["female","male","unknown"] if s in set(df[sex_col].astype(str))]
+        for m in METRICS:
+            _boxplot(df, m, sex_col, order=sex_order, title=f"{m} by sex", fname=f"box_{m}_by_sex_side.png", figsize=(7.5,4.8))
 
-    # -- Per-class accuracy over rounds (line plot) --------------------------
-    if percls:
-        fig = plt.figure()
-        ax = fig.add_subplot(111)
-        if "non_frozen" in percls and not percls["non_frozen"].empty:
-            nf = percls["non_frozen"].sort_values(by="round")
-            for label, series in perclass_columns(nf).items():
-                try:
-                    ax.plot(nf["round"], series, label=f"{label} (unfrozen)")
-                except Exception:
-                    pass
-        if "frozen" in percls and not percls["frozen"].empty:
-            fr = percls["frozen"].sort_values(by="round")
-            for label, series in perclass_columns(fr).items():
-                try:
-                    ax.plot(fr["round"], series, linestyle="--", label=f"{label} (frozen)")
-                except Exception:
-                    pass
-        ax.set_xlabel("Round"); ax.set_ylabel("Per-class Accuracy")
-        ax.set_title("Per-class Accuracy per Round")
-        ax.legend(ncol=2); ax.grid(True); fig.tight_layout()
-        _safe_save(fig, "perclass_over_rounds.png")
 
-    # -- Final-round per-class accuracy (bar) --------------------------------
-    if percls:
-        labels = SUPERCLASSES
-        x = np.arange(len(labels)); width = 0.35
-        fig = plt.figure()
-        ax = fig.add_subplot(111)
-        drew_any = False
-        if "non_frozen" in percls and not percls["non_frozen"].empty:
-            nf_last = percls["non_frozen"].sort_values(by="round").tail(1)
-            nf_map  = perclass_columns(nf_last)
-            y_nf    = [float(nf_map.get(lbl, pd.Series([0])).iloc[0]) for lbl in labels]
-            ax.bar(x - width/2, y_nf, width, label="Unfrozen"); drew_any = True
-        if "frozen" in percls and not percls["frozen"].empty:
-            fr_last = percls["frozen"].sort_values(by="round").tail(1)
-            fr_map  = perclass_columns(fr_last)
-            y_fr    = [float(fr_map.get(lbl, pd.Series([0])).iloc[0]) for lbl in labels]
-            ax.bar(x + width/2, y_fr, width, label="Frozen"); drew_any = True
-        if drew_any:
-            ax.set_xticks(x); ax.set_xticklabels(labels)
-            ax.set_ylabel("Accuracy"); ax.set_title("Final-Round Per-class Accuracy")
-            ax.legend(); fig.tight_layout()
-            _safe_save(fig, "perclass_final_bar.png")
-        else:
-            plt.close(fig)
+# --------------------------------------------------------------------------------------
+# ANOVA F-test on engineered features (SelectKBest) — robust to NaNs & constants
+# --------------------------------------------------------------------------------------
 
-    # -- Confusion heatmaps (last round of each run) -------------------------
-    for name, dfc in conf_long.items():
-        if dfc is None or dfc.empty:
-            continue
-        if "round" not in dfc.columns or "true" not in dfc.columns or "pred" not in dfc.columns or "count" not in dfc.columns:
-            continue
-        r = int(dfc["round"].max())
-        sub = dfc[dfc["round"] == r].copy()
-        if sub.empty:
-            continue
-        n = len(SUPERCLASSES)
-        try:
-            piv = sub.pivot_table(index="true", columns="pred", values="count", aggfunc="sum", fill_value=0)
-            piv.index = pd.to_numeric(piv.index, errors="coerce")
-            piv.columns = pd.to_numeric(piv.columns, errors="coerce")
-            cm = (piv.reindex(index=range(n), columns=range(n), fill_value=0).to_numpy(dtype=float))
-        except Exception as e:
-            print(f"Confusion pivot failed for {name}: {e}")
-            continue
+def run_anova_selectkbest(feature_df: pd.DataFrame, outdir: Path):
+    try:
+        from sklearn.feature_selection import SelectKBest, f_classif, VarianceThreshold
+        from sklearn.impute import SimpleImputer
+        from sklearn.preprocessing import LabelEncoder
+    except Exception:
+        print("(sklearn not available — skipping ANOVA SelectKBest)")
+        return
+    if feature_df.empty or "label" not in feature_df.columns:
+        return
 
+    X_num = feature_df.drop(columns=["label"], errors="ignore").select_dtypes(include=[np.number]).copy()
+    y_all = feature_df["label"].astype(str).copy()
+    X_num = X_num.replace([np.inf, -np.inf], np.nan)
+
+    vt = VarianceThreshold(threshold=1e-12)
+    try:
+        X_vt = vt.fit_transform(X_num)
+    except Exception:
+        print("(ANOVA) No numeric features after preprocessing.")
+        return
+    cols_vt = X_num.columns[vt.get_support()]
+    if X_vt.shape[1] == 0:
+        print("(ANOVA) All numeric features were constant or removed.")
+        return
+
+    from sklearn.impute import SimpleImputer
+    imp = SimpleImputer(strategy="median")
+    X_imp = imp.fit_transform(X_vt)
+
+    le = LabelEncoder()
+    y_enc = le.fit_transform(y_all.values)
+
+    k = int(min(20, X_imp.shape[1]))
+    selector = SelectKBest(score_func=f_classif, k=k).fit(X_imp, y_enc)
+    scores_series = pd.Series(selector.scores_, index=cols_vt).sort_values(ascending=False)
+
+    top = scores_series.head(25)
+    fig, ax = plt.subplots(figsize=(10, 5.5))
+    xs = np.arange(len(top))
+    ax.bar(xs, top.values)
+    ax.set_xticks(xs)
+    ax.set_xticklabels(top.index, rotation=65, ha="right")
+    ax.set_title("ANOVA F-scores (top 25)")
+    ax.set_ylabel("F-score")
+    ax.grid(axis="y", alpha=0.3)
+    plt.tight_layout()
+    savefig(fig, outdir, "anova_selectkbest_top25.png")
+
+
+# --------------------------------------------------------------------------------------
+# Optional: confusion heatmaps from FL CSVs (if present)
+# --------------------------------------------------------------------------------------
+
+def try_plot_confusions_from_csv(cm_csv: Path, superclasses: Iterable[str], name: str, outdir: Path, last_k: int = 3):
+    if not cm_csv.exists():
+        print(f"Missing: {cm_csv}")
+        return
+    df = pd.read_csv(cm_csv)
+    req = {"round","true","pred","count"}
+    if not req.issubset(df.columns):
+        print(f"Confusion CSV {cm_csv} missing columns {req}")
+        return
+    rounds = sorted(df["round"].dropna().unique())[-int(last_k):]
+    sc = list(superclasses)
+    n = len(sc)
+    for r in rounds:
+        sub = df[df["round"] == r].copy()
+        piv = sub.pivot_table(index="true", columns="pred", values="count", aggfunc="sum", fill_value=0)
+        piv.index = pd.to_numeric(piv.index, errors="coerce")
+        piv.columns = pd.to_numeric(piv.columns, errors="coerce")
+        cm = (piv.reindex(index=range(n), columns=range(n), fill_value=0).to_numpy(dtype=float))
         with np.errstate(invalid="ignore", divide="ignore"):
             row_sum = cm.sum(axis=1, keepdims=True)
             cmn = np.nan_to_num(cm / np.maximum(row_sum, 1), nan=0.0, posinf=0.0, neginf=0.0)
-
-        fig = plt.figure(figsize=(6, 5))
-        ax = fig.add_subplot(111)
-        im = ax.imshow(cmn, aspect="auto", vmin=0, vmax=1.0)
-        ax.set_title(f"Confusion Matrix — {name} (round {r})")
-        ax.set_xlabel("Predicted"); ax.set_ylabel("True")
-        ax.set_xticks(range(n)); ax.set_xticklabels(SUPERCLASSES, rotation=45, ha="right")
-        ax.set_yticks(range(n)); ax.set_yticklabels(SUPERCLASSES)
-        cbar = fig.colorbar(im, ax=ax); cbar.set_label("Row-normalized")
+        fig, ax = plt.subplots(figsize=(6.4, 5.3))
+        im = ax.imshow(cmn, aspect="auto", vmin=0, vmax=1.0, cmap="Blues")
+        ax.set_title(f"Confusion Matrix — {name} (round {int(r)})")
+        ax.set_xlabel("Predicted")
+        ax.set_ylabel("True")
+        ax.set_xticks(range(n))
+        ax.set_xticklabels(sc, rotation=45, ha="right")
+        ax.set_yticks(range(n))
+        ax.set_yticklabels(sc)
+        cbar = fig.colorbar(im, ax=ax)
+        cbar.set_label("Row-normalized")
         for i in range(n):
             for j in range(n):
                 val = cmn[i, j] * 100.0
-                ax.text(j, i, f"{val:0.2f}", ha="center", va="center",
-                        color=("white" if val >= 50 else "black"), fontsize=9)
-        fig.tight_layout()
-        _safe_save(fig, f"confusion_{name}_r{r:02d}.png")
-
-    # -- Global accuracy by phase (within each run) --------------------------
-    for name, df in dfs.items():
-        if df is None or df.empty or "phase" not in df.columns:
-            continue
-        g = df[df["client_id"].astype(str) == "GLOBAL"].copy()
-        if g.empty or "round" not in g.columns or "accuracy" not in g.columns:
-            continue
-        pre  = g[g["phase"].astype(str).eq(PHASE_DISABLED)].sort_values(by="round")
-        post = g[g["phase"].astype(str).eq(PHASE_ENABLED)].sort_values(by="round")
-        if pre.empty and post.empty:
-            continue
-        fig = plt.figure()
-        ax = fig.add_subplot(111)
-        if not pre.empty:  ax.plot(pre["round"], pre["accuracy"], label=f"{name} (no-CV)")
-        if not post.empty: ax.plot(post["round"], post["accuracy"], label=f"{name} (post-CV)")
-        ax.set_xlabel("Round"); ax.set_ylabel("Global Accuracy")
-        ax.set_title(f"Global Accuracy by Phase — {name}")
-        ax.legend(); ax.grid(True); fig.tight_layout()
-        _safe_save(fig, f"global_by_phase_{name}.png")
-
-    # -- Per-client accuracy by phase (overlay pre/post + MA overlays) -------
-    for name, df in dfs.items():
-        if df is None or df.empty or "phase" not in df.columns or "client_id" not in df.columns:
-            continue
-        sub = df[df["client_id"].astype(str) != "GLOBAL"].copy()
-        if sub.empty or "round" not in sub.columns or "accuracy" not in sub.columns:
-            continue
-        fig = plt.figure()
-        ax = fig.add_subplot(111)
-        drew_any = False
-
-        for phase, style in [(PHASE_DISABLED, "-"), (PHASE_ENABLED, "--")]:
-            grp = sub[sub["phase"].astype(str).eq(phase)]
-            for cid, g in grp.groupby("client_id"):
-                g = g.sort_values(by="round")
-                if g.empty:
-                    continue
-                line, = ax.plot(g["round"], g["accuracy"], linestyle=style, alpha=0.35, zorder=1)
-                xm, ym = _ma_xy(g["round"].values, g["accuracy"].values)
-                ax.plot(
-                    xm, ym,
-                    linestyle=style, linewidth=2.0, color=line.get_color(), alpha=0.95,
-                    label=f"Client {cid} ({name}, {phase})", zorder=2
-                )
-                drew_any = True
-
-        g_global = df[df["client_id"].astype(str) == "GLOBAL"].copy()
-        if not g_global.empty and "round" in g_global.columns and "accuracy" in g_global.columns:
-            g_global = g_global.sort_values("round")
-            xg, yg = _ma_xy(g_global["round"].values, g_global["accuracy"].values)
-            if len(yg):
-                ax.plot(
-                    xg, yg,
-                    linestyle="-.", linewidth=3.0, color="black", alpha=0.8,
-                    label=f"GLOBAL ({name}, MA{MA_WINDOW})", zorder=3
-                )
-
-        if drew_any:
-            ax.set_xlabel("Round"); ax.set_ylabel("Local Accuracy")
-            ax.set_title(f"Per-Client Accuracy by Phase — {name}")
-            ax.legend(ncol=2); ax.grid(True); fig.tight_layout()
-            _safe_save(fig, f"clients_by_phase_{name}.png")
-        else:
-            plt.close(fig)
-
-    # Run ANOVAs when data present
-    anova_global_between_runs(dfs)
-    anova_perclass_between_runs(percls)
-    anova_client_accuracy_by_phase(dfs)
-
-    print(f"Saved plots and ANOVA tables (where possible) to: {OUT.resolve()}")
+                ax.text(j, i, f"{val:0.2f}", ha="center", va="center", color=("white" if val >= 50 else "black"), fontsize=9)
+        plt.tight_layout()
+        savefig(fig, outdir, f"confusion_{name}_r{int(r):02d}.png")
 
 
-# =============================================================================
-# The remainder provides unified evaluation utilities used by Centralized.py.
-# =============================================================================
+# --------------------------------------------------------------------------------------
+# Driver: orchestrate everything
+# --------------------------------------------------------------------------------------
 
-import time as _time, re as _re
-import torch as _torch
-from sklearn.metrics import (classification_report as _clsrep, accuracy_score as _acc,
-                             f1_score as _f1, precision_score as _prec, recall_score as _rec,
-                             roc_auc_score as _rocauc, confusion_matrix as _sk_cm)
+def run_eda_and_optional_fl(args):
+    outdir = ensure_outdir(Path(args.outdir))
+    eda_dir = ensure_outdir(outdir / "eda")
 
-# Avoid circular imports at module load time
-try:
-    from . import config as CFG
-    from .utils import torch_loader_kwargs as _torch_loader_kwargs
-except Exception:
-    from src_Connection import config as CFG  # type: ignore
-    from src_Connection.utils import torch_loader_kwargs as _torch_loader_kwargs  # type: ignore
-
-
-class TorchAdapter:
-    """Unified inference wrapper for PyTorch models used by evaluation/visualization.
-
-    Responsibilities
-    ----------------
-    • Builds a predict/predict_proba API over waveform paths (WFDB base paths).
-    • Handles device placement and batch loading consistently with config.
-    • Converts model logits into predicted labels using the provided LabelEncoder.
-
-    Used by
-    -------
-    • Centralized.run_deep_models → to get y_pred / proba for metrics and plots.
-    """
-
-    def __init__(self, model, label_encoder, is_binary: bool, batch=32, device=None):
-        self.model = model.to(device or _torch.device("cpu")).eval()
-        self.le = label_encoder; self.is_binary = is_binary
-        self.batch = int(batch); self.device = device or _torch.device("cpu")
-        self.classes_ = getattr(self.le, "classes_", None)
-
-    @_torch.no_grad()
-    def _loader(self, paths):
-        """Internal: build a predict-only DataLoader from WFDB base paths."""
-        from torch.utils.data import Dataset, DataLoader
-        from .data_loader import load_waveform_np
-        class _PredictOnly(Dataset):
-            def __init__(self, p):
-                self.paths=list(p)
-                self.T = max(1, CFG.SEQ_LEN // max(1, CFG.DOWNSAMPLE_FACTOR))
-            def __len__(self): return len(self.paths)
-            def __getitem__(self, i):
-                return _torch.from_numpy(load_waveform_np(self.paths[i], T=self.T, factor=CFG.DOWNSAMPLE_FACTOR))
-        return DataLoader(_PredictOnly(paths), **_torch_loader_kwargs(False, self.batch, self.device.type))
-
-    @_torch.no_grad()
-    def predict(self, paths):
-        """Return predicted class labels (str) for a list/array of WFDB base paths."""
-        preds=[]
-        for xb in self._loader(paths):
-            xb=xb.to(self.device); logits=self.model(xb)
-            y_idx=((_torch.sigmoid(logits.view(-1))>=0.5).long().cpu().numpy()
-                   if self.is_binary else logits.argmax(1).cpu().numpy())
-            preds.extend(self.le.inverse_transform(y_idx))
-        return np.asarray(preds)
-
-    @_torch.no_grad()
-    def predict_proba(self, paths):
-        """Return class probability estimates aligned to self.classes_ order."""
-        out=[]
-        for xb in self._loader(paths):
-            xb=xb.to(self.device); logits=self.model(xb)
-            if self.is_binary:
-                p1=_torch.sigmoid(logits.view(-1)).unsqueeze(1); p0=1.0-p1; p=_torch.cat([p0,p1], dim=1)
-            else:
-                p=_torch.softmax(logits, dim=1)
-            out.append(p.cpu().numpy().astype("float32"))
-        return np.vstack(out)
-
-
-def evaluate_models(models_dict, paths, y_true, label_encoder, is_binary, device):
-    """Evaluate multiple models/adapters and return a unified metrics table.
-
-    Parameters
-    ----------
-    models_dict : dict[str, TorchAdapter]
-        Mapping of model name → TorchAdapter instance.
-    paths : array-like[str]
-        WFDB base paths (test set).
-    y_true : array-like[str]
-        Ground-truth labels in string form (for readability).
-    label_encoder : LabelEncoder
-        Used to map indices ↔ labels for ROC-AUC multi-class alignment.
-    is_binary : bool
-        Binary classification flag (affects ROC-AUC handling).
-    device : torch.device
-        Passed through to adapter if needed (already applied at construction).
-
-    Returns
-    -------
-    pd.DataFrame
-        Sorted by weighted F1, with accuracy/precision/recall/F1 and OVR ROC-AUC (when possible).
-
-    Connected to
-    ------------
-    • Centralized.run_deep_models: prints classification report and uses the returned DataFrame
-      to pick a “best” model for confusion plots and learning curves.
-    """
-    rows=[]
-    for name, adapter in models_dict.items():
-        y_pred = adapter.predict(paths)
+    # 1) Load PTB-XL DB/SCP and build minimal metadata table (features_df)
+    db_csv = Path(args.db_csv) if args.db_csv else DEFAULT_DB_CSV
+    scp_csv = Path(args.scp_csv) if args.scp_csv else DEFAULT_SCP_CSV
+    db, scp, _ = load_db_and_scp(db_csv, scp_csv)
+    features_df = pd.DataFrame()
+    if not db.empty and not scp.empty:
+        to_label, valid_codes, diag_only, label_field = make_label_mapper(scp, label_mode="5class")
         try:
-            print(f"\n=== {name} ===")
-            print(_clsrep(y_true, y_pred, digits=3, zero_division=0))
-        except Exception:
-            pass
-        row = {
-            "model": name,
-            "accuracy": _acc(y_true, y_pred),
-            "precision_macro": _prec(y_true, y_pred, average="macro", zero_division=0),
-            "recall_macro": _rec(y_true, y_pred, average="macro", zero_division=0),
-            "f1_macro": _f1(y_true, y_pred, average="macro", zero_division=0),
-            "f1_weighted": _f1(y_true, y_pred, average="weighted", zero_division=0),
-            "roc_auc_ovr_macro": np.nan
-        }
-        try:
-            classes = np.unique(y_true)
-            from sklearn.preprocessing import label_binarize
-            y_bin = label_binarize(y_true, classes=classes)
-            scores = adapter.predict_proba(paths)
-            est = np.asarray(adapter.classes_)
-            pos = {c:i for i,c in enumerate(est)}
-            idx = [pos[c] for c in classes]
-            scores = scores[:, idx]
-            row["roc_auc_ovr_macro"] = float(_rocauc(y_bin, scores, average="macro", multi_class="ovr"))
-        except Exception:
-            pass
-        rows.append(row)
-    df = pd.DataFrame(rows).sort_values("f1_weighted", ascending=False)
-    return df
-
-
-def _slug(txt): return _re.sub(r"[^a-z0-9]+", "_", str(txt).lower()).strip("_")
-
-def plot_confusion(y_true, y_pred, title="Confusion Matrix", classes=None, save_path=None, collapse_to_3=False):
-    """Plot a (row-normalized %) confusion matrix and optionally save to file.
-
-    Parameters
-    ----------
-    y_true, y_pred : array-like
-        Ground-truth and predicted labels (strings or ints).
-    title : str
-        Figure title.
-    classes : Optional[list[str]]
-        Class label order; if None, inferred from union of y_true/y_pred.
-    save_path : Optional[str | Path]
-        If provided, saves PNG at this path.
-    collapse_to_3 : bool
-        If True, maps classes to {'MI', 'NORM', 'OTHER'} for a coarse view.
-
-    Returns
-    -------
-    matplotlib.figure.Figure
-        The created figure (also saved if save_path provided).
-
-    Used by
-    -------
-    • Centralized.run_deep_models: to visualize best model confusion.
-    """
-    if collapse_to_3:
-        def _map3(a):
-            a=str(a)
-            if a=="MI": return "MI"
-            if a=="NORM": return "NORM"
-            return "OTHER"
-        y_true = np.vectorize(_map3)(np.array(y_true)); y_pred = np.vectorize(_map3)(np.array(y_pred))
-        classes = ["MI","NORM","OTHER"]
+            features_df = build_minimal_table(db, to_label, record_file_col=args.record_file_col, min_conf=float(args.scp_min_conf))
+        except Exception as e:
+            print(f"(Minimal table) failed: {e}")
     else:
-        y_true = np.array(y_true); y_pred = np.array(y_pred)
-        classes = classes or sorted(list(set(y_true)|set(y_pred)))
-    cm = _sk_cm(y_true, y_pred, labels=classes)
-    cm_pct = cm.astype(float); row_sum = cm_pct.sum(axis=1, keepdims=True)
-    cm_pct = np.divide(cm_pct, np.maximum(row_sum, 1), where=row_sum>0) * 100.0
-    fig, ax = plt.subplots(figsize=(7.8, 6.2))
-    im = ax.imshow(cm_pct, interpolation="nearest", cmap=plt.cm.Blues, vmin=0, vmax=100)
-    fig.colorbar(im, ax=ax).set_label("%")
-    ax.set_title(title); ax.set_xlabel("Predicted"); ax.set_ylabel("True")
-    ax.set_xticks(range(len(classes))); ax.set_xticklabels(classes)
-    ax.set_yticks(range(len(classes))); ax.set_yticklabels(classes)
-    for i in range(cm_pct.shape[0]):
-        for j in range(cm_pct.shape[1]):
-            val = cm_pct[i, j]
-            ax.text(j, i, f"{val:0.2f}", ha="center", va="center",
-                    color=("white" if val >= 50 else "black"), fontsize=10)
-    plt.tight_layout()
-    if save_path:
-        Path(save_path).parent.mkdir(parents=True, exist_ok=True)
-        plt.savefig(save_path, dpi=300, bbox_inches="tight")
-    return fig
+        print("(PTB-XL CSVs missing — skipping demographics/fold EDA that relies on them.)")
 
-
-def plot_learning_curves(histories: dict[str, dict], out_dir: str | Path | None = None):
-    """Plot and save loss/accuracy curves for multiple models.
-
-    Parameters
-    ----------
-    histories : dict[str, dict]
-        For each model name, a dict with keys 'loss', 'val_loss', 'accuracy', 'val_accuracy'.
-    out_dir : Optional[str | Path]
-        Destination directory; defaults to CFG.ART_DIR/figs when None.
-
-    Outputs
-    -------
-    • 'loss_curve_<model>.png' and, when accuracy present, 'accuracy_curve_<model>.png'
-    """
-    if not histories:
-        print("No histories to plot.")
-        return
-    out_dir = Path(out_dir or (Path(CFG.ART_DIR) / "figs"))
-    out_dir.mkdir(parents=True, exist_ok=True)
-    for name, hist in histories.items():
-        ep = range(1, len(hist.get('loss', [])) + 1)
-        plt.figure(figsize=(7,4))
-        plt.plot(ep, hist.get('loss', []), marker='o', linewidth=1, label='Training Loss')
-        plt.plot(ep, hist.get('val_loss', []), marker='o', linewidth=1, label='Validation Loss')
-        plt.title(f'Loss — {name}'); plt.xlabel('Epoch'); plt.ylabel('Loss'); plt.legend(); plt.grid(alpha=0.3)
-        fp1 = out_dir / f"loss_curve_{_slug(name)}.png"
-        plt.tight_layout(); plt.savefig(fp1, dpi=300, bbox_inches='tight'); print('Saved:', fp1); plt.close()
-
-        acc = hist.get('accuracy', []); val_acc = hist.get('val_accuracy', [])
-        if len(acc):
-            plt.figure(figsize=(7,4))
-            plt.plot(ep, acc, marker='o', linewidth=1, label='Training Acc')
-            plt.plot(ep, val_acc, marker='o', linewidth=1, label='Validation Acc')
-            plt.title(f'Accuracy — {name}'); plt.xlabel('Epoch'); plt.ylabel('Accuracy'); plt.legend(); plt.grid(alpha=0.3)
-            fp2 = out_dir / f"accuracy_curve_{_slug(name)}.png"
-            plt.tight_layout(); plt.savefig(fp2, dpi=300, bbox_inches='tight'); print('Saved:', fp2); plt.close()
-
-
-from sklearn.metrics import f1_score as _f1_score
-
-def fairness_macro_f1_by_groups(best_adapter, y_true, test_index, meta_df: pd.DataFrame):
-    """Compute macro-F1 per demographic group (sex, age bins) on the test subset.
-
-    Parameters
-    ----------
-    best_adapter : TorchAdapter
-        Adapter used to make predictions.
-    y_true : array-like[str]
-        Ground-truth labels for the test subset (aligned by test_index).
-    test_index : array-like
-        Indices into meta_df defining the test subset.
-    meta_df : pd.DataFrame
-        Metadata table with at least 'record_path' and optionally 'sex', 'age'.
-
-    Returns
-    -------
-    pd.DataFrame
-        Columns: group, value, n, macro_F1
-    """
-    paths = meta_df.loc[test_index, "record_path"].astype(str).values
-    y_pred = np.asarray(best_adapter.predict(paths))
-    y_true = np.asarray(list(y_true))
-    meta_test = meta_df.loc[test_index].copy()
-
-    if "sex_norm" not in meta_test.columns and "sex" in meta_test.columns:
-        def _sex_norm(series: pd.Series) -> pd.Series:
-            out = pd.Series("unknown", index=series.index, dtype="string")
-            s_num = pd.to_numeric(series, errors="coerce")
-            out.loc[s_num == 1] = "male"; out.loc[s_num == 0] = "female"
-            s = series.astype("string").str.strip().str.lower()
-            out.loc[s.str.startswith("m", na=False)] = "male"
-            out.loc[s.str.startswith("f", na=False)] = "female"
-            out.loc[s.isin({"male","man"})] = "male"
-            out.loc[s.isin({"female","woman"})] = "female"
-            return out
-        meta_test["sex_norm"] = _sex_norm(meta_test["sex"])
-
-    meta_test["age_num"] = pd.to_numeric(meta_test.get("age", np.nan), errors="coerce")
-    meta_test["age_bin"] = pd.cut(meta_test["age_num"], bins=[0,40,60,200], labels=["<=40","41-60","61+"])
-
-    rows = []
-    def _macro_f1_mask(mask):
-        a, b = y_true[mask], y_pred[mask]
-        if len(np.unique(a)) < 2:
-            return np.nan
-        return _f1_score(a, b, average="macro", zero_division=0)
-
-    for grp_name, series in [("sex_norm", meta_test["sex_norm"]), ("age_bin", meta_test["age_bin"])]:
-        for g, idxs in series.groupby(series).groups.items():
-            mask = meta_test.index.isin(idxs)
-            rows.append({"group": grp_name, "value": str(g), "n": int(mask.sum()), "macro_F1": _macro_f1_mask(mask)})
-    fair_df = pd.DataFrame(rows).sort_values(["group","value"])
-    return fair_df
-
-
-def saliency_grad_times_input(model: _torch.nn.Module, path: str, device=None):
-    """Compute a simple saliency signal (|grad * input|) for one record.
-
-    Steps
-    -----
-    • Loads a single waveform from path.
-    • Forwards through model and backprops the winning logit.
-    • Returns the raw (T, C) array and the per-time averaged saliency over leads.
-
-    Returns
-    -------
-    (x, sal_mean) : np.ndarray, np.ndarray
-        x is (T, C) waveform; sal_mean is (T,) saliency to overlay on a lead.
-    """
-    device = device or _torch.device("cuda" if _torch.cuda.is_available() else "cpu")
-    model = model.to(device).eval()
-    from .data_loader import load_waveform_np
-    T = max(1, CFG.SEQ_LEN // max(1, CFG.DOWNSAMPLE_FACTOR))
-    x = load_waveform_np(path, T=T, factor=CFG.DOWNSAMPLE_FACTOR)
-    xt = _torch.from_numpy(x).unsqueeze(0).to(device)
-    xt.requires_grad_(True)
-
-    with _torch.enable_grad():
-        logits = model(xt)
-        if logits.ndim == 2 and logits.size(1) > 1:
-            target = logits[0, logits.argmax(1).item()]
-        else:
-            target = logits.view(-1)[0]
-        model.zero_grad(set_to_none=True)
-        if xt.grad is not None: xt.grad.zero_()
-        target.backward()
-        grad = xt.grad.detach(); xt_det = xt.detach()
-        sal = (grad * xt_det).abs().squeeze(0).cpu().numpy()
-        sal_mean = sal.mean(axis=1)
-    return x, sal_mean
-
-def plot_saliency_overlay(model, sample_paths: list[str], out_dir: str | Path | None = None, device=None):
-    """Save saliency overlays (Lead I + saliency curve) for a list of records."""
-    out_dir = Path(out_dir or (Path(CFG.ART_DIR) / "figs"))
-    out_dir.mkdir(parents=True, exist_ok=True)
-    for p in sample_paths:
-        x, s = saliency_grad_times_input(model, p, device=device)
-        fig, ax1 = plt.subplots(figsize=(10, 3.0))
-        ax1.plot(x[:, 0], linewidth=0.8); ax1.set_title("ECG (Lead I) with saliency overlay"); ax1.set_ylabel("mV"); ax1.grid(alpha=0.3)
-        ax2 = ax1.twinx(); ax2.plot(s, linewidth=0.8, alpha=0.85); ax2.set_ylabel("saliency")
-        fp = out_dir / f"saliency_{Path(p).name.replace('/', '_')}.png"
-        plt.tight_layout(); plt.savefig(fp, dpi=220, bbox_inches="tight"); print("Saved:", fp); plt.close()
-
-
-def count_params(m):
-    """Count trainable parameters of a torch.nn.Module."""
-    return sum(p.numel() for p in m.parameters() if p.requires_grad)
-
-def benchmark_inference(adapter, paths, device=None, warmup=1):
-    """Time adapter.predict over provided paths (with a small warmup)."""
-    device = device or _torch.device("cuda" if _torch.cuda.is_available() else "cpu")
-    model = adapter.model.to(device).eval()
-    if warmup:
-        _ = adapter.predict(paths[:min(8, len(paths))])
-    t0 = _time.time()
-    _ = adapter.predict(paths)
-    return _time.time() - t0
-
-def summarize_efficiency(adapters: dict[str, object], test_paths: list[str]):
-    """Return a table of params, total inference time, and throughput per model."""
-    rows = []
-    for name, adapter in adapters.items():
+    # 2) Load engineered features (feature_df)
+    feature_df = pd.DataFrame()
+    feats_path = Path(args.features_csv) if args.features_csv else None
+    if feats_path is None:
+        for c in DEFAULT_FEATURES_CSV_CANDIDATES:
+            if c.exists():
+                feats_path = c
+                break
+    if feats_path is None:
+        print("Missing: basic_signal_features.csv (engineered features) — correlation & HRV EDA will be skipped.")
+    else:
         try:
-            secs = benchmark_inference(adapter, test_paths)
-            params = count_params(adapter.model)
-            rows.append({"model": name, "params": int(params), "test_infer_sec": float(secs),
-                         "samples": int(len(test_paths)),
-                         "samples_per_sec": float(len(test_paths))/max(secs, 1e-6)})
-        except Exception:
-            rows.append({"model": name, "params": np.nan, "test_infer_sec": np.nan,
-                         "samples": len(test_paths), "samples_per_sec": np.nan})
-    return pd.DataFrame(rows).sort_values("samples_per_sec", ascending=False)
+            feature_df = pd.read_csv(feats_path, index_col=0)
+        except Exception as e:
+            print(f"Failed to read features CSV ({feats_path}): {e}")
+
+    # 3) EDA plots (mostly notebook parity)
+    if not features_df.empty:
+        plot_missingness_top(features_df, eda_dir)
+        plot_class_counts(features_df, eda_dir)
+        plot_sex_overall_and_by_class(features_df, eda_dir)
+        plot_age_distributions(features_df, eda_dir)
+        plot_records_per_year(features_df, eda_dir)
+        plot_strat_fold_grouped(features_df, eda_dir)
+    else:
+        print("(Minimal metadata table unavailable — many EDA plots will be skipped.)")
+
+    if not feature_df.empty:
+        plot_feature_correlations(feature_df, eda_dir)
+        plot_hrv_boxes(feature_df, eda_dir / "hrv")
+        run_anova_selectkbest(feature_df, eda_dir)
+
+    # 4) Optional: Confusion matrices from FL CSVs (if present)
+    SUPERCLASSES = [c for c in ORDER_5]
+    results_dir = Path(args.results_dir) if args.results_dir else Path("results")
+    try_plot_confusions_from_csv(results_dir / "non_frozen_run_cm.csv", SUPERCLASSES, "non_frozen", outdir)
+    try_plot_confusions_from_csv(results_dir / "frozen_run_cm.csv", SUPERCLASSES, "frozen", outdir)
+
+    print(f"Saved plots to: {outdir}")
 
 
-# Run only when executed as a script (no side effects on import)
+# --------------------------------------------------------------------------------------
+# CLI
+# --------------------------------------------------------------------------------------
+
+def build_argparser():
+    p = argparse.ArgumentParser(description="PTB-XL EDA + optional FL results visualization")
+    p.add_argument("--dataset-root", type=str, default=str(DEFAULT_DATASET_ROOT), help="Root folder for PTB-XL dataset")
+    p.add_argument("--db-csv", type=str, default=str(DEFAULT_DB_CSV), help="Path to ptbxl_database.csv")
+    p.add_argument("--scp-csv", type=str, default=str(DEFAULT_SCP_CSV), help="Path to scp_statements.csv")
+    p.add_argument("--record-file-col", type=str, default="filename_lr", choices=["filename_lr","filename_hr"], help="Which PTB-XL path column to use")
+    p.add_argument("--scp-min-conf", type=float, default=0.0, help="Min confidence for SCP code to count toward label")
+    p.add_argument("--features-csv", type=str, default=None, help="Engineered features CSV (from notebook §5c)")
+    p.add_argument("--results-dir", type=str, default="results", help="Folder where FL CSVs live")
+    p.add_argument("--outdir", type=str, default=str(DEFAULT_OUTDIR), help="Where to save figures")
+    return p
+
+
+def main():
+    args = build_argparser().parse_args()
+    run_eda_and_optional_fl(args)
+
+
 if __name__ == "__main__":
-    _run_plots_and_anova()
+    main()

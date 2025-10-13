@@ -193,9 +193,9 @@ NOTEBOOK = {
 
     # Which torch models to run in Centralized.py
     "RUN_TORCH_CNN":  True,
-    "RUN_TORCH_RNN":  True,
-    "RUN_TORCH_LSTM": True,
-    "RUN_TORCH_ANN":  True,
+    "RUN_TORCH_RNN":  False,
+    "RUN_TORCH_LSTM": False,
+    "RUN_TORCH_ANN":  False,
     "DEEP_HYBRID": False,
 
     # KFold CV (centralized)

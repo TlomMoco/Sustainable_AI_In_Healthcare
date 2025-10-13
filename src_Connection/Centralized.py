@@ -28,14 +28,16 @@ I/O & side effects
 ------------------
 • Reads PTB-XL metadata/paths as configured by CFG
 • Writes figures under <CFG.RESULTS_DIR>/viz/
-• Prints unified evaluation DataFrame to stdout
+• Writes evaluation summary to <CFG.RESULTS_DIR>/centralized_eval.csv
+• Optionally saves best weights per model to <CFG.RESULTS_DIR>/models/
 
 Config keys referenced
 ----------------------
 SEED, VAL_FRAC, BATCH_SIZE, EPOCHS,
 BASE_LR, RECURRENT_LR, GRAD_CLIP_NORM,
 RUN_TORCH_CNN, RUN_TORCH_RNN, RUN_TORCH_LSTM, RUN_TORCH_ANN,
-CONFUSION_COLLAPSE_TO_3, RESULTS_DIR
+CONFUSION_COLLAPSE_TO_3, RESULTS_DIR,
+EARLY_STOP_PATIENCE (optional), SAVE_BEST_WEIGHTS (optional)
 
 Assumptions
 -----------
@@ -48,22 +50,22 @@ Assumptions
 
 from __future__ import annotations
 
-# --- Standard / third-party
+import csv
 import math
 from pathlib import Path
+from typing import Dict, Tuple
 
 import torch
 from torch import nn, optim
 from torch.utils.data import DataLoader
 
-# --- Project imports
 from src_Connection import config as CFG
 from src_Connection.utils import (
     set_seed,
     pick_device,
     log,
     sanitize_mps_env,
-    torch_loader_kwargs,   # stable non-shuffled eval loaders (no dropout/bn randomness)
+    torch_loader_kwargs,
 )
 from src_Connection.data_loader import (
     make_feature_table as build_feature_tables,  # returns (feature_df, features_df)
@@ -72,7 +74,7 @@ from src_Connection.data_loader import (
 from src_Connection.data_preprocessing import (
     make_label_encoder,
     make_train_val_loaders,
-    ECGDataset,                                  # to build a train-eval loader
+    ECGDataset,
 )
 from src_Connection.models import create_model
 from src_Connection.results_visualization import (
@@ -86,29 +88,7 @@ from src_Connection.results_visualization import (
 # Helper to read config (supports top-level vars or NOTEBOOK[...] fallbacks)
 # -----------------------------------------------------------------------------
 def C(name: str, default=None):
-    """Get a config value with a safe fallback.
-
-    Tries, in order:
-        1) CFG.<name> (top-level attributes in config.py)
-        2) CFG.NOTEBOOK[<name>] (if running under a notebook that injects values)
-        3) provided `default`
-
-    Why this exists:
-        Keeps this module runnable from both notebooks and plain scripts
-        without hard-coding import order or requiring every key to exist.
-
-    Parameters
-    ----------
-    name : str
-        Config key to look up.
-    default : Any
-        Value to return if not found.
-
-    Returns
-    -------
-    Any
-        The resolved config value.
-    """
+    """Get a config value with a safe fallback."""
     return getattr(CFG, name, CFG.NOTEBOOK.get(name, default))
 
 
@@ -116,37 +96,16 @@ def C(name: str, default=None):
 # Deep learning pipeline (CNN/RNN/LSTM/ANN in PyTorch)
 # -----------------------------------------------------------------------------
 def run_deep_models(seed: int | None = None) -> None:
-    """Orchestrate centralized training & evaluation for selected deep models.
-
-    Steps performed
-    ---------------
-    • Seed & device init (CPU/CUDA/MPS)                       -> utils
-    • Build engineered features & meta (DEEP subset)          -> data_loader.make_feature_table
-    • Patient-safe train/test split                           -> data_loader.train_test_split
-    • Fit label encoder on train; apply to test               -> data_preprocessing.make_label_encoder
-    • Build train/val loaders + stable train-eval loader      -> data_preprocessing & utils
-    • Train models (per CFG flags)                            -> models.create_model
-    • Evaluate via unified adapter & produce metrics table    -> results_visualization.evaluate_models
-    • Save confusion matrix & learning curves                 -> results_visualization
-
-    Parameters
-    ----------
-    seed : int | None
-        Optional seed override; defaults to C("SEED", 42).
-
-    Returns
-    -------
-    None
-    """
+    """Orchestrate centralized training & evaluation for selected deep models."""
     # ---------- Reproducibility & device selection ----------
     seed = int(seed if seed is not None else C("SEED", 42))
-    set_seed(seed)              # utils.set_seed: seeds Python/NumPy/Torch, etc.
-    sanitize_mps_env()          # utils.sanitize_mps_env: fixes MPS quirks if present
-    device = pick_device()      # utils.pick_device: selects 'cuda'/'mps'/'cpu'
+    set_seed(seed)
+    sanitize_mps_env()
+    device = pick_device()
     log(f"[Torch] device={device}")
 
     # ---------- Feature tables & split ----------
-    # Build engineered feature table + minimal meta (DEEP API).
+    # Build engineered feature table + minimal meta (DEEP subset).
     # Returns two tables; deep models use `features_df`.
     _, features_df = build_feature_tables(save_csv=True)
 
@@ -168,13 +127,11 @@ def run_deep_models(seed: int | None = None) -> None:
     is_binary = (n_classes == 2)
 
     # ---------- DataLoaders ----------
-    # Slightly larger val_frac helps stabilize validation curves on smallish sets.
     train_loader, val_loader, tr_pos, _ = make_train_val_loaders(
         train_paths, y_tr, device=device, val_frac=C("VAL_FRAC", 0.20)
     )
 
-    # Build a *stable* (non-shuffled) eval loader on the *train subset*
-    # to compute train metrics in eval mode (dropout/bn OFF).
+    # Stable (non-shuffled) train-eval loader to compute *eval-mode* train metrics
     train_eval_ds = ECGDataset(train_paths[tr_pos], y_tr[tr_pos])
     train_eval_loader = DataLoader(
         train_eval_ds, **torch_loader_kwargs(False, C("BATCH_SIZE", 24), device.type)
@@ -182,74 +139,42 @@ def run_deep_models(seed: int | None = None) -> None:
 
     # ---------- Loss selection ----------
     def _criterion():
-        """Select appropriate loss function for binary vs multi-class tasks."""
         return nn.BCEWithLogitsLoss() if is_binary else nn.CrossEntropyLoss()
 
     # ---------- Evaluation helper (single pass) ----------
     @torch.no_grad()
-    def _eval_epoch(model, loader):
-        """Run evaluation pass over `loader` and compute loss & accuracy.
-
-        • Puts model in eval() to disable dropout/batchnorm updates.
-        • For binary: applies sigmoid + 0.5 threshold for class prediction.
-        • For multi-class: argmax over logits.
-
-        Returns
-        -------
-        (loss_mean: float, acc: float)
-        """
+    def _eval_epoch(model, loader) -> Tuple[float, float]:
+        """Return (loss_mean, accuracy) on `loader`."""
         model.eval()
         crit = _criterion()
         total, correct, loss_sum = 0, 0, 0.0
         for xb, yb in loader:
             xb, yb = xb.to(device), yb.to(device)
             logits = model(xb)
-            # BCE expects float targets; CE expects class indices.
             loss = crit(logits.view(-1), yb.float()) if is_binary else crit(logits, yb)
             loss_sum += loss.item() * xb.size(0)
             preds = (torch.sigmoid(logits.view(-1)) >= 0.5).long() if is_binary else logits.argmax(1)
             correct += (preds == yb).sum().item()
             total += xb.size(0)
-        return (loss_sum / total if total else math.nan), (correct / total if total else math.nan)
+        loss_mean = loss_sum / total if total else math.nan
+        acc = correct / total if total else math.nan
+        return loss_mean, acc
 
     # ---------- Train a single model type ----------
     def train_model_torch(name: str, epochs: int | None = None):
-        """Train one model (CNN/RNN/LSTM/ANN) and return (model, history).
-
-        Parameters
-        ----------
-        name : {"cnn","rnn","lstm","ann"}
-            Model key understood by models.create_model.
-        epochs : int | None
-            Number of epochs; defaults to C("EPOCHS", 12).
-
-        Training details
-        ----------------
-        • Optimizer: Adam
-        • LR schedule: ReduceLROnPlateau on val_loss (min mode)
-        • Optional gradient clipping via CFG.GRAD_CLIP_NORM
-        • Tracks *eval-mode* train loss/acc (via stable train_eval_loader)
-          and val loss/acc each epoch.
-        • Keeps the best snapshot by lowest val_loss (no early stop—just best state).
-
-        Returns
-        -------
-        model : torch.nn.Module
-            Best-scoring model (by val_loss).
-        hist : dict[str, list[float]]
-            History with keys: loss, val_loss, accuracy, val_accuracy.
-        """
+        """Train one model (CNN/RNN/LSTM/ANN) and return (model, history)."""
         epochs = int(epochs if epochs is not None else C("EPOCHS", 12))
         model = create_model(name, n_classes, binary=is_binary).to(device)
 
-        # Smaller LR for recurrent/ANN models (empirical stability).
         base_lr = C("RECURRENT_LR", 2e-4) if name.lower() in {"rnn", "lstm", "ann"} else C("BASE_LR", 3e-4)
         opt = optim.Adam(model.parameters(), lr=base_lr)
         sch = optim.lr_scheduler.ReduceLROnPlateau(opt, mode="min", factor=0.5, patience=2, min_lr=1e-5)
         crit = _criterion()
 
-        hist = {"loss": [], "val_loss": [], "accuracy": [], "val_accuracy": []}
+        hist: Dict[str, list] = {"loss": [], "val_loss": [], "accuracy": [], "val_accuracy": []}
         best_state, best_val = None, float("inf")
+        no_improve = 0
+        early_pat = C("EARLY_STOP_PATIENCE", None)
 
         for ep in range(1, epochs + 1):
             # --- train phase (dropout ON) ---
@@ -267,29 +192,33 @@ def run_deep_models(seed: int | None = None) -> None:
                 ep_loss += loss.item() * xb.size(0)
                 ep_total += xb.size(0)
 
-            train_loss_trainmode = ep_loss / max(1, ep_total)
-
             # --- metrics in EVAL mode (dropout OFF) ---
             tr_loss, tr_acc = _eval_epoch(model, train_eval_loader)
             va_loss, va_acc = _eval_epoch(model, val_loader)
             sch.step(va_loss if not math.isnan(va_loss) else tr_loss)
 
             # Log eval-mode train metrics (stable) and validation metrics
-            hist["loss"].append(tr_loss)           # eval-mode train loss
-            hist["accuracy"].append(tr_acc)        # eval-mode train acc
+            hist["loss"].append(tr_loss)
+            hist["accuracy"].append(tr_acc)
             hist["val_loss"].append(va_loss)
             hist["val_accuracy"].append(va_acc)
 
             print(
                 f"[{name}] epoch {ep:02d}/{epochs}  "
-                f"train(loss={train_loss_trainmode:.4f}→eval {tr_loss:.4f} acc={tr_acc:.4f})  "
+                f"train(eval loss={tr_loss:.4f} acc={tr_acc:.4f})  "
                 f"val(loss={va_loss:.4f} acc={va_acc:.4f})"
             )
 
-            # Track best by validation loss; snapshot weights (no early stop)
+            # Track best by validation loss; snapshot weights (no early stop—unless configured)
             if va_loss < best_val:
                 best_val = va_loss
                 best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+                no_improve = 0
+            else:
+                no_improve += 1
+                if early_pat is not None and no_improve >= int(early_pat):
+                    print(f"[{name}] Early stop at epoch {ep} (patience={early_pat})")
+                    break
 
         # Restore best parameters before returning
         if best_state is not None:
@@ -299,6 +228,9 @@ def run_deep_models(seed: int | None = None) -> None:
     # ---------- Train selected models based on CFG flags ----------
     histories: dict[str, dict] = {}
     deep_models_raw: dict[str, torch.nn.Module] = {}
+    model_dir = Path(C("RESULTS_DIR", Path("results"))) / "models"
+    model_dir.mkdir(parents=True, exist_ok=True)
+
     for name, flag in [
         ("cnn",  C("RUN_TORCH_CNN",  True)),
         ("rnn",  C("RUN_TORCH_RNN",  True)),
@@ -310,12 +242,26 @@ def run_deep_models(seed: int | None = None) -> None:
             continue
         print(f"\n[Train] === {name.upper()} ===")
         m, h = train_model_torch(name)
-        tag = f"{name.UPPER()} (PyTorch)" if hasattr(name, "UPPER") else f"{name.upper()} (PyTorch)"
+        tag = f"{name.upper()} (PyTorch)"
         deep_models_raw[tag] = m
         histories[tag] = h
 
+        # Optionally save best weights per model
+        if C("SAVE_BEST_WEIGHTS", True):
+            fp = model_dir / f"best_{name.lower()}.pt"
+            torch.save(m.state_dict(), fp)
+            print("Saved weights:", fp)
+
+        # Also save training history as CSV for reproducibility
+        hist_csv = model_dir / f"history_{name.lower()}.csv"
+        with open(hist_csv, "w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(["epoch", "loss", "val_loss", "accuracy", "val_accuracy"])
+            for i in range(len(h.get("loss", []))):
+                w.writerow([i + 1, h["loss"][i], h["val_loss"][i], h["accuracy"][i], h["val_accuracy"][i]])
+        print("Saved history:", hist_csv)
+
     # ---------- Evaluate on TEST (unified interface via TorchAdapter) ----------
-    # TorchAdapter signature varies across versions (device may be optional).
     try:
         adapters = {
             name: TorchAdapter(m, le, is_binary, batch=C("BATCH_SIZE", 24), device=device)
@@ -331,9 +277,15 @@ def run_deep_models(seed: int | None = None) -> None:
     print("\nUnified evaluation:")
     print(unified_df)
 
+    # Persist evaluation table
+    results_csv = Path(C("RESULTS_DIR", Path("results"))) / "centralized_eval.csv"
+    results_csv.parent.mkdir(parents=True, exist_ok=True)
+    unified_df.to_csv(results_csv, index=False)
+    print("Saved evaluation:", results_csv)
+
     # ---------- Visualization outputs ----------
-    viz_dir = C("RESULTS_DIR", Path("results")) / "viz"
-    Path(viz_dir).mkdir(parents=True, exist_ok=True)
+    viz_dir = Path(C("RESULTS_DIR", Path("results"))) / "viz"
+    viz_dir.mkdir(parents=True, exist_ok=True)
 
     # Confusion matrix for top entry (if any)
     if not unified_df.empty:
@@ -343,7 +295,7 @@ def run_deep_models(seed: int | None = None) -> None:
         plot_confusion(
             y_te, y_pred,
             title=f"Confusion — {best_name}",
-            save_path=str(Path(viz_dir) / f"confusion_{best_name.replace(' ', '_')}.png"),
+            save_path=str(viz_dir / f"confusion_{best_name.replace(' ', '_')}.png"),
             collapse_to_3=C("CONFUSION_COLLAPSE_TO_3", False),
         )
 
