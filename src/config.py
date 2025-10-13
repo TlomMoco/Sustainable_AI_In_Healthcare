@@ -70,7 +70,7 @@ FREEZE_CFG = {
     "freeze_mode": "gated", # "gated" or "static"
 }
 # For logging (results/[name].csv) frozen layers vs not (True/False) manually
-FREEZE_ENABLED = False       # toggle this for frozen/non-frozen run
+FREEZE_ENABLED = True       # toggle this for frozen/non-frozen run
 
 # -------------------------------------------------------------------------
 # Normalization Parameters
@@ -99,7 +99,7 @@ EXPERIMENT = {
 
 TUNING = {
     "enabled": False,                   # run CV now?
-    "use_cached_best": True,           # if enabled=False, load best params from disk if available
+    "use_cached_best": False,           # if enabled=True, use cached best params if available
     "log_phase": True,                  # log tuning phase in results?
     "log_mode": "same",                 # "same" or "separate" CSV for tuning vs non-tuning
     "phase_labels": {
