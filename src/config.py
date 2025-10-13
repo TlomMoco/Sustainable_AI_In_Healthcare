@@ -39,8 +39,8 @@ DATA_ROOT = DATA_DIR
 TUNING_DIR = RESULTS_DIR / "tuning"
 
 # Feature/EDA artifacts
-ART_DIR = RESULTS_DIR / "artifacts"           # where feature CSVs or EDA dumps can go
-ART_DIR.mkdir(parents=True, exist_ok=True)
+# ART_DIR = RESULTS_DIR / "artifacts"           # where feature CSVs or EDA dumps can go
+# ART_DIR.mkdir(parents=True, exist_ok=True)
 
 # Choose which feature set make_feature_table() should produce:
 #   "basic36"  -> your current mean/std/rms per lead (36D)
