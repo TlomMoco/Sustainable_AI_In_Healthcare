@@ -20,7 +20,6 @@ from src.models import create_model
 # ----------------------------- data utils -------------------------------
 def _tensor_dataset_from_df(df: pd.DataFrame, mu: np.ndarray, sigma: np.ndarray, eps: float = 1e-6):
     X, y = [], []
-    cls2idx = {c: i for i, c in enumerate(range(N_CLASSES))}
     # df must already have 'y' as class index; if not, cast via provided mapping.
     for _, row in df.iterrows():
         sig = load_waveform(row, sampling_rate=SAMPLE_RATE)  # (12, T)
@@ -124,9 +123,10 @@ def run_client_cv(
 
     # Guard: don't request more folds than unique patients (unlikely)
     unique_groups = int(np.unique(groups).size)
-    eff_k = min(int(k), unique_groups)
-    print(f"[CV] rows={len(df_train)}, unique_patients={unique_groups}, requested_k={k}, effective_k={eff_k}")
-    if eff_k < 2:
+    eff_k = max(2, min(int(k), unique_groups))  # clamp: 2 <= eff_k <= #unique patients
+    print(f"[CV] rows={len(df_train)}, unique_patients={unique_groups}, "
+          f"requested_k={k}, effective_k={eff_k}")
+    if eff_k < 2:  # extra safeguard for degenerate cases
         return {"best": None, "best_mean_acc": 0.0}
 
     # Grouped by patient_id to avoid leakage
