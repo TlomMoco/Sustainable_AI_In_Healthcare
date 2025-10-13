@@ -11,6 +11,23 @@ Launch order (multi-terminal):
     $ python -m src_Connection.Client --cid 1 # Terminal 3
     $ python -m src_Connection.Client --cid 2 # ...
     $ python -m src_Connection.Client --cid 3
+
+Where this module connects
+--------------------------
+• Starts a Flower (flwr) server that coordinates clients launched by
+  `src_Connection.Client` (PTBClient).
+• Aggregates metrics emitted from each client’s `evaluate()` and `fit()`.
+• Writes round-level GLOBAL metrics, per-class accuracy, and confusion matrices
+  to CSVs under `config.RESULTS_DIR` for downstream visualization:
+  - `src_Connection.results_visualization` reads these CSVs to make plots/ANOVA.
+• Reads FL hyperparameters and experiment names from `src_Connection.config`.
+
+Outputs (CSV)
+-------------
+• <run_name>.csv                — round-level GLOBAL accuracy/loss (and client logs from clients)
+• <run_name>_perclass.csv       — per-class accuracy derived from CM each round
+• <run_name>_cm.csv             — confusion matrices in long format (true,pred,count)
+• results/viz/*.png             — (optional) confusion heatmaps if enabled
 """
 
 from __future__ import annotations
@@ -32,25 +49,38 @@ except ImportError as e:
         "  pip install 'flwr==1.*'"
     ) from e
 
+# --- Project configuration (server knobs, output dirs, label space) ---------
 from src_Connection.config import (
-    CLIENTS,
-    FREEZE_CFG,
-    ROUNDS,
-    RESULTS_DIR,
-    EXPERIMENT,
-    N_CLASSES,
-    TUNING,
-    SUPERCLASSES,
-    FL_SERVER_ADDRESS,  # use address from config
+    CLIENTS,              # total number of clients expected to connect
+    FREEZE_CFG,           # passed to clients to coordinate unfreeze schedule
+    ROUNDS,               # total FL rounds
+    RESULTS_DIR,          # where CSVs and viz are stored
+    EXPERIMENT,           # run_name to namespace outputs
+    N_CLASSES,            # for confusion matrix sizing
+    TUNING,               # logging-phase controls (pre/post CV)
+    SUPERCLASSES,         # label order for per-class accuracy header
+    FL_SERVER_BIND,       # <-- server bind address (e.g., "0.0.0.0:8080")
 )
+from src_Connection.utils import ensure_dir
 
 
 # -------------------------------------------------------------------------
 # Helper methods for logging
 # -------------------------------------------------------------------------
 def _append_global_row(server_round: int, acc: float, loss: float) -> None:
-    """Append a GLOBAL row with round-level metrics to the results CSV."""
-    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    """Append a GLOBAL row with round-level metrics to the results CSV.
+
+    Called from:
+      • LoggingFedAvg.aggregate_evaluate(...)
+
+    Writes to:
+      • RESULTS_DIR / f"{EXPERIMENT['run_name']}.csv"
+        or phase-suffixed file if TUNING['log_mode'] == 'separate'.
+
+    Columns:
+      client_id=GLOBAL, round, accuracy, loss, (phase if combined log mode)
+    """
+    ensure_dir(RESULTS_DIR)
     exp = EXPERIMENT["run_name"]
 
     if TUNING.get("log_phase"):
@@ -79,7 +109,21 @@ def _append_global_row(server_round: int, acc: float, loss: float) -> None:
 
 
 def _append_perclass_row(server_round: int, cm: np.ndarray) -> None:
-    """Append per-class accuracy (derived from confusion matrix) for this round."""
+    """Append per-class accuracy (derived from confusion matrix) for this round.
+
+    Inputs
+    ------
+    server_round : int
+        Current FL round (1-based).
+    cm : np.ndarray [N_CLASSES, N_CLASSES]
+        Aggregated confusion counts across clients for this round.
+
+    Output CSV
+    ----------
+    RESULTS_DIR / f"{EXPERIMENT['run_name']}_perclass.csv"
+      Columns: ["round"] + ["acc_<class>" for class in SUPERCLASSES]
+    """
+    ensure_dir(RESULTS_DIR)
     path = RESULTS_DIR / f"{EXPERIMENT['run_name']}_perclass.csv"
     header = ["round"] + [f"acc_{c}" for c in SUPERCLASSES]
     write_header = not path.exists()
@@ -93,7 +137,17 @@ def _append_perclass_row(server_round: int, cm: np.ndarray) -> None:
 
 
 def _append_confusion_rows(server_round: int, cm: np.ndarray) -> None:
-    """Append confusion matrix rows in long format (true, pred, count)."""
+    """Append confusion matrix in long format: (round, true, pred, count).
+
+    Output CSV
+    ----------
+    RESULTS_DIR / f"{EXPERIMENT['run_name']}_cm.csv"
+      Columns: round, true, pred, count
+
+    Used by:
+      • results_visualization.py → confusion heatmaps & last-round CM plots.
+    """
+    ensure_dir(RESULTS_DIR)
     path = RESULTS_DIR / f"{EXPERIMENT['run_name']}_cm.csv"
     write_header = not path.exists()
     with open(path, "a", newline="") as f:
@@ -107,9 +161,13 @@ def _append_confusion_rows(server_round: int, cm: np.ndarray) -> None:
 
 
 def _save_confusion_heatmap(cm: np.ndarray, server_round: int) -> None:
-    """(Optional) Save a row-normalized confusion matrix heatmap for this round."""
+    """(Optional) Save a row-normalized confusion matrix heatmap for this round.
+
+    Note: Disabled by default for speed; uncomment call in LoggingFedAvg to enable.
+    Writes PNG to RESULTS_DIR / "viz".
+    """
     viz = RESULTS_DIR / "viz"
-    viz.mkdir(parents=True, exist_ok=True)
+    ensure_dir(viz)
     with np.errstate(invalid="ignore", divide="ignore"):
         cmn = cm / cm.sum(axis=1, keepdims=True)
         cmn = np.nan_to_num(cmn)
@@ -127,12 +185,24 @@ def _save_confusion_heatmap(cm: np.ndarray, server_round: int) -> None:
 # Metric aggregation (weighted average over client examples)
 # -------------------------------------------------------------------------
 def weighted_average(metrics: List[Tuple[int, Dict[str, float]]]) -> Dict[str, float]:
-    """
-    Compute weighted average of client metrics.
-    Args:
-        metrics: List of (num_examples, {"accuracy": value, ...}) pairs.
-    Returns:
-        Dict[str, float]: Weighted average metrics (currently accuracy only).
+    """Compute weighted average of client metrics (e.g., accuracy).
+
+    Flower passes per-client evaluation metrics as (num_examples, metrics_dict).
+
+    Parameters
+    ----------
+    metrics : list of (int, dict)
+        For each client: (number of examples used in evaluation, {"accuracy": ...})
+
+    Returns
+    -------
+    dict
+        {"accuracy": weighted_mean} where weights are num_examples.
+
+    Connected to
+    ------------
+    • LoggingFedAvg(strategy).aggregate_evaluate() via
+      'evaluate_metrics_aggregation_fn=weighted_average'.
     """
     total_examples = sum(num_examples for num_examples, _ in metrics)
     if total_examples == 0:
@@ -146,16 +216,33 @@ def weighted_average(metrics: List[Tuple[int, Dict[str, float]]]) -> Dict[str, f
 # Custom FedAvg strategy with logging hooks
 # -------------------------------------------------------------------------
 class LoggingFedAvg(fl.server.strategy.FedAvg):
-    """FedAvg that also logs GLOBAL metrics and confusion matrices per round."""
+    """FedAvg that also logs GLOBAL metrics and confusion matrices per round.
+
+    Hook points
+    -----------
+    • aggregate_evaluate:
+        - Calls parent to compute aggregated loss/metrics.
+        - Logs GLOBAL (server-side) accuracy/loss to CSV.
+        - Aggregates per-class confusion from client metrics and logs both:
+            * per-class accuracy row
+            * long-format CM
+
+    Inputs from clients
+    -------------------
+    • Client.evaluate(...) in src_Connection.Client emits:
+        - metrics["accuracy"] as float
+        - metrics["cm_i_j"] for each (i, j) cell of confusion matrix
+    """
 
     def aggregate_evaluate(self, server_round, results, failures):
+        # Let the base FedAvg compute aggregated (loss, metrics)
         agg = super().aggregate_evaluate(server_round, results, failures)
         if agg is not None:
             loss, metrics = agg
             acc = float(metrics.get("accuracy", 0.0))
             _append_global_row(server_round, acc, loss)
 
-        # Aggregate confusion matrix contributed by each client
+        # Aggregate confusion matrix contributed by each client (sum counts)
         cm = np.zeros((N_CLASSES, N_CLASSES), dtype=np.float64)
         for _, evalres in results:
             m = evalres.metrics or {}
@@ -168,7 +255,7 @@ class LoggingFedAvg(fl.server.strategy.FedAvg):
 
         _append_perclass_row(server_round, cm)
         _append_confusion_rows(server_round, cm)
-        # If you want per-round images, uncomment below (slower):
+        # If you want per-round images, uncomment below (slower due to PNG I/O):
         # _save_confusion_heatmap(cm, server_round)
         return agg
 
@@ -177,21 +264,44 @@ class LoggingFedAvg(fl.server.strategy.FedAvg):
 # FL server launcher (multi-terminal)
 # -------------------------------------------------------------------------
 def start_server():
-    """Start the Flower server and define training strategy for multi-terminal runs."""
+    """Start the Flower server and define training strategy for multi-terminal runs.
+
+    What it configures
+    ------------------
+    • on_fit_config_fn: a function that sends dynamic config to clients each round.
+      - We pass 'round' and 'unfreeze_after' (from FREEZE_CFG) to let clients
+        coordinate dynamic freezing/unfreezing policies (see Client._apply_freeze_policy).
+    • LoggingFedAvg strategy:
+      - Client thresholds: min_fit_clients == min_available_clients == CLIENTS
+      - Aggregators:
+          evaluate_metrics_aggregation_fn = weighted_average
+          fit_metrics_aggregation_fn      = lambda mets: {}  (silence unused warning)
+    • Server bind address/rounds:
+      - server_address = config.FL_SERVER_BIND (e.g., "0.0.0.0:8080")
+      - num_rounds     = config.ROUNDS
+
+    Connected files
+    ---------------
+    • src_Connection.Client (PTBClient):
+        - Receives on_fit_config_fn dict each round.
+        - Performs local fit/eval and returns metrics.
+    • src_Connection.Experiments:
+        - The `federated` subcommand can spawn this server and multiple clients.
+    """
 
     def on_fit_config_fn(rnd: int) -> Dict[str, int]:
         # Sent to clients each round; clients can use 'round' and schedule logic
         return {"round": rnd, "unfreeze_after": int(FREEZE_CFG["unfreeze_after"])}
 
     strategy = LoggingFedAvg(
-        min_fit_clients=int(CLIENTS),
-        min_available_clients=int(CLIENTS),
-        evaluate_metrics_aggregation_fn=weighted_average,
-        fit_metrics_aggregation_fn=lambda mets: {},  # silence fit-metrics warning
-        on_fit_config_fn=on_fit_config_fn,
+        min_fit_clients=int(CLIENTS),        # require all clients for fit
+        min_available_clients=int(CLIENTS),  # block until all clients are connected
+        evaluate_metrics_aggregation_fn=weighted_average,  # global accuracy = weighted mean
+        fit_metrics_aggregation_fn=lambda mets: {},        # ignore fit metrics aggregation
+        on_fit_config_fn=on_fit_config_fn,                 # per-round config to clients
     )
 
-    addr = str(FL_SERVER_ADDRESS)  # e.g., "127.0.0.1:8080" from config.py
+    addr = str(FL_SERVER_BIND)  # e.g., "0.0.0.0:8080" from config.py
     print(f"[Server] Starting Flower @ {addr}  |  rounds={int(ROUNDS)}  |  clients={int(CLIENTS)}")
     fl.server.start_server(
         server_address=addr,
