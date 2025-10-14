@@ -44,8 +44,10 @@ def title_of(base: str, run_name: str, model_key: str) -> str:
     return f"{base} — {PRETTY_RUN.get(run_name, run_name)} — {PRETTY_MODEL.get(model_key, model_key.upper())}"
 
 RUNS, PERCLS_MAP, CONF_MAP = _discover_runs()
-OUT = RESULTS_DIR / "viz" / f"FL_Training_{MODEL['type'].upper()}"
-ensure_dir(OUT)
+
+# NOTE: Removed the single global OUT. We'll create a per-model OUT instead.
+# OUT = RESULTS_DIR / "viz" / f"FL_Training_{MODEL['type'].upper()}"
+# ensure_dir(OUT)
 
 # Phase labels written by training
 PHASE_ENABLED  = "post_cv"
@@ -117,16 +119,29 @@ def _collapse_rows(df: pd.DataFrame, keys: list[str]) -> pd.DataFrame:
                   .drop(columns="_p"))
     return df.sort_values(keys).drop_duplicates(keys, keep="last")
 
+# Per-model OUT helper
+def _out_dir_for(model_key: str) -> Path:
+    """Return and ensure the output directory for a given model (CNN/LSTM)."""
+    pretty = PRETTY_MODEL.get(model_key, model_key.upper())
+    d = RESULTS_DIR / "viz" / f"FL_Training_{pretty}"
+    ensure_dir(d)
+    return d
 
 # -------------------------------------------------------------------------
 # Plotting
 # -------------------------------------------------------------------------
+
+_saved_dirs = set()
 
 for model in dfs_by_model.keys():
     dfs       = dfs_by_model[model]
     percls    = percls_by_model.get(model, {})
     conf_long = conf_long_by_model.get(model, {})
     SFX = f"_{model}"
+
+    # Create per-model OUT directory
+    outdir = _out_dir_for(model)
+    _saved_dirs.add(str(outdir.resolve()))
 
     # Global accuracy vs round
     plt.figure()
@@ -137,7 +152,7 @@ for model in dfs_by_model.keys():
     plt.xlabel("Round"); plt.ylabel("Accuracy")
     plt.title(title_of("Global Accuracy per Round", "non_frozen", model))
     plt.legend(); plt.grid(True); plt.tight_layout()
-    plt.savefig(OUT / f"global_accuracy{SFX}.png", dpi=150); plt.close()
+    plt.savefig(outdir / f"global_accuracy{SFX}.png", dpi=150); plt.close()
 
     # Client accuracies vs round (with GLOBAL overlay)
     for name, df in dfs.items():
@@ -153,7 +168,7 @@ for model in dfs_by_model.keys():
         plt.xlabel("Round"); plt.ylabel("Accuracy")
         plt.title(title_of("Client vs Global Accuracy", name, model))
         plt.legend(ncol=2); plt.grid(True); plt.tight_layout()
-        plt.savefig(OUT / f"clients_vs_global_{name}{SFX}.png", dpi=150); plt.close()
+        plt.savefig(outdir / f"clients_vs_global_{name}{SFX}.png", dpi=150); plt.close()
 
     # Mean client accuracy per round (not GLOBAL)
     plt.figure()
@@ -168,7 +183,7 @@ for model in dfs_by_model.keys():
     plt.xlabel("Round"); plt.ylabel("Mean Client Accuracy")
     plt.title(title_of("Mean Client Accuracy per Round", "non_frozen", model))
     plt.legend(); plt.grid(True); plt.tight_layout()
-    plt.savefig(OUT / f"global_mean_accuracy{SFX}.png", dpi=150); plt.close()
+    plt.savefig(outdir / f"global_mean_accuracy{SFX}.png", dpi=150); plt.close()
 
     # Wall-time per round (total across clients)
     for name, df in dfs.items():
@@ -187,7 +202,7 @@ for model in dfs_by_model.keys():
         plt.xlabel("Round"); plt.ylabel("Total client wall-time (s)")
         plt.title(title_of("Total Wall-Time per Round", name, model))
         plt.grid(True); plt.tight_layout()
-        plt.savefig(OUT / f"walltime_{name}{SFX}.png", dpi=150); plt.close()
+        plt.savefig(outdir / f"walltime_{name}{SFX}.png", dpi=150); plt.close()
 
     # Per-client trajectories (frozen vs non-frozen, one figure)
     if all(k in dfs for k in ("frozen", "non_frozen")):
@@ -228,7 +243,7 @@ for model in dfs_by_model.keys():
         plt.xlabel("Round"); plt.ylabel("Local Accuracy")
         plt.title(title_of("Per-Client Accuracy Trajectories (Frozen vs Unfrozen)", "non_frozen", model))
         plt.legend(ncol=2); plt.grid(True); plt.tight_layout()
-        plt.savefig(OUT / f"per_client_trajectories{SFX}.png", dpi=150); plt.close()
+        plt.savefig(outdir / f"per_client_trajectories{SFX}.png", dpi=150); plt.close()
 
     # Per-client accuracy lines per run (no GLOBAL)
     for name, df in dfs.items():
@@ -241,7 +256,7 @@ for model in dfs_by_model.keys():
         plt.xlabel("Round"); plt.ylabel("Accuracy")
         plt.title(title_of("Per-Client Accuracy", name, model))
         plt.legend(ncol=2); plt.grid(True); plt.tight_layout()
-        plt.savefig(OUT / f"per_client_accuracy_{name}{SFX}.png", dpi=150); plt.close()
+        plt.savefig(outdir / f"per_client_accuracy_{name}{SFX}.png", dpi=150); plt.close()
 
     # Per-class accuracy over rounds (line plot)
     if percls:
@@ -257,7 +272,7 @@ for model in dfs_by_model.keys():
         plt.xlabel("Round"); plt.ylabel("Per-class Accuracy")
         plt.title(title_of("Per-class Accuracy per Round", "non_frozen", model))
         plt.legend(ncol=2); plt.grid(True); plt.tight_layout()
-        plt.savefig(OUT / f"perclass_over_rounds{SFX}.png", dpi=150); plt.close()
+        plt.savefig(outdir / f"perclass_over_rounds{SFX}.png", dpi=150); plt.close()
 
     # Final-round per-class accuracy (bar)
     if percls:
@@ -277,7 +292,7 @@ for model in dfs_by_model.keys():
         plt.xticks(x, labels); plt.ylabel("Accuracy")
         plt.title(title_of("Final-Round Per-class Accuracy", "non_frozen", model))
         plt.legend(); plt.tight_layout()
-        plt.savefig(OUT / f"perclass_final_bar{SFX}.png", dpi=150); plt.close()
+        plt.savefig(outdir / f"perclass_final_bar{SFX}.png", dpi=150); plt.close()
 
     # Confusion heatmaps (last round of each run)
     for name, dfc in conf_long.items():
@@ -300,7 +315,7 @@ for model in dfs_by_model.keys():
         plt.yticks(range(n), SUPERCLASSES)
         plt.colorbar(label="Row-normalized")
         plt.tight_layout()
-        plt.savefig(OUT / f"confusion_{name}{SFX}_r{r:02d}.png", dpi=150); plt.close()
+        plt.savefig(outdir / f"confusion_{name}{SFX}_r{r:02d}.png", dpi=150); plt.close()
 
     # Global accuracy by phase (within each run)
     for name, df in dfs.items():
@@ -320,7 +335,7 @@ for model in dfs_by_model.keys():
         plt.xlabel("Round"); plt.ylabel("Global Accuracy")
         plt.title(title_of("Global Accuracy by Phase", name, model))
         plt.legend(); plt.grid(True); plt.tight_layout()
-        plt.savefig(OUT / f"global_by_phase_{name}{SFX}.png", dpi=150); plt.close()
+        plt.savefig(outdir / f"global_by_phase_{name}{SFX}.png", dpi=150); plt.close()
 
     # Per-client accuracy by phase (overlay pre/cached/post)
     for name, df in dfs.items():
@@ -339,6 +354,8 @@ for model in dfs_by_model.keys():
         plt.xlabel("Round"); plt.ylabel("Local Accuracy")
         plt.title(title_of("Per-Client Accuracy by Phase", name, model))
         plt.legend(ncol=2); plt.grid(True); plt.tight_layout()
-        plt.savefig(OUT / f"clients_by_phase_{name}{SFX}.png", dpi=150); plt.close()
+        plt.savefig(outdir / f"clients_by_phase_{name}{SFX}.png", dpi=150); plt.close()
 
-print(f"Saved plots to: {OUT.resolve()}")
+print("Saved plots to:")
+for d in sorted(_saved_dirs):
+    print(f" - {d}")

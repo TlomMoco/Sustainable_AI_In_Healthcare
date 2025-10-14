@@ -201,20 +201,20 @@ BAR_BASE = 0.32
 SPREAD_BASE = 1.00
 GAP_FRAC_GROUPED = 0.08
 
-
+# -- Text wrapping helper ----------------------------------------------------------------
 def _wrap(names: Iterable[str], width: int = 12) -> list[str]:
     import textwrap
     return ["\n".join(textwrap.wrap(str(n), width=width)) for n in names]
 
-
+# -- X positions helper -----------------------------------------------------------------
 def _x_positions(n: int, spread: float = SPREAD_BASE):
     return np.arange(n) * spread
 
-
+# -- Bar width helper -------------------------------------------------------------------
 def _bar_width(n: int, base: float = BAR_BASE):
     return float(np.clip(base, 0.18, 0.45))
 
-
+# -- Sex normalization helper ------------------------------------------------------
 def _sex_norm(series: pd.Series) -> pd.Series:
     out = pd.Series("unknown", index=series.index, dtype="string")
     s_num = pd.to_numeric(series, errors="coerce")
@@ -227,7 +227,7 @@ def _sex_norm(series: pd.Series) -> pd.Series:
     out.loc[s.isin({"female","woman"})] = "female"
     return out
 
-
+# -- Axis prettification helper ---------------------------------------------------------
 def _prettify_axes(ax: plt.Axes):
     ax.grid(axis="y", alpha=0.25, linestyle="--", linewidth=0.6)
     for s in ("top", "right"):
@@ -235,13 +235,13 @@ def _prettify_axes(ax: plt.Axes):
     ax.tick_params(axis="both", labelsize=10)
     ax.yaxis.set_major_formatter(FuncFormatter(lambda v, p: f"{int(v):,}"))
 
-
+# -- Text with outline helper -----------------------------------------------------------
 def _text_with_outline(ax, x, y, s, fontsize=10, color="#111", outline_width=2.0, outline_color="white", **kwargs):
     t = ax.text(x, y, s, ha="center", va="bottom", fontsize=fontsize, color=color, **kwargs)
     t.set_path_effects([pe.Stroke(linewidth=outline_width, foreground=outline_color), pe.Normal()])
     return t
 
-
+# -- Freedman-Diaconis binning helper ---------------------------------------------------
 def _fd_bins(x: np.ndarray, min_bins=20, max_bins=60):
     x = np.asarray(x, dtype=float)
     x = x[np.isfinite(x)]
@@ -256,7 +256,7 @@ def _fd_bins(x: np.ndarray, min_bins=20, max_bins=60):
     bins = int(np.ceil((x.max() - x.min()) / bw))
     return int(np.clip(bins, min_bins, max_bins))
 
-
+# -- Bar annotation helper ----------------------------------------------------------------
 def _annot_bars(ax, xs, ys, fmt="{:,}", dy_frac=0.02, fontsize=10):
     if len(ys) == 0:
         return
@@ -266,6 +266,105 @@ def _annot_bars(ax, xs, ys, fmt="{:,}", dy_frac=0.02, fontsize=10):
         if np.isfinite(y):
             s = fmt.format(int(round(y))) if fmt == "{:,}" else fmt.format(y)
             _text_with_outline(ax, x, y + dy, s, fontsize=fontsize)
+
+# -- Correlation heatmap among ANOVA top-K features --------------------------------------
+def plot_anova_topk_corr_heatmap(feature_df: pd.DataFrame, outdir: Path, top_k: int = 25):
+    """
+    Correlation heatmap among the ANOVA top-K features.
+    Reuses outdir/tables/table_anova_fscores_topK.csv if present; otherwise computes inline.
+    Exports:
+      - tables/table_anova_topK_corr_spearman.csv   (|r| Spearman matrix among top-K)
+    Saves:
+      - eda_anova_topK_corr_heatmap.png
+    """
+    if feature_df.empty or "label" not in feature_df.columns:
+        return
+
+    tables_dir = outdir / "tables"
+    topk_csv = tables_dir / "table_anova_fscores_topK.csv"
+    top_feats = None
+
+    # Try to reuse previously saved ANOVA top-K table
+    if topk_csv.exists():
+        try:
+            top_df = pd.read_csv(topk_csv)
+            if "feature" in top_df.columns and not top_df.empty:
+                top_feats = top_df["feature"].astype(str).tolist()[: int(top_k)]
+        except Exception:
+            top_feats = None
+
+    # Fallback: compute ANOVA top-K inline (mirrors run_anova_selectkbest)
+    if top_feats is None:
+        try:
+            from sklearn.feature_selection import f_classif, VarianceThreshold
+            from sklearn.impute import SimpleImputer
+            from sklearn.preprocessing import LabelEncoder
+        except Exception:
+            print("(ANOVA-topK) sklearn not available — skipping ANOVA-topK correlation heatmap")
+            return
+
+        X_num = feature_df.drop(columns=["label"], errors="ignore").select_dtypes(include=[np.number]).copy()
+        if X_num.shape[1] == 0:
+            print("(ANOVA-topK) No numeric features — skipping")
+            return
+        X_num = X_num.replace([np.inf, -np.inf], np.nan)
+        y_all = feature_df["label"].astype(str).copy()
+
+        vt = VarianceThreshold(threshold=1e-12)
+        try:
+            X_vt = vt.fit_transform(X_num)
+        except Exception:
+            print("(ANOVA-topK) VarianceThreshold removed all features — skipping")
+            return
+        cols_vt = X_num.columns[vt.get_support()]
+        if len(cols_vt) == 0:
+            print("(ANOVA-topK) All numeric features constant — skipping")
+            return
+
+        imp = SimpleImputer(strategy="median")
+        X_imp = imp.fit_transform(X_vt)
+        y_enc = LabelEncoder().fit_transform(y_all.values)
+
+        F, p = f_classif(X_imp, y_enc)
+        F = np.clip(F, 0, None)
+        full = (
+            pd.DataFrame({"feature": cols_vt, "F_score": F, "p_value": p})
+            .sort_values("F_score", ascending=False)
+            .reset_index(drop=True)
+        )
+        k = int(min(max(1, top_k), full.shape[0]))
+        top_feats = full.head(k)["feature"].tolist()
+
+    # Build correlation among the selected features (Spearman |r|)
+    X = (feature_df.drop(columns=["label"], errors="ignore")
+                     .select_dtypes(include=[np.number])
+                     .replace([np.inf, -np.inf], np.nan))
+    keep = [f for f in top_feats if f in X.columns]
+    if len(keep) < 2:
+        print("(ANOVA-topK) Fewer than 2 selected features present in data — skipping")
+        return
+
+    corr = X[keep].corr(method="spearman").abs().round(3)
+    _savetab(corr, tables_dir, "table_anova_topK_corr_spearman.csv")
+
+    # Plot (labels visible only if reasonably sized)
+    n = len(keep)
+    fig_w = max(7.5, 0.32 * n)
+    fig_h = max(6.0, 0.28 * n)
+    fig, ax = plt.subplots(figsize=(fig_w, fig_h))
+    im = ax.imshow(corr.values, vmin=0, vmax=1, cmap="viridis", interpolation="nearest")
+    cb = fig.colorbar(im, ax=ax); cb.set_label("|Spearman r|")
+
+    if n <= 30:
+        ax.set_xticks(range(n)); ax.set_yticks(range(n))
+        ax.set_xticklabels(keep, rotation=65, ha="right", fontsize=8)
+        ax.set_yticklabels(keep, fontsize=8)
+    else:
+        ax.set_xticks([]); ax.set_yticks([])
+
+    ax.set_title(f"Correlation among ANOVA top-{len(keep)} features (|r|)", fontsize=12)
+    plt.tight_layout()
+    savefig(fig, outdir, "eda_anova_topK_corr_heatmap.png")
 
 
 # --------------------------------------------------------------------------------------
@@ -933,11 +1032,12 @@ def run_eda_and_optional_fl(args):
         plot_hrv_boxes(feature_df, eda_dir / "hrv")
         run_anova_selectkbest(feature_df, eda_dir, top_k=int(args.anova_top_k))
 
-    # 4) Optional: Confusion matrices from CSVs (if present)
+    # 4) Confusion matrices from CSVs (if present)
     SUPERCLASSES = [c for c in ORDER_5]
     results_dir = Path(args.results_dir) if args.results_dir else Path("results")
     try_plot_confusions_from_csv(results_dir / "non_frozen_run_cm.csv", SUPERCLASSES, "non_frozen", outdir)
     try_plot_confusions_from_csv(results_dir / "frozen_run_cm.csv", SUPERCLASSES, "frozen", outdir)
+    plot_anova_topk_corr_heatmap(feature_df, eda_dir, top_k=int(args.anova_top_k))
 
     print(f"Saved plots to: {outdir}")
 

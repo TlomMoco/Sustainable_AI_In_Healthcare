@@ -20,7 +20,6 @@ dataset/ptb-xl-a-large-publicly-available-electrocardiography-dataset-1.0.3
 # Ignore experiment outputs
 checkpoints/
 results/dropbox
-results
 *.pt
 *.pth
 *.ckpt
@@ -54,18 +53,5 @@ __pycache__/
 # OS junk
 .DS_Store
 Thumbs.db
-
-
 *.DS_Store
-.DS_Store
-.DS_Store
-.DS_Store
-.DS_Store
-.DS_Store
-.DS_Store
-.DS_Store
-.DS_Store
-.DS_Store
-.DS_Store
-.DS_Store
-.DS_Store
+
