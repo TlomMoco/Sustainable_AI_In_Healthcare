@@ -1,28 +1,9 @@
-# src/Centralized.py
 from __future__ import annotations
-
-"""
-Centralized.py — Deep Models (centralized training only)
-
-This version is aligned with your current codebase:
-- Imports from src.* (not src_Connection.*)
-- Uses data_loader waveforms + patient-aware 3-way split
-- Provides local Dataset, label-encoding, plotting, and evaluation
-- Supports CNN/LSTM via src.models.create_model
-
-Outputs:
-- results/models/best_<model>.pt          (weights)
-- results/models/history_<model>.csv      (training curves)
-- results/centralized_eval.csv            (summary table)
-- results/viz/confusion_<model>.png       (confusion matrix)
-- results/viz/learning_curves.png         (per-model curves)
-"""
 
 import csv
 import math
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Tuple, List
+from typing import Dict, Tuple, List, Optional
 
 import numpy as np
 import torch
@@ -34,45 +15,42 @@ from sklearn.metrics import confusion_matrix, classification_report
 
 from src.config import (
     RESULTS_DIR, SEED, SAMPLE_RATE, N_CLASSES, SPLITS, MODEL,
-    LR as CFG_LR,  # reuse your LR
+    LR as CFG_LR, ANOVA_FALLBACK_LEADS, ANOVA_FSCORE_THRESHOLD
 )
 from src.data_loader import (
     load_metadata, map_superclasses, filter_single_label,
     stratified_patient_split_3way, load_waveform,
     compute_perlead_norm_stats, normalize_signal,
-    SUPERCLASSES,
+    compute_anova_lead_mask_by_threshold,
 )
 from src.models import create_model
 from src.utils import set_seed, ensure_dir
 
 
-# -----------------------------------------------------------------------------
-# Local helpers (device, datasets, plotting)
-# -----------------------------------------------------------------------------
 def pick_device() -> torch.device:
     if torch.cuda.is_available():
         return torch.device("cuda")
-    # MPS (Apple Silicon) if available
     if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():  # type: ignore[attr-defined]
         return torch.device("mps")
     return torch.device("cpu")
 
 
 def torch_loader_kwargs(shuffle: bool, batch: int, device_type: str) -> dict:
-    # Reasonable defaults; tune if you like
     pin = device_type == "cuda"
     num_w = 2 if device_type == "cuda" else 0
     return {"batch_size": int(batch), "shuffle": bool(shuffle), "num_workers": num_w, "pin_memory": pin}
 
 
 class PTBWaveformDataset(Dataset):
-    """Lazily loads PTB-XL waveforms row-by-row and returns (X, y_idx)."""
-    def __init__(self, df, le: LabelEncoder, mu: np.ndarray, sigma: np.ndarray, sample_rate: int):
+    """Loads PTB-XL waveforms row-by-row; slices to selected leads and applies z-score."""
+    def __init__(self, df, le: LabelEncoder, mu: np.ndarray, sigma: np.ndarray,
+                 sample_rate: int, lead_idx: Optional[List[int]] = None):
         self.df = df.reset_index(drop=True)
         self.le = le
         self.mu = mu
         self.sigma = sigma
         self.fs = int(sample_rate)
+        self.lead_idx = None if lead_idx is None else list(int(i) for i in lead_idx)
 
     def __len__(self) -> int:
         return len(self.df)
@@ -80,10 +58,12 @@ class PTBWaveformDataset(Dataset):
     def __getitem__(self, idx: int):
         row = self.df.iloc[idx]
         sig = load_waveform(row, sampling_rate=self.fs)            # (12, T)
-        sig = normalize_signal(sig, self.mu, self.sigma, eps=1e-6) # z-score per lead
-        x = torch.tensor(sig, dtype=torch.float32)                 # (12, T)
+        if self.lead_idx is not None:
+            sig = sig[self.lead_idx, :]                            # (K, T)
+        sig = normalize_signal(sig, self.mu, self.sigma, eps=1e-6) # z-score per selected lead
+        x = torch.tensor(sig, dtype=torch.float32)                 # (K, T)
         y_str = str(row["y"])
-        y_idx = int(np.where(self.le.classes_ == y_str)[0][0])     # encode with fitted LE
+        y_idx = int(np.where(self.le.classes_ == y_str)[0][0])
         y = torch.tensor(y_idx, dtype=torch.long)
         return x, y
 
@@ -113,8 +93,7 @@ def plot_learning_curves_png(histories: Dict[str, Dict[str, List[float]]], out_d
         ax1.plot(range(1, len(h["loss"]) + 1), h["loss"], label=f"{name} (train)")
         ax1.plot(range(1, len(h["val_loss"]) + 1), h["val_loss"], linestyle="--", label=f"{name} (val)")
     ax1.set_title("Loss (eval-mode train vs val)")
-    ax1.set_xlabel("Epoch")
-    ax1.set_ylabel("Loss")
+    ax1.set_xlabel("Epoch"); ax1.set_ylabel("Loss")
     ax1.grid(True); ax1.legend()
     fig1.tight_layout()
     fig1.savefig(out_dir / "learning_curves_loss.png", dpi=150)
@@ -126,17 +105,13 @@ def plot_learning_curves_png(histories: Dict[str, Dict[str, List[float]]], out_d
         ax2.plot(range(1, len(h["accuracy"]) + 1), h["accuracy"], label=f"{name} (train)")
         ax2.plot(range(1, len(h["val_accuracy"]) + 1), h["val_accuracy"], linestyle="--", label=f"{name} (val)")
     ax2.set_title("Accuracy (eval-mode train vs val)")
-    ax2.set_xlabel("Epoch")
-    ax2.set_ylabel("Accuracy")
+    ax2.set_xlabel("Epoch"); ax2.set_ylabel("Accuracy")
     ax2.grid(True); ax2.legend()
     fig2.tight_layout()
     fig2.savefig(out_dir / "learning_curves_acc.png", dpi=150)
     plt.close(fig2)
 
 
-# -----------------------------------------------------------------------------
-# Pipeline
-# -----------------------------------------------------------------------------
 def run_deep_models(seed: int | None = None) -> None:
     # --- Repro / device -------------------------------------------------
     set_seed(int(seed if seed is not None else SEED))
@@ -146,40 +121,50 @@ def run_deep_models(seed: int | None = None) -> None:
     # --- Load & split (patient-aware 3-way) -----------------------------
     ptb = load_metadata()
     df_all = filter_single_label(map_superclasses(ptb))
-    tr_df, va_df, te_df = stratified_patient_split_3way(df_all, splits=(SPLITS["train"], SPLITS["val"], SPLITS["test"]), seed=SEED)
+    tr_df, va_df, te_df = stratified_patient_split_3way(
+        df_all, splits=(SPLITS["train"], SPLITS["val"], SPLITS["test"]), seed=SEED
+    )
+
+    # --- Lead selection on TRAIN ---------------------------------------
+    lead_mask, kept_leads, _ = compute_anova_lead_mask_by_threshold(
+        tr_df, RESULTS_DIR, feature_set="engineered",
+        fscore_threshold=ANOVA_FSCORE_THRESHOLD, fallback_k=ANOVA_FALLBACK_LEADS
+    )
+    lead_idx: List[int] = [int(i) for i in kept_leads]
+    print(f"[Centralized] ANOVA threshold={ANOVA_FSCORE_THRESHOLD} → keeping leads (1-based): {[i+1 for i in lead_idx]}")
 
     # Label encoder on TRAIN classes
     le = LabelEncoder().fit(tr_df["y"].astype(str).values)
     n_classes = len(le.classes_)
     assert n_classes == N_CLASSES, f"Config N_CLASSES={N_CLASSES} but data has {n_classes} classes: {list(le.classes_)}"
 
-    # Per-lead normalization stats from TRAIN only
-    mu_tr, sigma_tr = compute_perlead_norm_stats(tr_df, sampling_rate=SAMPLE_RATE)
+    # Per-lead normalization stats from TRAIN only, then slice to selected leads
+    mu_all, sigma_all = compute_perlead_norm_stats(tr_df, sampling_rate=SAMPLE_RATE)
+    mu_sel, sigma_sel = mu_all[lead_idx], sigma_all[lead_idx]
 
-    # Datasets/loaders
+    # Datasets/loaders (true lead removal)
     def make_loader(df, shuffle: bool, batch: int):
-        ds = PTBWaveformDataset(df, le, mu_tr, sigma_tr, SAMPLE_RATE)
+        ds = PTBWaveformDataset(df, le, mu_sel, sigma_sel, SAMPLE_RATE, lead_idx=lead_idx)
         return DataLoader(ds, **torch_loader_kwargs(shuffle, batch, device.type))
 
-    batch = 64  # default; you can also read from config if you prefer
+    batch = 64
     train_loader = make_loader(tr_df, shuffle=True,  batch=batch)
     val_loader   = make_loader(va_df, shuffle=False, batch=max(64, batch))
     test_loader  = make_loader(te_df, shuffle=False, batch=max(64, batch))
 
-    # Loss (always multi-class here)
     crit = nn.CrossEntropyLoss()
 
     @torch.no_grad()
-    def _eval(model, loader) -> Tuple[float, float]:
-        model.eval()
+    def _eval(model_in: nn.Module, loader) -> Tuple[float, float]:
+        model_in.eval()
         loss_sum, correct, total = 0.0, 0, 0
         for xb, yb in loader:
             xb, yb = xb.to(device), yb.to(device)
-            logits = model(xb)
+            logits = model_in(xb)
             loss = crit(logits, yb)
             loss_sum += float(loss.item()) * len(yb)
             pred = logits.argmax(1)
-            correct += int((pred == yb).sum())
+            correct += int(pred.eq(yb).sum().item())
             total += len(yb)
         return (loss_sum / total if total else math.nan,
                 correct / total if total else math.nan)
@@ -189,6 +174,7 @@ def run_deep_models(seed: int | None = None) -> None:
         model = create_model(
             n_classes=n_classes,
             model_type=model_type,
+            n_leads=len(lead_idx),                 # <— variable input channels
             hidden=MODEL.get("lstm_hidden", 128),
             layers=MODEL.get("lstm_layers", 1),
             bidir=MODEL.get("bidirectional", True),
@@ -199,9 +185,9 @@ def run_deep_models(seed: int | None = None) -> None:
         sch = optim.lr_scheduler.ReduceLROnPlateau(opt, mode="min", factor=0.5, patience=2, min_lr=1e-5)
 
         hist = {"loss": [], "val_loss": [], "accuracy": [], "val_accuracy": []}
-        best_state, best_val, no_improve, early_pat = None, float("inf"), 0, None  # add patience in config if needed
+        best_state, best_val, no_improve = None, float("inf"), 0
+        early_pat: Optional[int] = None  # set to an int (e.g., 3) to enable early stopping
 
-        # Stable eval-mode train loader (same as train but shuffle False)
         train_eval_loader = make_loader(tr_df, shuffle=False, batch=max(64, batch))
 
         for ep in range(1, epochs + 1):
@@ -212,8 +198,6 @@ def run_deep_models(seed: int | None = None) -> None:
                 logits = model(xb)
                 loss = crit(logits, yb)
                 loss.backward()
-                # Optional grad clip (set a value if you want)
-                # nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 opt.step()
 
             tr_loss, tr_acc = _eval(model, train_eval_loader)
@@ -235,15 +219,16 @@ def run_deep_models(seed: int | None = None) -> None:
                 no_improve = 0
             else:
                 no_improve += 1
-                if early_pat is not None and no_improve >= int(early_pat):
-                    print(f"[{name}] Early stop at epoch {ep}")
-                    break
+                if early_pat is not None:
+                    if no_improve >= early_pat:
+                        print(f"[{name}] Early stop at epoch {ep}")
+                        break
 
         if best_state is not None:
             model.load_state_dict(best_state)
         return model, hist
 
-    # Which models to run: support both; default run both
+    # Which models to run
     run_cnn  = True
     run_lstm = True
 
@@ -251,8 +236,6 @@ def run_deep_models(seed: int | None = None) -> None:
     viz_dir   = (Path(RESULTS_DIR) / "viz");    viz_dir.mkdir(parents=True, exist_ok=True)
 
     histories: Dict[str, Dict[str, List[float]]] = {}
-    eval_rows: List[dict] = {}
-
     trained: Dict[str, nn.Module] = {}
 
     if run_cnn:
@@ -300,7 +283,6 @@ def run_deep_models(seed: int | None = None) -> None:
         print(classification_report(all_true, all_pred, target_names=list(le.classes_), digits=4))
         rows.append({"model": name, "test_loss": f"{test_loss:.6f}", "test_acc": f"{test_acc:.6f}"})
 
-    # Save unified eval
     results_csv = Path(RESULTS_DIR) / "centralized_eval.csv"
     ensure_dir(results_csv.parent)
     with open(results_csv, "w", newline="") as f:
@@ -308,7 +290,6 @@ def run_deep_models(seed: int | None = None) -> None:
         w.writeheader(); w.writerows(rows)
     print("Saved evaluation:", results_csv)
 
-    # Learning curves
     plot_learning_curves_png(histories, viz_dir)
     print("\n[Done] Centralized run complete.")
 

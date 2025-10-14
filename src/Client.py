@@ -1,27 +1,6 @@
-"""
-Client.py — PTB-XL Federated Learning Client
---------------------------------------------
-
-Implements a single federated learning (FL) client for ECG classification
-under the Sustainable AI in Healthcare project (DSP5100).
-
-Each client:
-  • Loads a patient-specific PTB-XL subset (uneven split)
-  • Builds a CNN or LSTM model depending on config.py
-  • Trains locally using FedAvg (with optional FedProx term)
-  • Applies dynamic & reactive layer freezing
-  • Logs sustainability metrics per round
-  • Communicates with the Flower server (FedAvg)
-  • Logs per-round metrics (accuracy, loss, time, #trainable params)
-
-This setup simulates data heterogeneity and sustainability-oriented
-training efficiency.
-
-"""
-
 from __future__ import annotations
 from collections import OrderedDict
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 from dataclasses import dataclass
 import argparse
 import time
@@ -35,21 +14,20 @@ import json
 from src.config import (
     LR, BATCH_SIZE, EPOCHS_LOCAL, FREEZE_THRESHOLD, FEDPROX_MU,
     SEED, RESULTS_DIR, FREEZE_CFG, SPLITS, NORM, MODEL, EXPERIMENT,
-    SAMPLE_RATE, N_CLASSES, TUNING, GRIDSEARCH, tuning_paths, FREEZE_ENABLED
+    SAMPLE_RATE, N_CLASSES, TUNING, GRIDSEARCH, tuning_paths, FREEZE_ENABLED,
+    ANOVA_FALLBACK_LEADS, ANOVA_FSCORE_THRESHOLD
 )
 from src.data_loader import (
     load_metadata, map_superclasses, filter_single_label,
     stratified_patient_split_3way, load_waveform,
-    compute_perlead_norm_stats, normalize_signal
+    compute_perlead_norm_stats, normalize_signal,
+    compute_anova_lead_mask_by_threshold,
 )
 from src.tuning import run_client_cv
 from src.models import create_model
 from src.utils import set_seed, ensure_dir, append_csv_locked
 
 
-# -------------------------------------------------------------------------
-# Freeze state tracker
-# -------------------------------------------------------------------------
 @dataclass
 class FreezeState:
     best_loss: float = float("inf")
@@ -61,14 +39,16 @@ class FreezeState:
 
 
 # -------------------------------------------------------------------------
-# Helper functions
+# Helper functions (with true lead removal)
 # -------------------------------------------------------------------------
-def make_tensor_dataset(df, mu=None, sigma=None):
-    """Convert a PTB-XL dataframe to tensors (X, y)."""
+def make_tensor_dataset(df, mu=None, sigma=None, lead_idx: Optional[List[int]] = None):
+    """Convert a PTB-XL dataframe to tensors (X, y) with selected leads only."""
     X, y = [], []
     classes = ["NORM", "MI", "STTC", "HYP", "CD"]
     for _, row in df.iterrows():
-        sig = load_waveform(row)
+        sig = load_waveform(row)                 # (12, T)
+        if lead_idx is not None:
+            sig = sig[lead_idx, :]              # (K, T)
         if mu is not None and sigma is not None and NORM["enabled"]:
             sig = normalize_signal(sig, mu, sigma, eps=NORM["eps"])
         X.append(sig)
@@ -78,9 +58,8 @@ def make_tensor_dataset(df, mu=None, sigma=None):
     return X, y
 
 
-def get_loaders(df, batch_size=BATCH_SIZE, mu=None, sigma=None, shuffle=True):
-    """Return a DataLoader for the given DataFrame."""
-    X, y = make_tensor_dataset(df, mu, sigma)
+def get_loaders(df, batch_size=BATCH_SIZE, mu=None, sigma=None, shuffle=True, lead_idx: Optional[List[int]] = None):
+    X, y = make_tensor_dataset(df, mu, sigma, lead_idx)
     ds = torch.utils.data.TensorDataset(X, y)
     return torch.utils.data.DataLoader(ds, batch_size=batch_size, shuffle=shuffle)
 
@@ -89,7 +68,7 @@ def get_loaders(df, batch_size=BATCH_SIZE, mu=None, sigma=None, shuffle=True):
 # Federated Client
 # -------------------------------------------------------------------------
 class PTBClient(fl.client.NumPyClient):
-    """Federated learning client with reactive layer freezing."""
+    """Federated learning client with reactive layer freezing + ANOVA-based lead removal."""
 
     def __init__(self, cid: int):
         # --- Setup -------------------------------------------------------
@@ -101,14 +80,21 @@ class PTBClient(fl.client.NumPyClient):
         ptb = load_metadata()
         df = filter_single_label(map_superclasses(ptb))
 
-        # Explicit split tuple to ensure consistent order
+        # Global patient-aware split
         train_g, val_g, test_g = stratified_patient_split_3way(
-            df,
-            splits=(SPLITS["train"], SPLITS["val"], SPLITS["test"]),
-            seed=SEED,
+            df, splits=(SPLITS["train"], SPLITS["val"], SPLITS["test"]), seed=SEED,
         )
 
-        # Uneven client splits (by patient) ------------------------------
+        # --- Lead selection on GLOBAL TRAIN ------------------------------
+        lead_mask, kept_leads, _ = compute_anova_lead_mask_by_threshold(
+            train_g, RESULTS_DIR, feature_set="engineered",
+            fscore_threshold=ANOVA_FSCORE_THRESHOLD, fallback_k=ANOVA_FALLBACK_LEADS
+        )
+        self.lead_idx: List[int] = [int(i) for i in kept_leads]
+        print(f"[Client {cid}] ANOVA threshold={ANOVA_FSCORE_THRESHOLD} → keeping leads (1-based): {[i+1 for i in self.lead_idx]}")
+        self.n_leads = len(self.lead_idx)
+
+        # --- Uneven client splits (by patient) ---------------------------
         patients = train_g.patient_id.unique()
         np.random.seed(SEED)
         np.random.shuffle(patients)
@@ -116,7 +102,7 @@ class PTBClient(fl.client.NumPyClient):
         ratios = np.array([0.5, 0.33, 0.15, 0.02])
         ratios /= ratios.sum()
         sizes = (ratios * len(patients)).astype(int)
-        sizes[-1] = len(patients) - sizes[:-1].sum()  # assign remainder to last client
+        sizes[-1] = len(patients) - sizes[:-1].sum()  # remainder to last client
 
         clients, start = [], 0
         for s in sizes:
@@ -129,23 +115,26 @@ class PTBClient(fl.client.NumPyClient):
         self.train_df = clients[cid]
         self.val_df, self.test_df = val_g, test_g
 
-        # --- Visibility: true training volume ----------------------------
+        # --- Visibility: training volume (still reported at 12 leads) ----
         n_records = len(self.train_df)
-        samples_per_record = 10 * SAMPLE_RATE * 12  # 10s * Hz * 12 leads
+        samples_per_record = 10 * SAMPLE_RATE * 12  # informational only
         total_samples = n_records * samples_per_record
-        hours = (n_records * 10.0) / 3600.0  # 10 seconds per record -> hours
+        hours = (n_records * 10.0) / 3600.0
         print(
             f"[Client {self.cid}] train records={n_records:,} "
             f"≈ {hours:.1f} h ECG | samples={total_samples:,} @ {SAMPLE_RATE} Hz"
         )
 
-        # --- Per-lead normalization (local stats) ------------------------
-        self.mu, self.sigma = compute_perlead_norm_stats(self.train_df)
+        # --- Per-lead normalization (local stats) & slice to selected ----
+        mu_full, sigma_full = compute_perlead_norm_stats(self.train_df)
+        self.mu = mu_full[self.lead_idx]
+        self.sigma = sigma_full[self.lead_idx]
 
-        # --- Model setup -------------------------------------------------
+        # --- Model setup (variable input channels) -----------------------
         self.model = create_model(
             n_classes=N_CLASSES,
             model_type=MODEL["type"],
+            n_leads=self.n_leads,
             hidden=MODEL.get("lstm_hidden", 128),
             layers=MODEL.get("lstm_layers", 1),
             bidir=MODEL.get("bidirectional", True),
@@ -154,18 +143,17 @@ class PTBClient(fl.client.NumPyClient):
         self.ce = nn.CrossEntropyLoss()
         self.state = FreezeState()
 
-        # --- Per Client hyperparams (for tuning experiments) -----------
+        # --- Hyperparams -------------------------------------------------
         self.lr = LR
         self.batch_size = BATCH_SIZE
         self.local_epochs = EPOCHS_LOCAL
-        self.fedprox_mu = FEDPROX_MU  # proximal term (not normalization μ)
+        self.fedprox_mu = FEDPROX_MU
 
         # ----------------------------------------------------------------
-        # Hyperparameter tuning via CV (pre-flight) + cached reuse
+        # Hyperparameter tuning via CV (optional) + cached reuse
         # ----------------------------------------------------------------
-
         self.cv_done = False
-        self.hp_source = "default"  # "default" | "cached" | "tuned"
+        self.hp_source = "default"
 
         best_path, cv_csv_path = tuning_paths(
             run_name=EXPERIMENT["run_name"], cid=self.cid, freeze_enabled=FREEZE_ENABLED
@@ -179,17 +167,10 @@ class PTBClient(fl.client.NumPyClient):
             self.fedprox_mu = float(hp.get("fedprox", 0.0))
             self.hp_source = src
 
-        # --- Unified tuning/caching policy (drop-in replacement) ---
-        # Preference order:
-        # 1) If use_cached_best and cache exists -> load cached (skip CV)
-        # 2) Else if enabled -> run CV, save + apply best
-        # 3) Else -> use defaults
-
-        # Single policy: if tuned files exist, reuse them; otherwise run CV only if enabled.
         prefer_cached = TUNING.get("use_cached_best", True)
         do_cv = TUNING.get("enabled", False)
-
         used = False
+
         if prefer_cached and best_path.exists():
             with open(best_path, "r", encoding="utf-8") as f:
                 best = (json.load(f) or {}).get("params", {})
@@ -221,50 +202,37 @@ class PTBClient(fl.client.NumPyClient):
                 print(f"[Client {self.cid}] CV skipped/insufficient groups; using defaults.")
 
         if not used and not do_cv:
-            # Explicitly note we’re on defaults
             print(f"[Client {self.cid}] No cache and CV disabled → using default HPs.")
 
-        # Optional: remember source if you want to write it to CSV later
-        self.hp_source = "cached" if prefer_cached and best_path.exists() else (
-            "tuned" if (do_cv and used) else "default")
+        self.hp_source = "cached" if prefer_cached and best_path.exists() else ("tuned" if (do_cv and used) else "default")
+        self.cv_done = do_cv
 
-        # If you rely on this flag later:
-        self.cv_done = do_cv  # True iff we actually ran CV this session
-
-        # Static/head-only start for very small clients (only when freezing is enabled)
+        # Static/head-only start for very small clients (when freezing enabled)
         if EXPERIMENT["freeze_enabled"] and len(self.train_df) < FREEZE_THRESHOLD:
             print(f"[Client {self.cid}] Head-only training to start (small client).")
-            # 1) freeze backbone (features)
             for p in self.model.features.parameters():
                 p.requires_grad = False
-            # 2) within the head, train ONLY the last Linear (keep others frozen)
             head = getattr(self.model, "head", None)
-
-            # freeze entire head first (handles Sequential or single Linear)
             if isinstance(head, nn.Module):
                 for p in head.parameters():
                     p.requires_grad = False
-
-            # find last Linear inside head (Sequential or Linear)
             last_linear = None
             if isinstance(head, nn.Linear):
                 last_linear = head
             elif isinstance(head, nn.Module):
                 for m in head.modules():
                     if isinstance(m, nn.Linear):
-                        last_linear = m  # keep updating: ends as last Linear
-            # unfreeze that Linear only
+                        last_linear = m
             if last_linear is not None:
                 for p in last_linear.parameters():
                     p.requires_grad = True
 
-        print(f"[Client {self.cid}] Initialized model: {MODEL['type']} on {self.device}")
+        print(f"[Client {self.cid}] Initialized model: {MODEL['type']} ({self.n_leads} leads) on {self.device}")
 
 
     # ---------------------------------------------------------------------
     # Federated API
     # ---------------------------------------------------------------------
-    # Flower calls this with a config kwarg — accept it even if unused
     def get_parameters(self, config: dict | None = None):
         return [v.detach().cpu().numpy() for _, v in self.model.state_dict().items()]
 
@@ -277,9 +245,6 @@ class PTBClient(fl.client.NumPyClient):
     # Freezing logic (hybrid: size + reactive)
     # ---------------------------------------------------------------------
     def _apply_freeze_policy(self, round_num: int, loss_local: float, acc_local: float):
-        """Adjust layer freezing based on client size and performance."""
-
-        # Global toggle — disable all freezing if requested
         if not EXPERIMENT["freeze_enabled"]:
             for p in self.model.parameters():
                 p.requires_grad = True
@@ -287,70 +252,53 @@ class PTBClient(fl.client.NumPyClient):
                 self.state.last_frozen = 0
             return {"policy": "disabled", "frozen_layers": 0}
 
-        total = len(list(self.model.features))
+        total = len(list(self.model.features.children()))
         n_train = len(self.train_df)
 
-        # Base: size-aware target (static baseline)
         if n_train >= 2 * FREEZE_THRESHOLD:
             target = 0
         elif n_train < FREEZE_THRESHOLD:
             target = int(total * max(0.0, 1 - round_num / FREEZE_CFG["unfreeze_after"]))
         else:
-            target = total // 4  # gentle mid-size default
+            target = total // 4
 
-        # Reactive adjustment based on performance trends
         improved = (self.state.best_loss - loss_local) > self.state.min_delta or (acc_local > self.state.best_acc)
-        degraded = (loss_local - self.state.best_loss) > self.state.min_delta or (
-                acc_local < self.state.best_acc - 1e-3
-        )
+        degraded = (loss_local - self.state.best_loss) > self.state.min_delta or (acc_local < self.state.best_acc - 1e-3)
 
         if degraded:
             self.state.no_improve += 1
         elif improved:
             self.state.no_improve = max(0, self.state.no_improve - 1)
 
-        # Every `patience` steps without improvement: adjust one layer
         adjust = (self.state.no_improve // self.state.patience)
         if degraded:
-            target = min(total - 1, target + adjust)  # freeze more
+            target = min(total - 1, target + adjust)
         elif improved:
-            target = max(0, target - adjust)  # unfreeze
+            target = max(0, target - adjust)
 
         if len(self.train_df) < FREEZE_THRESHOLD and improved and self.state.no_improve == 0:
-            # allow the Linear(160->96) to train too
             next_linear = None
             head = getattr(self.model, "head", None)
             if isinstance(head, nn.Linear):
                 next_linear = head
             elif isinstance(head, nn.Module):
-                # modules() also covers Sequential/ModuleList trees
                 for m in head.modules():
                     if isinstance(m, nn.Linear):
                         next_linear = m
                         break
-
             if next_linear is not None:
                 for p in next_linear.parameters():
                     p.requires_grad = True
 
-        # Apply the actual freezing pattern
-        for i, layer in enumerate(self.model.features):
+        for i, layer in enumerate(list(self.model.features.children())):
             for p in layer.parameters():
                 p.requires_grad = (i >= target)
 
-        # Update internal state
         self.state.last_frozen = target
         self.state.best_loss = min(self.state.best_loss, loss_local)
         self.state.best_acc = max(self.state.best_acc, acc_local)
 
-        # Return summary
-        return {
-            "policy": "dynamic",
-            "frozen_layers": target,
-            "improved": improved,
-            "degraded": degraded,
-            "no_improve": self.state.no_improve,
-        }
+        return {"policy": "dynamic", "frozen_layers": target, "improved": improved, "degraded": degraded, "no_improve": self.state.no_improve}
 
 
     # ---------------------------------------------------------------------
@@ -366,7 +314,7 @@ class PTBClient(fl.client.NumPyClient):
 
         # Local training with optional FedProx term
         t0 = time.perf_counter()
-        loader = get_loaders(self.train_df, batch_size=self.batch_size, mu=self.mu, sigma=self.sigma)
+        loader = get_loaders(self.train_df, batch_size=self.batch_size, mu=self.mu, sigma=self.sigma, lead_idx=self.lead_idx)
         opt = optim.Adam(filter(lambda p: p.requires_grad, self.model.parameters()),
                          lr=self.lr, weight_decay=1e-4)
         global_params = [p.detach().clone() for p in self.model.parameters()]  # FedProx snapshot
@@ -387,7 +335,6 @@ class PTBClient(fl.client.NumPyClient):
         wall_s = time.perf_counter() - t0
         loss_after, acc_after = self._evaluate_dataset(self.val_df)
 
-        # Update state for next round
         if loss_after < self.state.best_loss:
             self.state.best_loss = loss_after
         if acc_after > self.state.best_acc:
@@ -403,11 +350,10 @@ class PTBClient(fl.client.NumPyClient):
     # ---------------------------------------------------------------------
     # Evaluation
     # ---------------------------------------------------------------------
-    # -- helper to evaluate on a given dataset ----------------------------
     def _evaluate_dataset(self, df) -> Tuple[float, float]:
         if len(df) == 0:
             return 0.0, 0.0
-        loader = get_loaders(df, 128, mu=self.mu, sigma=self.sigma, shuffle=False)
+        loader = get_loaders(df, 128, mu=self.mu, sigma=self.sigma, shuffle=False, lead_idx=self.lead_idx)
         self.model.eval()
         correct, total, loss_sum = 0, 0, 0.0
         with torch.no_grad():
@@ -416,40 +362,29 @@ class PTBClient(fl.client.NumPyClient):
                 logits = self.model(xb)
                 loss_sum += float(self.ce(logits, yb).item()) * len(yb)
                 pred = logits.argmax(dim=1)
-                correct += int((pred == yb).sum())
+                correct += int(pred.eq(yb).sum().item())
                 total += len(yb)
         return loss_sum / total, correct / total
 
-    # -- main evaluation method (called by server) ----------------------
     def evaluate(self, parameters, config):
         self.set_parameters(parameters)
-
-        # Compute metrics + confusion counts on TEST split
-        loader = get_loaders(self.test_df, 128, mu=self.mu, sigma=self.sigma, shuffle=False)
+        loader = get_loaders(self.test_df, 128, mu=self.mu, sigma=self.sigma, shuffle=False, lead_idx=self.lead_idx)
         self.model.eval()
         correct, total, loss_sum = 0, 0, 0.0
-
-        # Confusion matrix: rows=true, cols=pred
         cm = np.zeros((N_CLASSES, N_CLASSES), dtype=np.int64)
-
         with torch.no_grad():
             for xb, yb in loader:
                 xb, yb = xb.to(self.device), yb.to(self.device)
                 logits = self.model(xb)
                 loss_sum += float(self.ce(logits, yb).item()) * len(yb)
                 pred = logits.argmax(dim=1)
-
-                correct += int((pred == yb).sum())
+                correct += int(pred.eq(yb).sum().item())
                 total += len(yb)
-
-                # update confusion counts
                 for t, p in zip(yb.view(-1).cpu().numpy(), pred.view(-1).cpu().numpy()):
                     cm[int(t), int(p)] += 1
 
         loss = (loss_sum / total) if total > 0 else 0.0
         acc = (correct / total) if total > 0 else 0.0
-
-        # Flower expects flat dict[str,float]
         metrics = {"accuracy": acc}
         for i in range(N_CLASSES):
             for j in range(N_CLASSES):
@@ -466,19 +401,16 @@ class PTBClient(fl.client.NumPyClient):
         ensure_dir(RESULTS_DIR)
         exp = EXPERIMENT["run_name"]
 
-        # --- Phase label based on what we actually used this run -------------
-        # self.hp_source is set to: "tuned" | "cached" | "default"
         if TUNING.get("log_phase"):
             if getattr(self, "hp_source", "default") == "tuned":
-                phase = TUNING["phase_labels"]["enabled"]  # "post_cv"
+                phase = TUNING["phase_labels"]["enabled"]
             elif getattr(self, "hp_source", "default") == "cached":
-                phase = TUNING["phase_labels"]["cached"]  # "cached_cv"
+                phase = TUNING["phase_labels"]["cached"]
             else:
-                phase = TUNING["phase_labels"]["disabled"]  # "no_cv"
+                phase = TUNING["phase_labels"]["disabled"]
         else:
             phase = ""
 
-        # --- Choose file & columns ------------------------------------------
         separate = (TUNING.get("log_phase") and TUNING.get("log_mode") == "separate")
         if separate:
             path = RESULTS_DIR / f"{exp}_{phase or 'no_cv'}.csv"
@@ -525,7 +457,7 @@ def main():
         # Flower ≥ 1.4
         fl.client.start_client(server_address="127.0.0.1:8080", client=client.to_client())
     except AttributeError:
-        # Older Flower: fall back to NumPy API
+        # Older Flower
         fl.client.start_numpy_client(server_address="127.0.0.1:8080", client=client)
 
 

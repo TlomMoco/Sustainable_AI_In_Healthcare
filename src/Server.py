@@ -9,7 +9,7 @@ Responsibilities:
   • Configure each training round (number, unfreezing schedule, etc.)
   • Aggregate metrics across clients (weighted by number of examples)
 
-This script should be launched first in a terminal:
+Launch:
     $ python -m src.Server
 
 Then start each client in separate terminals:
@@ -24,16 +24,20 @@ from typing import Dict, List, Tuple
 
 import flwr as fl
 import numpy as np
-import matplotlib.pyplot as plt
-from src.config import CLIENTS, FREEZE_CFG, ROUNDS, RESULTS_DIR, EXPERIMENT, N_CLASSES, TUNING, SUPERCLASSES
+import matplotlib.pyplot as plt  # kept for parity with your environment
+
+from src.config import (
+    CLIENTS, FREEZE_CFG, ROUNDS, RESULTS_DIR, EXPERIMENT,
+    N_CLASSES, TUNING, SUPERCLASSES
+)
 from src.utils import append_csv_locked
 
 # -------------------------------------------------------------------------
 # Global results logging
 # -------------------------------------------------------------------------
 GLOBAL_ROW = {
-    "client_id": "GLOBAL",          # matches client csv schema but marks global row
-    "frozen_layers": "",             # not meaningful at global scope
+    "client_id": "GLOBAL",   # matches client csv schema but marks global row
+    "frozen_layers": "",     # not meaningful at global scope
     "is_frozen": "",
     "wall_time_sec": "",
     "trainable_params": "",
@@ -44,22 +48,32 @@ GLOBAL_ROW = {
 # FL server launcher
 # -------------------------------------------------------------------------
 def start_server():
-    """Start the Flower server and define training strategy."""
+    """Start the Flower server and define training strategy (wait for all clients)."""
 
     def on_fit_config_fn(rnd: int) -> Dict[str, int]:
         """Provide configuration to clients for each round."""
         return {"round": rnd, "unfreeze_after": FREEZE_CFG["unfreeze_after"]}
 
-    # Federated averaging strategy
+    # --- Federated averaging strategy (WAIT FOR ALL CLIENTS) -------------
+    # fraction_* = 1.0 => try to use all available clients
+    # min_available_clients = CLIENTS => do not start until all are connected
+    # min_fit/val clients = CLIENTS => every round needs all clients
+    # accept_failures = False => if a client drops, the round fails instead of silently proceeding
     strategy = LoggingFedAvg(
-        min_fit_clients=CLIENTS,                    # number of clients per round
-        min_available_clients=CLIENTS,              # required clients online
+        fraction_fit=1.0,
+        min_fit_clients=CLIENTS,
+        fraction_evaluate=1.0,
+        min_evaluate_clients=CLIENTS,
+        min_available_clients=CLIENTS,
+        accept_failures=False,
+
         evaluate_metrics_aggregation_fn=weighted_average,
-        fit_metrics_aggregation_fn=lambda mets: {}, # no-op, silences warning
-        on_fit_config_fn=on_fit_config_fn,          # send round config
+        fit_metrics_aggregation_fn=lambda mets: {},  # silence warning
+        on_fit_config_fn=on_fit_config_fn,
     )
 
-    # Launch the server
+    # --- Launch the server -----------------------------------------------
+    # Note: We do not set a round_timeout so the server patiently waits for all clients.
     fl.server.start_server(
         server_address="0.0.0.0:8080",
         strategy=strategy,
@@ -71,7 +85,6 @@ def start_server():
 # Helper methods for logging
 # -------------------------------------------------------------------------
 
-# --- Append a row to the global results CSV ------------------------------
 def _append_global_row(server_round: int, acc: float, loss: float) -> None:
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     exp = EXPERIMENT["run_name"]
@@ -104,7 +117,6 @@ def _append_global_row(server_round: int, acc: float, loss: float) -> None:
     append_csv_locked(path, row, fieldnames)
 
 
-# --- Append per-class accuracy and confusion matrix -----------------------
 def _append_perclass_row(server_round: int, cm: np.ndarray) -> None:
     path = RESULTS_DIR / f"{EXPERIMENT['run_name']}_perclass.csv"
     fieldnames = ["round"] + [f"acc_{c}" for c in SUPERCLASSES]
@@ -114,7 +126,6 @@ def _append_perclass_row(server_round: int, cm: np.ndarray) -> None:
     append_csv_locked(path, row, fieldnames)
 
 
-# --- Append confusion matrix in long format ------------------------------
 def _append_confusion_rows(server_round: int, cm: np.ndarray) -> None:
     path = RESULTS_DIR / f"{EXPERIMENT['run_name']}_cm.csv"
     fieldnames = ["round", "true", "pred", "count"]
@@ -170,7 +181,6 @@ def weighted_average(metrics: List[Tuple[int, Dict[str, float]]]) -> Dict[str, f
     avg_accuracy = sum(num_examples * m.get("accuracy", 0.0)
                        for num_examples, m in metrics) / total_examples
     return {"accuracy": avg_accuracy}
-
 
 
 # -------------------------------------------------------------------------

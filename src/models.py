@@ -9,9 +9,8 @@ Supported model types:
   • CNN  — Compact 1D convolutional network (default)
   • LSTM — Lightweight recurrent model for sequential ECG input
 
-Both models are designed for 12-lead ECG signals with input shape (12, T),
-and output logits corresponding to the 5 diagnostic superclasses:
-["NORM", "MI", "STTC", "HYP", "CD"]
+Both models accept a variable number of input leads (n_leads) with input
+shape (B, n_leads, T) and output logits for the 5 superclasses.
 """
 
 from __future__ import annotations
@@ -20,7 +19,6 @@ import torch.nn as nn
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 from sklearn.linear_model import LogisticRegression
-
 
 
 # -------------------------------------------------------------------------
@@ -39,18 +37,18 @@ def create_logistic_baseline() -> Pipeline:
 # -------------------------------------------------------------------------
 class TinyECGCNN(nn.Module):
     """
-    A small but expressive 1D CNN for 12-lead ECG classification.
+    A small but expressive 1D CNN for ECG classification.
 
-    Input:  (B, 12, T)
+    Input:  (B, in_ch, T)
     Output: (B, n_classes)
     """
 
-    def __init__(self, n_classes: int):
+    def __init__(self, n_classes: int, in_ch: int = 12):
         super().__init__()
 
         self.features = nn.Sequential(
             # Block 1 — early temporal reduction
-            nn.Conv1d(12, 32, kernel_size=7, stride=2, padding=3),
+            nn.Conv1d(in_ch, 32, kernel_size=7, stride=2, padding=3),
             nn.BatchNorm1d(32),
             nn.ReLU(),
             nn.MaxPool1d(2),   # → T/4 total reduction
@@ -88,7 +86,6 @@ class TinyECGCNN(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Forward pass."""
         z = self.features(x)     # (B, 160, 1)
         return self.head(z)      # (B, n_classes)
 
@@ -100,7 +97,7 @@ class TinyECGLSTM(nn.Module):
     """
     Lightweight LSTM model for sequential ECG processing.
 
-    Input:  (B, 12, T)
+    Input:  (B, in_ch, T)
     Output: (B, n_classes)
 
     The model exposes self.features as a ModuleList to allow
@@ -110,6 +107,7 @@ class TinyECGLSTM(nn.Module):
     def __init__(
         self,
         n_classes: int,
+        in_ch: int = 12,
         hidden: int = 128,
         layers: int = 1,
         bidir: bool = True,
@@ -121,7 +119,7 @@ class TinyECGLSTM(nn.Module):
         # Optional convolutional stem for feature extraction
         if use_stem:
             self.stem = nn.Sequential(
-                nn.Conv1d(12, 32, kernel_size=7, stride=2, padding=3),
+                nn.Conv1d(in_ch, 32, kernel_size=7, stride=2, padding=3),
                 nn.BatchNorm1d(32),
                 nn.ReLU(),
                 nn.MaxPool1d(2),
@@ -129,7 +127,7 @@ class TinyECGLSTM(nn.Module):
             rnn_in = 32
         else:
             self.stem = nn.Identity()
-            rnn_in = 12
+            rnn_in = in_ch
 
         # LSTM encoder
         self.rnn = nn.LSTM(
@@ -153,7 +151,6 @@ class TinyECGLSTM(nn.Module):
         self.features = nn.ModuleList([self.stem, self.rnn])
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Forward pass."""
         z = self.stem(x)          # (B, C, T)
         z = z.permute(0, 2, 1)    # (B, T, C)
         z, _ = self.rnn(z)        # (B, T, H)
@@ -164,21 +161,27 @@ class TinyECGLSTM(nn.Module):
 # -------------------------------------------------------------------------
 # Model factory
 # -------------------------------------------------------------------------
-def create_model(n_classes: int, model_type: str = "cnn", **kwargs) -> nn.Module:
+def create_model(
+    n_classes: int,
+    model_type: str = "cnn",
+    n_leads: int = 12,
+    **kwargs
+) -> nn.Module:
     """
     Factory function for model creation.
 
     Args:
         n_classes: number of output classes (5 for PTB-XL)
         model_type: 'cnn' or 'lstm'
-        kwargs: extra parameters (hidden, layers, bidir, etc.)
+        n_leads: number of input channels/leads to use
+        kwargs: extra parameters (hidden, layers, bidir, use_stem, etc.)
 
     Returns:
         torch.nn.Module: model instance
     """
     if model_type == "cnn":
-        return TinyECGCNN(n_classes)
+        return TinyECGCNN(n_classes, in_ch=n_leads)
     elif model_type == "lstm":
-        return TinyECGLSTM(n_classes, **kwargs)
+        return TinyECGLSTM(n_classes, in_ch=n_leads, **kwargs)
     else:
         raise ValueError(f"Unknown model_type: {model_type}")

@@ -268,7 +268,7 @@ def _annot_bars(ax, xs, ys, fmt="{:,}", dy_frac=0.02, fontsize=10):
             _text_with_outline(ax, x, y + dy, s, fontsize=fontsize)
 
 # -- Correlation heatmap among ANOVA top-K features --------------------------------------
-def plot_anova_topk_corr_heatmap(feature_df: pd.DataFrame, outdir: Path, top_k: int = 25):
+def plot_anova_topk_corr_heatmap(feature_df: pd.DataFrame, outdir: Path, top_k: int = 30):
     """
     Correlation heatmap among the ANOVA top-K features.
     Reuses outdir/tables/table_anova_fscores_topK.csv if present; otherwise computes inline.
@@ -1037,7 +1037,7 @@ def run_eda_and_optional_fl(args):
     results_dir = Path(args.results_dir) if args.results_dir else Path("results")
     try_plot_confusions_from_csv(results_dir / "non_frozen_run_cm.csv", SUPERCLASSES, "non_frozen", outdir)
     try_plot_confusions_from_csv(results_dir / "frozen_run_cm.csv", SUPERCLASSES, "frozen", outdir)
-    plot_anova_topk_corr_heatmap(feature_df, eda_dir, top_k=int(args.anova_top_k))
+    plot_anova_topk_corr_heatmap(feature_df, eda_dir, top_k=int(args.anova_topk_corr))
 
     print(f"Saved plots to: {outdir}")
 
@@ -1054,7 +1054,8 @@ def build_argparser():
     p.add_argument("--record-file-col", type=str, default="filename_lr", choices=["filename_lr","filename_hr"], help="Which PTB-XL path column to use")
     p.add_argument("--scp-min-conf", type=float, default=0.0, help="Min confidence for SCP code to count toward label")
     p.add_argument("--features-csv", type=str, default=None, help="Engineered features CSV (from feature engineering stage)")
-    p.add_argument("--anova-top-k", type=int, default=25, help="Top-K features to visualize in ANOVA plot/table")
+    p.add_argument("--anova-top-k", type=int, default=100, help="Top-K features to visualize in ANOVA table")
+    p.add_argument("--anova-topk-corr", type=int, default=25, help="Plot correlation heatmap of top-K ANOVA features")
     p.add_argument("--results-dir", type=str, default="results", help="Folder where confusion CSVs live (optional)")
     p.add_argument("--outdir", type=str, default=str(DEFAULT_OUTDIR), help="Where to save figures and tables")
     return p

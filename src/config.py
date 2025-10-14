@@ -94,6 +94,11 @@ NORM = {
     "eps": 1e-6,            # Numerical stability
 }
 
+# -------------------------------------------------------------------------
+# ANOVA / lead-selection knobs
+# -------------------------------------------------------------------------
+ANOVA_FSCORE_THRESHOLD: float = 300.0
+ANOVA_FALLBACK_LEADS: int = 8
 
 # -------------------------------------------------------------------------
 # Model Selection & Tuning / CV
@@ -112,7 +117,7 @@ EXPERIMENT = {
 
 TUNING = {
     "enabled": False,                   # run CV now?
-    "use_cached_best": False,           # if enabled=True, use cached best params if available
+    "use_cached_best": True,           # if enabled=True, use cached best params if available
     "log_phase": True,                  # log tuning phase in results?
     "log_mode": "same",                 # "same" or "separate" CSV for tuning vs non-tuning
     "phase_labels": {
