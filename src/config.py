@@ -96,7 +96,7 @@ ANOVA_FALLBACK_LEADS: int = 6
 # Model Selection & Tuning / CV
 # -------------------------------------------------------------------------
 MODEL = {
-    "type": "lstm",              # "cnn" or "lstm" for now
+    "type": "cnn",              # "cnn" or "lstm"
     "lstm_hidden": 128,
     "lstm_layers": 1,
     "bidirectional": True,
@@ -109,7 +109,7 @@ EXPERIMENT = {
 
 TUNING = {
     "enabled": False,                   # run CV now?
-    "use_cached_best": True,           # if enabled=True, use cached best params if available
+    "use_cached_best": False,           # if enabled=True, use cached best params if available
     "log_phase": True,                 # log tuning phase in results?
     "log_mode": "same",                # "same" or "separate" CSV for tuning vs non-tuning
     "phase_labels": {
