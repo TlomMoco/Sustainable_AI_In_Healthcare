@@ -69,20 +69,53 @@ class PTBWaveformDataset(Dataset):
         return x, y
 
 
-def plot_confusion_png(cm: np.ndarray, labels: List[str], title: str, save_path: Path) -> None:
-    fig, ax = plt.subplots(figsize=(6, 5))
+def plot_confusion_png(cm: np.ndarray, labels: List[str], title: str, save_path: Path, model_name: str = "") -> None:
+    """Plot confusion matrix with percentage annotations in professional style."""
+    fig, ax = plt.subplots(figsize=(10, 8))
+    
+    # Normalize to percentages
     with np.errstate(invalid="ignore", divide="ignore"):
-        cmn = np.nan_to_num(cm / cm.sum(axis=1, keepdims=True))
-    im = ax.imshow(cmn, aspect="auto")
-    ax.set_title(title)
-    ax.set_xlabel("Predicted")
-    ax.set_ylabel("True")
-    ax.set_xticks(range(len(labels))); ax.set_xticklabels(labels, rotation=45, ha="right")
-    ax.set_yticks(range(len(labels))); ax.set_yticklabels(labels)
-    fig.colorbar(im, ax=ax, label="Row-normalized")
+        cmn = np.nan_to_num(cm / cm.sum(axis=1, keepdims=True)) * 100
+    
+    # Create heatmap with Blues colormap
+    im = ax.imshow(cmn, aspect="auto", cmap="Blues", vmin=0, vmax=100)
+    
+    # Add text annotations
+    n = len(labels)
+    for i in range(n):
+        for j in range(n):
+            val = cmn[i, j]
+            # White text for values > 50%, black for <= 50%
+            text_color = "white" if val > 50 else "black"
+            ax.text(j, i, f"{val:.2f}", 
+                   ha="center", va="center",
+                   color=text_color, fontsize=12, weight="bold")
+    
+    # Styling with model name
+    if model_name:
+        full_title = f"Confusion Matrix - Prediction Percentages\n{model_name.upper()}"
+    else:
+        full_title = "Confusion Matrix - Prediction Percentages"
+    
+    ax.set_title(full_title, fontsize=16, pad=20, weight="bold")
+    ax.set_xlabel("Predicted Labels", fontsize=14, labelpad=10)
+    ax.set_ylabel("True Labels", fontsize=14, labelpad=10)
+    
+    # Set ticks
+    ax.set_xticks(range(n))
+    ax.set_xticklabels(labels, fontsize=12)
+    ax.set_yticks(range(n))
+    ax.set_yticklabels(labels, fontsize=12)
+    
+    # Add colorbar with % label
+    cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    cbar.set_label("%", fontsize=14, rotation=0, labelpad=20)
+    cbar.ax.tick_params(labelsize=11)
+    
+    # Clean layout
     fig.tight_layout()
     ensure_dir(save_path.parent)
-    fig.savefig(save_path, dpi=150)
+    fig.savefig(save_path, dpi=300, bbox_inches="tight", facecolor="white")
     plt.close(fig)
 
 
@@ -175,7 +208,7 @@ def run_deep_models(seed: int | None = None) -> None:
         model = create_model(
             n_classes=n_classes,
             model_type=model_type,
-            n_leads=len(lead_idx),                 # <— variable input channels
+            n_leads=len(lead_idx),                 # <– variable input channels
             hidden=MODEL.get("lstm_hidden", 128),
             layers=MODEL.get("lstm_layers", 1),
             bidir=MODEL.get("bidirectional", True),
@@ -281,7 +314,15 @@ def run_deep_models(seed: int | None = None) -> None:
         test_acc  = float(np.mean(np.equal(all_true, all_pred))) if total else math.nan
 
         cm = confusion_matrix(all_true, all_pred, labels=list(range(n_classes)))
-        plot_confusion_png(cm, labels=list(le.classes_), title=f"Confusion — {name}", save_path=viz_dir / f"confusion_{name}.png")
+        
+        # Pass model name to confusion matrix plot
+        plot_confusion_png(
+            cm, 
+            labels=list(le.classes_), 
+            title=f"Confusion – {name}", 
+            save_path=viz_dir / f"confusion_{name}.png",
+            model_name=name  # ← ADD MODEL NAME HERE
+        )
 
         # Detailed report (precision/recall/F1 per class + macro) → CSV
         rep = classification_report(all_true, all_pred, target_names=list(le.classes_), digits=4, output_dict=True)

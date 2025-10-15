@@ -1,16 +1,16 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-eda.py — Standalone EDA + numbers export for PTB-XL (decoupled from training)
+eda.py – Standalone EDA + numbers export for PTB-XL (decoupled from training)
 
 What this module does
 ---------------------
-• Loads PTB-XL metadata (ptbxl_database.csv + scp_statements.csv) and builds a minimal
+- Loads PTB-XL metadata (ptbxl_database.csv + scp_statements.csv) and builds a minimal
   per-record table with labels (5-class by default), sex, age, recording_date, strat_fold.
-• (Optional) Loads engineered feature tables (e.g., basic_signal_features.csv) to drive
+- (Optional) Loads engineered feature tables (e.g., basic_signal_features.csv) to drive
   feature-level EDA (correlations, HR/HRV boxplots) and ANOVA SelectKBest.
-• Saves all figures to an output folder and exports the numbers behind each figure to CSVs.
-• (Optional) Renders confusion matrices from federated/centralized runs if you pass their CSVs.
+- Saves all figures to an output folder and exports the numbers behind each figure to CSVs.
+- (Optional) Renders confusion matrices from federated/centralized runs if you pass their CSVs.
 
 Usage
 -----
@@ -26,8 +26,8 @@ is skipped, but demographics/fold EDA still runs from ptbxl_database.csv.
 
 Notes
 -----
-• Matplotlib backend is set to "Agg" for server/CI compatibility.
-• Boxplot uses tick_labels=… for Matplotlib ≥3.9 compatibility.
+- Matplotlib backend is set to "Agg" for server/CI compatibility.
+- Boxplot uses tick_labels=… for Matplotlib ≥3.9 compatibility.
 """
 from __future__ import annotations
 
@@ -188,13 +188,13 @@ def build_minimal_table(db: pd.DataFrame, to_diag_label, record_file_col: str = 
         row["label"] = y
         rows.append(row)
     if not rows:
-        raise RuntimeError("No rows produced — check PTB-XL paths/mappings.")
+        raise RuntimeError("No rows produced – check PTB-XL paths/mappings.")
     df = pd.DataFrame(rows)
     return df
 
 
 # --------------------------------------------------------------------------------------
-# EDA helpers (styling etc.) — parity with notebook visuals
+# EDA helpers (styling etc.) – parity with notebook visuals
 # --------------------------------------------------------------------------------------
 
 BAR_BASE = 0.32
@@ -270,7 +270,7 @@ def _annot_bars(ax, xs, ys, fmt="{:,}", dy_frac=0.02, fontsize=10):
 # -- Correlation heatmap among ANOVA top-K features --------------------------------------
 def plot_anova_topk_corr_heatmap(feature_df: pd.DataFrame, outdir: Path, top_k: int = 30):
     """
-    Correlation heatmap among the ANOVA top-K features.
+    Correlation heatmap among the ANOVA top-K features - PROFESSIONAL STYLE.
     Reuses outdir/tables/table_anova_fscores_topK.csv if present; otherwise computes inline.
     Exports:
       - tables/table_anova_topK_corr_spearman.csv   (|r| Spearman matrix among top-K)
@@ -300,12 +300,12 @@ def plot_anova_topk_corr_heatmap(feature_df: pd.DataFrame, outdir: Path, top_k: 
             from sklearn.impute import SimpleImputer
             from sklearn.preprocessing import LabelEncoder
         except Exception:
-            print("(ANOVA-topK) sklearn not available — skipping ANOVA-topK correlation heatmap")
+            print("(ANOVA-topK) sklearn not available – skipping ANOVA-topK correlation heatmap")
             return
 
         X_num = feature_df.drop(columns=["label"], errors="ignore").select_dtypes(include=[np.number]).copy()
         if X_num.shape[1] == 0:
-            print("(ANOVA-topK) No numeric features — skipping")
+            print("(ANOVA-topK) No numeric features – skipping")
             return
         X_num = X_num.replace([np.inf, -np.inf], np.nan)
         y_all = feature_df["label"].astype(str).copy()
@@ -314,11 +314,11 @@ def plot_anova_topk_corr_heatmap(feature_df: pd.DataFrame, outdir: Path, top_k: 
         try:
             X_vt = vt.fit_transform(X_num)
         except Exception:
-            print("(ANOVA-topK) VarianceThreshold removed all features — skipping")
+            print("(ANOVA-topK) VarianceThreshold removed all features – skipping")
             return
         cols_vt = X_num.columns[vt.get_support()]
         if len(cols_vt) == 0:
-            print("(ANOVA-topK) All numeric features constant — skipping")
+            print("(ANOVA-topK) All numeric features constant – skipping")
             return
 
         imp = SimpleImputer(strategy="median")
@@ -341,28 +341,75 @@ def plot_anova_topk_corr_heatmap(feature_df: pd.DataFrame, outdir: Path, top_k: 
                      .replace([np.inf, -np.inf], np.nan))
     keep = [f for f in top_feats if f in X.columns]
     if len(keep) < 2:
-        print("(ANOVA-topK) Fewer than 2 selected features present in data — skipping")
+        print("(ANOVA-topK) Fewer than 2 selected features present in data – skipping")
         return
 
     corr = X[keep].corr(method="spearman").abs().round(3)
     _savetab(corr, tables_dir, "table_anova_topK_corr_spearman.csv")
 
-    # Plot (labels visible only if reasonably sized)
+    # ========== PROFESSIONAL VISUALIZATION ==========
     n = len(keep)
-    fig_w = max(7.5, 0.32 * n)
-    fig_h = max(6.0, 0.28 * n)
-    fig, ax = plt.subplots(figsize=(fig_w, fig_h))
-    im = ax.imshow(corr.values, vmin=0, vmax=1, cmap="viridis", interpolation="nearest")
-    cb = fig.colorbar(im, ax=ax); cb.set_label("|Spearman r|")
-
-    if n <= 30:
-        ax.set_xticks(range(n)); ax.set_yticks(range(n))
-        ax.set_xticklabels(keep, rotation=65, ha="right", fontsize=8)
-        ax.set_yticklabels(keep, fontsize=8)
+    
+    # Dynamic figure size based on number of features
+    if n <= 15:
+        fig_w, fig_h = 10, 9
+        fontsize_labels = 10
+        fontsize_annot = 8
+    elif n <= 25:
+        fig_w, fig_h = 12, 11
+        fontsize_labels = 9
+        fontsize_annot = 7
     else:
-        ax.set_xticks([]); ax.set_yticks([])
-
-    ax.set_title(f"Correlation among ANOVA top-{len(keep)} features (|r|)", fontsize=12)
+        fig_w, fig_h = 14, 13
+        fontsize_labels = 8
+        fontsize_annot = 6
+    
+    fig, ax = plt.subplots(figsize=(fig_w, fig_h))
+    
+    # Use Blues colormap for professional look
+    im = ax.imshow(corr.values, vmin=0, vmax=1, cmap="Blues", interpolation="nearest", aspect="auto")
+    
+    # Add text annotations (only if not too many features)
+    if n <= 30:
+        for i in range(n):
+            for j in range(n):
+                val = corr.values[i, j]
+                # White text for high correlations (>0.6), black for low
+                text_color = "white" if val > 0.6 else "black"
+                ax.text(j, i, f"{val:.2f}", 
+                       ha="center", va="center",
+                       color=text_color, fontsize=fontsize_annot, weight="bold")
+    
+    # Professional title and labels
+    ax.set_title(f"Correlation among ANOVA top-{len(keep)} features (|r|)", 
+                fontsize=16, pad=20, weight="bold")
+    
+    # Set ticks and labels
+    ax.set_xticks(range(n))
+    ax.set_yticks(range(n))
+    
+    if n <= 30:
+        # Show all labels for smaller matrices
+        ax.set_xticklabels(keep, rotation=65, ha="right", fontsize=fontsize_labels)
+        ax.set_yticklabels(keep, fontsize=fontsize_labels)
+    else:
+        # For large matrices, show fewer labels
+        step = max(1, n // 20)
+        ax.set_xticks(range(0, n, step))
+        ax.set_xticklabels([keep[i] for i in range(0, n, step)], rotation=65, ha="right", fontsize=fontsize_labels)
+        ax.set_yticks(range(0, n, step))
+        ax.set_yticklabels([keep[i] for i in range(0, n, step)], fontsize=fontsize_labels)
+    
+    # Add colorbar
+    cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    cbar.set_label("|Spearman r|", fontsize=14, rotation=90, labelpad=15)
+    cbar.ax.tick_params(labelsize=11)
+    
+    # Grid for better readability
+    ax.set_xticks(np.arange(n) - 0.5, minor=True)
+    ax.set_yticks(np.arange(n) - 0.5, minor=True)
+    ax.grid(which="minor", color="white", linestyle='-', linewidth=0.5)
+    
     plt.tight_layout()
     savefig(fig, outdir, "eda_anova_topK_corr_heatmap.png")
 
@@ -374,16 +421,25 @@ def plot_anova_topk_corr_heatmap(feature_df: pd.DataFrame, outdir: Path, top_k: 
 def plot_missingness_top(features_df: pd.DataFrame, outdir: Path):
     if features_df.empty:
         return
+    
     NA_TOKENS = {"", " ", "nan", "none", "null", "NaN", "None", "NULL"}
     edf2 = features_df.copy()
     for col in edf2.columns:
         if edf2[col].dtype == "object":
             edf2[col] = edf2[col].replace(list(NA_TOKENS), np.nan)
+    
     na_rate = edf2.isna().mean().sort_values(ascending=False)
     nz = (100 * na_rate[na_rate > 0]).sort_values(ascending=False)
+    
+    # Always save the table to document data quality (even if zero missingness)
+    _savetab(nz.sort_values(ascending=False), outdir / "tables", "table_missingness_percent.csv")
+    
+    # Skip visualization if no missing values
     if nz.empty:
-        print("No missing values detected — skipping missingness plot.")
+        print("No missing values detected – skipping missingness plot.")
         return
+    
+    # Create visualization for top 15 columns with missing values
     top = nz.iloc[:15].iloc[::-1]
     fig, ax = plt.subplots(figsize=(9.0, 4.2))
     ys = _x_positions(len(top), 1.00)
@@ -399,7 +455,6 @@ def plot_missingness_top(features_df: pd.DataFrame, outdir: Path):
         ax.text(v + ymax * 0.01, y, f"{v:.2f}%", va="center", fontsize=9)
     plt.tight_layout()
     savefig(fig, outdir, "eda_missingness_top.png")
-    _savetab(nz.sort_values(ascending=False), outdir / "tables", "table_missingness_percent.csv")
 
 
 def plot_class_counts(meta_df: pd.DataFrame, outdir: Path):
@@ -443,7 +498,7 @@ def plot_sex_overall_and_by_class(meta_df: pd.DataFrame, outdir: Path):
     _savetab(vc, tables_dir, "table_sex_overall_counts.csv")
 
     k = len(vc)
-    group_width = 0.80
+    group_width = 0.30
     bar_gap_frac = 0.10
     bar_w = group_width / max(k, 1)
     eff_w = bar_w * (1 - bar_gap_frac)
@@ -720,12 +775,12 @@ def plot_feature_target_violins(feature_df: pd.DataFrame, outdir: Path, top_k: i
             from sklearn.impute import SimpleImputer
             from sklearn.preprocessing import LabelEncoder
         except Exception:
-            print("(sklearn not available — skipping feature-target violins)")
+            print("(sklearn not available – skipping feature-target violins)")
             return
 
         X_num = feature_df.drop(columns=["label"], errors="ignore").select_dtypes(include=[np.number]).copy()
         if X_num.shape[1] == 0:
-            print("(violins) No numeric features — skipping")
+            print("(violins) No numeric features – skipping")
             return
 
         X_num = X_num.replace([np.inf, -np.inf], np.nan)
@@ -735,7 +790,7 @@ def plot_feature_target_violins(feature_df: pd.DataFrame, outdir: Path, top_k: i
         try:
             X_vt = vt.fit_transform(X_num)
         except Exception:
-            print("(violins) VarianceThreshold removed all features — skipping")
+            print("(violins) VarianceThreshold removed all features – skipping")
             return
         cols_vt = X_num.columns[vt.get_support()]
 
@@ -818,12 +873,12 @@ def plot_pca_scatter(feature_df: pd.DataFrame, outdir: Path, max_points: int = 2
         from sklearn.impute import SimpleImputer
         from sklearn.preprocessing import StandardScaler
     except Exception:
-        print("(sklearn not available — skipping PCA scatter)")
+        print("(sklearn not available – skipping PCA scatter)")
         return
 
     X = feature_df.drop(columns=["label"], errors="ignore").select_dtypes(include=[np.number]).copy()
     if X.shape[1] < 2:
-        print("(PCA) Not enough numeric features — skipping")
+        print("(PCA) Not enough numeric features – skipping")
         return
     X = X.replace([np.inf, -np.inf], np.nan)
 
@@ -908,7 +963,7 @@ def plot_feature_correlations(feature_df: pd.DataFrame, outdir: Path):
     im = ax.imshow(corr.values, vmin=0, vmax=1, cmap="viridis", interpolation="nearest")
     cb = fig.colorbar(im, ax=ax)
     cb.set_label("|r|")
-    ax.set_title("Feature correlation heatmap — grouped by family (|r|)")
+    ax.set_title("Feature correlation heatmap – grouped by family (|r|)")
     ax.set_xticks([]); ax.set_yticks([])
     plt.tight_layout()
     savefig(fig, outdir, "eda_feature_corr_heatmap_grouped_simple.png")
@@ -940,7 +995,7 @@ def plot_feature_correlations(feature_df: pd.DataFrame, outdir: Path):
     fig, ax = plt.subplots(figsize=(8.5, 7.5))
     im = ax.imshow(corr_p.values, vmin=0, vmax=1, cmap="viridis", interpolation="nearest")
     fig.colorbar(im, ax=ax).set_label("|r|")
-    ax.set_title(f"Correlation heatmap after pruning (|r|≥0.95) — {num_p.shape[1]} features kept")
+    ax.set_title(f"Correlation heatmap after pruning (|r|≥0.95) – {num_p.shape[1]} features kept")
     ax.set_xticks([]); ax.set_yticks([])
     plt.tight_layout()
     savefig(fig, outdir, "eda_feature_corr_heatmap_pruned.png")
@@ -1018,7 +1073,7 @@ def plot_hrv_boxes(feature_df: pd.DataFrame, outdir: Path):
 
 
 # --------------------------------------------------------------------------------------
-# ANOVA F-test on engineered features (SelectKBest) — single canonical implementation
+# ANOVA F-test on engineered features (SelectKBest) – single canonical implementation
 # --------------------------------------------------------------------------------------
 
 def run_anova_selectkbest(feature_df: pd.DataFrame, outdir: Path, top_k: int = 25):
@@ -1035,7 +1090,7 @@ def run_anova_selectkbest(feature_df: pd.DataFrame, outdir: Path, top_k: int = 2
         from sklearn.impute import SimpleImputer
         from sklearn.preprocessing import LabelEncoder
     except Exception:
-        print("(sklearn not available — skipping ANOVA SelectKBest)")
+        print("(sklearn not available – skipping ANOVA SelectKBest)")
         return
     if feature_df.empty or "label" not in feature_df.columns:
         return
@@ -1135,7 +1190,7 @@ def try_plot_confusions_from_csv(cm_csv: Path, superclasses: Iterable[str], name
 
         fig, ax = plt.subplots(figsize=(6.4, 5.3))
         im = ax.imshow(cmn, aspect="auto", vmin=0, vmax=1.0, cmap="Blues")
-        ax.set_title(f"Confusion Matrix — {name} (round {int(r)})")
+        ax.set_title(f"Confusion Matrix – {name} (round {int(r)})")
         ax.set_xlabel("Predicted")
         ax.set_ylabel("True")
         ax.set_xticks(range(n)); ax.set_xticklabels(sc, rotation=45, ha="right")
@@ -1170,7 +1225,7 @@ def run_eda_and_optional_fl(args):
         except Exception as e:
             print(f"(Minimal table) failed: {e}")
     else:
-        print("(PTB-XL CSVs missing — skipping demographics/fold EDA that relies on them.)")
+        print("(PTB-XL CSVs missing – skipping demographics/fold EDA that relies on them.)")
 
     # 2) Load engineered features (feature_df)
     feature_df = pd.DataFrame()
@@ -1181,7 +1236,7 @@ def run_eda_and_optional_fl(args):
                 feats_path = c
                 break
     if feats_path is None:
-        print("Missing: basic_signal_features.csv (engineered features) — correlation & HRV EDA will be skipped.")
+        print("Missing: basic_signal_features.csv (engineered features) – correlation & HRV EDA will be skipped.")
     else:
         try:
             feature_df = pd.read_csv(feats_path, index_col=0)
@@ -1197,14 +1252,16 @@ def run_eda_and_optional_fl(args):
         plot_records_per_year(features_df, eda_dir)
         plot_strat_fold_grouped(features_df, eda_dir)
     else:
-        print("(Minimal metadata table unavailable — many EDA plots will be skipped.)")
+        print("(Minimal metadata table unavailable – many EDA plots will be skipped.)")
 
     if not feature_df.empty:
         plot_feature_correlations(feature_df, eda_dir)
         plot_hrv_boxes(feature_df, eda_dir / "hrv")
         run_anova_selectkbest(feature_df, eda_dir, top_k=int(args.anova_top_k))
-        plot_feature_target_violins(features_df, eda_dir, top_k=min(6, int(args.anova_top_k)))
-        plot_pca_scatter(features_df, eda_dir)
+        # ✅ FIX #1: Use feature_df instead of features_df
+        plot_feature_target_violins(feature_df, eda_dir, top_k=min(6, int(args.anova_top_k)))
+        # ✅ FIX #2: Use feature_df instead of features_df
+        plot_pca_scatter(feature_df, eda_dir)
 
     # 4) Confusion matrices from CSVs (if present)
     SUPERCLASSES = [c for c in ORDER_5]

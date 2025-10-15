@@ -41,13 +41,9 @@ PRETTY_MODEL = {"cnn": "CNN", "lstm": "LSTM"}
 PRETTY_PHASE = {"no_cv": "No CV", "cached_cv": "Cached CV", "post_cv": "Post-CV"}
 
 def title_of(base: str, run_name: str, model_key: str) -> str:
-    return f"{base} — {PRETTY_RUN.get(run_name, run_name)} — {PRETTY_MODEL.get(model_key, model_key.upper())}"
+    return f"{base} – {PRETTY_RUN.get(run_name, run_name)} – {PRETTY_MODEL.get(model_key, model_key.upper())}"
 
 RUNS, PERCLS_MAP, CONF_MAP = _discover_runs()
-
-# NOTE: Removed the single global OUT. We'll create a per-model OUT instead.
-# OUT = RESULTS_DIR / "viz" / f"FL_Training_{MODEL['type'].upper()}"
-# ensure_dir(OUT)
 
 # Phase labels written by training
 PHASE_ENABLED  = "post_cv"
@@ -294,28 +290,65 @@ for model in dfs_by_model.keys():
         plt.legend(); plt.tight_layout()
         plt.savefig(outdir / f"perclass_final_bar{SFX}.png", dpi=150); plt.close()
 
-    # Confusion heatmaps (last round of each run)
+    # ============================================================================
+    # CONFUSION HEATMAPS - PROFESSIONAL STYLE WITH MODEL NAME IN TITLE
+    # ============================================================================
     for name, dfc in conf_long.items():
         if dfc is None or dfc.empty:
             continue
         r = int(dfc["round"].max())
         sub = dfc[dfc["round"] == r].copy()
-        sub = _collapse_rows(sub, ["true", "pred"])  # de-dup pairs
+        sub = _collapse_rows(sub, ["true", "pred"])
         n = len(SUPERCLASSES)
+        
+        # Build confusion matrix
         cm = (sub.pivot_table(index="true", columns="pred", values="count", aggfunc="sum", fill_value=0)
                 .reindex(index=range(n), columns=range(n), fill_value=0)
                 .to_numpy(dtype=float))
+        
+        # Normalize to percentages
         with np.errstate(invalid="ignore", divide="ignore"):
-            cmn = np.nan_to_num(cm / cm.sum(axis=1, keepdims=True))
-        plt.figure(figsize=(6,5))
-        plt.imshow(cmn, aspect="auto")
-        plt.title(title_of(f"Confusion Matrix (round {r})", name, model))
-        plt.xlabel("Predicted"); plt.ylabel("True")
-        plt.xticks(range(n), SUPERCLASSES, rotation=45, ha="right")
-        plt.yticks(range(n), SUPERCLASSES)
-        plt.colorbar(label="Row-normalized")
-        plt.tight_layout()
-        plt.savefig(outdir / f"confusion_{name}{SFX}_r{r:02d}.png", dpi=150); plt.close()
+            cmn = np.nan_to_num(cm / cm.sum(axis=1, keepdims=True)) * 100
+        
+        # Create professional heatmap
+        fig, ax = plt.subplots(figsize=(10, 8))
+        im = ax.imshow(cmn, aspect="auto", cmap="Blues", vmin=0, vmax=100)
+        
+        # Add text annotations
+        for i in range(n):
+            for j in range(n):
+                val = cmn[i, j]
+                text_color = "white" if val > 50 else "black"
+                ax.text(j, i, f"{val:.2f}", 
+                       ha="center", va="center",
+                       color=text_color, fontsize=12, weight="bold")
+        
+        # Styling with MODEL NAME in title
+        model_name = PRETTY_MODEL.get(model, model.upper())
+        run_type = PRETTY_RUN.get(name, name)
+        ax.set_title(
+            f"Confusion Matrix - Prediction Percentages\n{model_name} - {run_type} (Round {r})", 
+            fontsize=16, pad=20, weight="bold"
+        )
+        ax.set_xlabel("Predicted Labels", fontsize=14, labelpad=10)
+        ax.set_ylabel("True Labels", fontsize=14, labelpad=10)
+        
+        # Set ticks
+        ax.set_xticks(range(n))
+        ax.set_xticklabels(SUPERCLASSES, fontsize=12)
+        ax.set_yticks(range(n))
+        ax.set_yticklabels(SUPERCLASSES, fontsize=12)
+        
+        # Colorbar
+        cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+        cbar.set_label("%", fontsize=14, rotation=0, labelpad=20)
+        cbar.ax.tick_params(labelsize=11)
+        
+        # Save
+        fig.tight_layout()
+        plt.savefig(outdir / f"confusion_{name}{SFX}_r{r:02d}.png", 
+                   dpi=300, bbox_inches="tight", facecolor="white")
+        plt.close(fig)
 
     # Global accuracy by phase (within each run)
     for name, df in dfs.items():
