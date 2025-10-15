@@ -38,14 +38,6 @@ DATA_ROOT = DATA_DIR
 # Subdirectory for hyperparameter tuning results
 TUNING_DIR = RESULTS_DIR / "tuning"
 
-# Feature/EDA artifacts
-# ART_DIR = RESULTS_DIR / "artifacts"           # where feature CSVs or EDA dumps can go
-# ART_DIR.mkdir(parents=True, exist_ok=True)
-
-# Choose which feature set make_feature_table() should produce:
-#   "basic36"  -> your current mean/std/rms per lead (36D)
-#   "friend_v1"-> your friend's engineered features (we'll wire next)
-FEATURES = {"kind": "basic36"}                # change to "friend_v1" to use his features
 
 # If True, whenever we build a feature table, also cache it to CSV for reuse
 SAVE_FEATURES_CSV = True
@@ -83,7 +75,7 @@ FREEZE_CFG = {
     "freeze_mode": "gated", # "gated" or "static"
 }
 # For logging (results/[name].csv) frozen layers vs not (True/False) manually
-FREEZE_ENABLED = True       # toggle this for frozen/non-frozen run
+FREEZE_ENABLED = False       # toggle this for frozen/non-frozen run
 
 # -------------------------------------------------------------------------
 # Normalization Parameters
@@ -98,13 +90,13 @@ NORM = {
 # ANOVA / lead-selection knobs
 # -------------------------------------------------------------------------
 ANOVA_FSCORE_THRESHOLD: float = 300.0
-ANOVA_FALLBACK_LEADS: int = 8
+ANOVA_FALLBACK_LEADS: int = 6
 
 # -------------------------------------------------------------------------
 # Model Selection & Tuning / CV
 # -------------------------------------------------------------------------
 MODEL = {
-    "type": "cnn",              # "cnn" or "lstm" for now
+    "type": "lstm",              # "cnn" or "lstm" for now
     "lstm_hidden": 128,
     "lstm_layers": 1,
     "bidirectional": True,
@@ -116,14 +108,14 @@ EXPERIMENT = {
 }
 
 TUNING = {
-    "enabled": False,                   # run CV now?
+    "enabled": True,                   # run CV now?
     "use_cached_best": True,           # if enabled=True, use cached best params if available
-    "log_phase": True,                  # log tuning phase in results?
-    "log_mode": "same",                 # "same" or "separate" CSV for tuning vs non-tuning
+    "log_phase": True,                 # log tuning phase in results?
+    "log_mode": "same",                # "same" or "separate" CSV for tuning vs non-tuning
     "phase_labels": {
-        "enabled":  "post_cv",          # tuning enabled
-        "disabled": "no_cv",            # tuning disabled
-        "cached":   "cached_cv"         # tuning disabled but cached params used
+        "enabled":  "tuned",           # tuning enabled
+        "cached":   "tuned",           # tuning disabled but cached params used
+        "disabled": "default"          # tuning disabled
     },
 }
 GRIDSEARCH = {
@@ -139,13 +131,19 @@ GRIDSEARCH = {
 
 def tuning_paths(run_name: str, cid: int, freeze_enabled: bool):
     """
-    Always use a single shared cache, independent of freezing/run name.
+    Model-aware tuning cache paths.
 
-    Produces:
-      results/tuning/client{cid}_best.json
-      results/tuning/client{cid}_cv.csv
+    Produces (under results/tuning/<model_type>/):
+      client{cid}_best.json
+      client{cid}_cv.csv
+
+    The signature remains the same to avoid touching call sites.
     """
-    base = TUNING_DIR
+    # Use a per-model subdirectory to keep caches separate when switching models
+    model_type = str(MODEL.get("type", "unknown")).lower()
+    base = (TUNING_DIR / model_type)
+    base.mkdir(parents=True, exist_ok=True)
+
     best_json = base / f"client{cid}_best.json"
     cv_csv = base / f"client{cid}_cv.csv"
     return best_json, cv_csv

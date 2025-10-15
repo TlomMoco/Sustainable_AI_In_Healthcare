@@ -385,7 +385,28 @@ class PTBClient(fl.client.NumPyClient):
 
         loss = (loss_sum / total) if total > 0 else 0.0
         acc = (correct / total) if total > 0 else 0.0
+
+        # ---- Precision/Recall/F1 (per-class + macro) ----
         metrics = {"accuracy": acc}
+        prec_list, rec_list, f1_list = [], [], []
+        for i in range(N_CLASSES):
+            tp = float(cm[i, i])
+            fp = float(cm[:, i].sum() - tp)
+            fn = float(cm[i, :].sum() - tp)
+            prec = (tp / (tp + fp)) if (tp + fp) > 0 else 0.0
+            rec  = (tp / (tp + fn)) if (tp + fn) > 0 else 0.0
+            f1   = (2 * prec * rec / (prec + rec)) if (prec + rec) > 0 else 0.0
+            metrics[f"precision_{i}"] = prec
+            metrics[f"recall_{i}"] = rec
+            metrics[f"f1_{i}"] = f1
+            prec_list.append(prec); rec_list.append(rec); f1_list.append(f1)
+
+        metrics["precision_macro"] = float(np.mean(prec_list)) if prec_list else 0.0
+        metrics["recall_macro"] = float(np.mean(rec_list)) if rec_list else 0.0
+        metrics["f1_macro"] = float(np.mean(f1_list)) if f1_list else 0.0
+        metrics["n_leads"] = float(self.n_leads)
+
+        # Also include confusion counts for aggregation
         for i in range(N_CLASSES):
             for j in range(N_CLASSES):
                 metrics[f"cm_{i}_{j}"] = float(cm[i, j])

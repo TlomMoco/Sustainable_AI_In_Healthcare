@@ -408,13 +408,18 @@ def compute_anova_lead_mask_by_threshold(
     fallback_k: int = 8,
 ) -> Tuple[np.ndarray, List[int], pd.DataFrame]:
     """
-    1) Run VarianceThreshold + f_classif on TRAIN features (exports full table)
-    2) Select features with F_score >= fscore_threshold
-    3) Map selected features to leads; keep all leads that have >=1 selected feature
-    4) If none selected, fall back to top `fallback_k` leads ranked by summed F_score (over ALL features)
+    1) Fit VT + SelectKBest(f_classif) on TRAIN and export full ANOVA table.
+    2) Select features with F_score >= fscore_threshold.
+    3) Map selected features to leads; keep all leads with ≥1 selected feature.
+    4) Top-up by total per-lead score (sum of F over ALL features) until ≥ K.
+    5) Enforce clinical guardrails and trim to EXACTLY K:
+         - Always include Lead II (0-based index = 1)
+         - Ensure ≥4 precordials (V1..V6 → 0-based 6..11)
+       Drop lowest-scoring leads while preserving constraints.
+
     Returns:
         lead_mask: np.ndarray shape (12,) with 1.0 for kept leads else 0.0
-        kept_leads: list of kept 0-based lead indices
+        kept_leads: list of kept 0-based lead indices (exactly K)
         df_selected: DataFrame of selected features (thresholded) with F_scores
     """
     outdir = Path(outdir)
@@ -425,61 +430,146 @@ def compute_anova_lead_mask_by_threshold(
     export_selectkbest_artifacts(train_df, outdir, feature_set=feature_set, k=99999)
 
     full_csv = tables_dir / "table_anova_fscores_full.csv"
+
+    # Fallback: conventional compact set if table missing/bad
+    def _fallback_default():
+        default = [1, 6, 7, 8, 9, 10]  # 0-based: II, V1..V5
+        mask = np.zeros(12, dtype=np.float32)
+        mask[default] = 1.0
+        return mask, default, pd.DataFrame()
+
     if not full_csv.exists():
-        return np.ones(12, dtype=np.float32), list(range(12)), pd.DataFrame()
+        return _fallback_default()
 
     df_full = pd.read_csv(full_csv)
     if "feature" not in df_full.columns or "F_score" not in df_full.columns:
-        return np.ones(12, dtype=np.float32), list(range(12)), pd.DataFrame()
+        return _fallback_default()
 
     # Selected features above threshold
     df_sel = df_full[df_full["F_score"] >= float(fscore_threshold)].copy()
 
-    # Aggregate to leads
+    # -- Aggregate to per-lead sums and counts ---------
     def _agg_to_leads(df_in: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray]:
         sumF = np.zeros(12, dtype=float)
         cnt = np.zeros(12, dtype=int)
         for _, r in df_in.iterrows():
-            li = _lead_index_from_feature_name(str(r.at["feature"]))
+            li = _lead_index_from_feature_name(str(r.get("feature", "")))
             if li is None:
                 continue
-            fs = float(r.at["F_score"]) if pd.notna(r.at["F_score"]) else 0.0
+            fs = float(r.get("F_score", 0.0)) if pd.notna(r.get("F_score", np.nan)) else 0.0
             sumF[li] += fs
             cnt[li] += 1
         return sumF, cnt
 
     sumF_all, cnt_all = _agg_to_leads(df_full)
-    sumF_sel, cnt_sel = _agg_to_leads(df_sel)
+    _,       cnt_sel = _agg_to_leads(df_sel)
 
-    # Leads that have >=1 feature above the threshold
+    # Step 1–4: threshold then top-up to >= K by total score
+    K = int(max(1, min(12, fallback_k)))
     kept = [i for i in range(12) if cnt_sel[i] > 0]
-
-    # Enforce a minimum number of leads (fallback_k) by topping up
-    min_leads = max(1, min(12, int(fallback_k)))
-    if len(kept) < min_leads:
-        # Rank all leads by total F (over full table), highest first
+    if len(kept) < K:
         order = list(np.argsort(-sumF_all))
         for li in order:
             if li not in kept:
                 kept.append(int(li))
-            if len(kept) >= min_leads:
+            if len(kept) >= K:
                 break
 
-    # Build mask
+    # ---- Clinical guardrails to EXACTLY K (Lead II + >=4 precordials) ----
+    LEAD_II = 1
+    LIMB = {0, 1, 2, 3, 4, 5}     # I, II, III, aVR, aVL, aVF (0-based)
+    PREC = {6, 7, 8, 9, 10, 11}   # V1..V6 (0-based)
+
+    def _prec_count(sel: List[int]) -> int:
+        return sum(1 for x in sel if x in PREC)
+
+    def _ok(sel: List[int]) -> bool:
+        s = set(sel)
+        have_ii = (LEAD_II in s)
+        prec_cnt = _prec_count(sel)
+        return have_ii and (prec_cnt >= min(4, K))
+
+    # Ensure Lead II present
+    if LEAD_II not in kept:
+        limb_pool = [li for li in kept if li in (LIMB - {LEAD_II})]
+        if limb_pool:
+            drop = min(limb_pool, key=lambda li: sumF_all[li])
+        else:
+            drop = min([li for li in kept if li != LEAD_II], key=lambda li: sumF_all[li])
+        if drop in kept:
+            kept.remove(drop)
+        kept.append(LEAD_II)
+
+    # Ensure >=4 precordials
+    while _prec_count(kept) < min(4, K):
+        # add best missing precordial
+        missing_prec = sorted([li for li in PREC if li not in kept],
+                              key=lambda li: sumF_all[li], reverse=True)
+        if not missing_prec:
+            break
+        add = missing_prec[0]
+        # drop worst limb (but never drop II)
+        limb_to_drop = [li for li in kept if li in (LIMB - {LEAD_II})]
+        if limb_to_drop:
+            drop = min(limb_to_drop, key=lambda li: sumF_all[li])
+        else:
+            drop_candidates = [li for li in kept if li != LEAD_II]
+            drop = min(drop_candidates, key=lambda li: sumF_all[li])
+        if add not in kept:
+            kept.append(add)
+        if drop in kept:
+            kept.remove(drop)
+
+    # Top-up if still < K (unlikely here)
+    if len(kept) < K:
+        order = [li for li in np.argsort(-sumF_all) if li not in kept]
+        for li in order:
+            kept.append(int(li))
+            if len(kept) >= K:
+                break
+
+    # Trim to EXACTLY K without violating constraints
+    def _can_drop(sel: List[int], li: int) -> bool:
+        if li == LEAD_II:  # never drop II
+            return False
+        trial = [x for x in sel if x != li]
+        return (len(trial) >= K) and _ok(trial)
+
+    while len(kept) > K:
+        for li in sorted(kept, key=lambda x: (sumF_all[x], x)):  # drop lowest score (stable)
+            if _can_drop(kept, li):
+                kept.remove(li)
+                break
+        else:
+            # cannot drop further while keeping constraints
+            break
+
+    # Final order: high → low score (for readable logs)
+    kept = sorted(kept, key=lambda li: (sumF_all[li], li), reverse=True)
+
+    # Build mask and export summary
     lead_mask = np.zeros(12, dtype=np.float32)
     for i in kept:
         lead_mask[int(i)] = 1.0
 
-    # Summary table
     sel_out = pd.DataFrame({
         "lead": [i + 1 for i in range(12)],
         "kept": [int(i in kept) for i in range(12)],
-        "sumF_selected": sumF_sel.tolist(),
-        "cnt_selected": cnt_sel.tolist(),
         "sumF_all": sumF_all.tolist(),
         "cnt_all": cnt_all.tolist(),
+        "cnt_selected": cnt_sel.tolist(),
         "threshold": [float(fscore_threshold)] * 12,
+        "K_exact": [K] * 12,
     })
     sel_out.to_csv(tables_dir / "table_anova_selected_leads_threshold.csv", index=False)
+
+    # Soft safety check (shouldn't trigger)
+    if not _ok(kept):
+        print("[WARN] Clinical guardrail not satisfied; returning best effort:", kept)
+
+    # Pretty print selected (1-based names)
+    lead_names = ["I","II","III","aVR","aVL","aVF","V1","V2","V3","V4","V5","V6"]
+    print("[ANOVA-select] K=", K, " → kept (1-based):",
+          [(li+1, lead_names[li]) for li in kept])
 
     return lead_mask, kept, df_sel

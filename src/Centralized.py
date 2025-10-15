@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import math
+import pandas as pd
 from pathlib import Path
 from typing import Dict, Tuple, List, Optional
 
@@ -275,18 +276,39 @@ def run_deep_models(seed: int | None = None) -> None:
                 all_true.extend(yb.cpu().numpy().tolist())
                 all_pred.extend(pred.cpu().numpy().tolist())
                 total += len(yb)
+
         test_loss = loss_sum / total if total else math.nan
         test_acc  = float(np.mean(np.equal(all_true, all_pred))) if total else math.nan
+
         cm = confusion_matrix(all_true, all_pred, labels=list(range(n_classes)))
         plot_confusion_png(cm, labels=list(le.classes_), title=f"Confusion — {name}", save_path=viz_dir / f"confusion_{name}.png")
+
+        # Detailed report (precision/recall/F1 per class + macro) → CSV
+        rep = classification_report(all_true, all_pred, target_names=list(le.classes_), digits=4, output_dict=True)
+        rep_df = pd.DataFrame(rep).transpose()
+        rep_path = Path(RESULTS_DIR) / f"centralized_report_{name}.csv"
+        ensure_dir(rep_path.parent)
+        rep_df.to_csv(rep_path, index=True)
+
+        macro = rep.get("macro avg", {})
+        rows.append({
+            "model": name,
+            "test_loss": f"{test_loss:.6f}",
+            "test_acc": f"{test_acc:.6f}",
+            "precision_macro": f"{macro.get('precision', float('nan')):.6f}",
+            "recall_macro": f"{macro.get('recall', float('nan')):.6f}",
+            "f1_macro": f"{macro.get('f1-score', float('nan')):.6f}",
+            "n_leads": str(len(lead_idx)),
+        })
+
+        # Also print a human-readable summary
         print(f"\n[{name}] TEST  loss={test_loss:.4f}  acc={test_acc:.4f}")
         print(classification_report(all_true, all_pred, target_names=list(le.classes_), digits=4))
-        rows.append({"model": name, "test_loss": f"{test_loss:.6f}", "test_acc": f"{test_acc:.6f}"})
 
     results_csv = Path(RESULTS_DIR) / "centralized_eval.csv"
     ensure_dir(results_csv.parent)
     with open(results_csv, "w", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=["model","test_loss","test_acc"])
+        w = csv.DictWriter(f, fieldnames=["model","test_loss","test_acc","precision_macro","recall_macro","f1_macro","n_leads"])
         w.writeheader(); w.writerows(rows)
     print("Saved evaluation:", results_csv)
 
