@@ -16,20 +16,6 @@ shape (B, n_leads, T) and output logits for the 5 superclasses.
 from __future__ import annotations
 import torch
 import torch.nn as nn
-from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import StandardScaler
-from sklearn.linear_model import LogisticRegression
-
-
-# -------------------------------------------------------------------------
-# Classical ML baseline (optional reference)
-# -------------------------------------------------------------------------
-def create_logistic_baseline() -> Pipeline:
-    """Return a simple baseline model using logistic regression."""
-    return Pipeline([
-        ("scaler", StandardScaler()),
-        ("logreg", LogisticRegression(max_iter=200, multi_class="ovr"))
-    ])
 
 
 # -------------------------------------------------------------------------
