@@ -7,7 +7,7 @@ import numpy as np
 import pandas as pd
 
 
-from src.config import RESULTS_DIR, SUPERCLASSES, TUNING_DIR, MODEL  # TUNING_DIR ok if unused
+from src.config import RESULTS_DIR, SUPERCLASSES, TUNING_DIR, MODEL, N_CLASSES
 from src.utils import ensure_dir
 
 # -------------------------------------------------------------------------
@@ -38,10 +38,11 @@ def _discover_runs():
 
 PRETTY_RUN   = {"frozen": "Frozen", "non_frozen": "Unfrozen"}
 PRETTY_MODEL = {"cnn": "CNN", "lstm": "LSTM"}
-PRETTY_PHASE = {"no_cv": "No CV", "cached_cv": "Cached CV", "post_cv": "Post-CV"}
+PRETTY_PHASE = {"no_cv": "No CV", "cached_cv": "Cached CV", "post_cv": "Post-CV", 
+                "default": "Default", "tuned": "Tuned"}
 
 def title_of(base: str, run_name: str, model_key: str) -> str:
-    return f"{base} – {PRETTY_RUN.get(run_name, run_name)} – {PRETTY_MODEL.get(model_key, model_key.upper())}"
+    return f"{base} — {PRETTY_RUN.get(run_name, run_name)} — {PRETTY_MODEL.get(model_key, model_key.upper())}"
 
 RUNS, PERCLS_MAP, CONF_MAP = _discover_runs()
 
@@ -388,6 +389,122 @@ for model in dfs_by_model.keys():
         plt.title(title_of("Per-Client Accuracy by Phase", name, model))
         plt.legend(ncol=2); plt.grid(True); plt.tight_layout()
         plt.savefig(outdir / f"clients_by_phase_{name}{SFX}.png", dpi=150); plt.close()
+
+
+# =====================================================================
+# ADDITIONAL: Generate confusion matrices for all phase combinations
+# =====================================================================
+def generate_all_phase_confusion_matrices():
+    """Generate confusion matrices for default and tuned phases."""
+    print("\n" + "="*70)
+    print("GENERATING CONFUSION MATRICES FOR ALL PHASES")
+    print("="*70 + "\n")
+    
+    configs = [
+        ("cnn", "frozen", "default"),
+        ("cnn", "frozen", "tuned"),
+        ("cnn", "non_frozen", "default"),
+        ("cnn", "non_frozen", "tuned"),
+        ("lstm", "frozen", "default"),
+        ("lstm", "frozen", "tuned"),
+        ("lstm", "non_frozen", "default"),
+        ("lstm", "non_frozen", "tuned"),
+    ]
+    
+    generated = 0
+    missing = []
+    
+    for model, freeze, phase in configs:
+        # Look for CM CSV file with phase suffix
+        cm_csv = RESULTS_DIR / f"{model}_{freeze}_run_cm_{phase}.csv"
+        
+        if not cm_csv.exists():
+            missing.append(str(cm_csv.name))
+            continue
+        
+        # Load and process
+        df = pd.read_csv(cm_csv)
+        df.columns = df.columns.str.lower()
+        
+        if not {"round", "true", "pred", "count"}.issubset(set(df.columns)):
+            print(f"✗ Skipping {cm_csv.name} - missing required columns")
+            continue
+        
+        # Get last round
+        last_round = int(df["round"].max())
+        df_round = df[df["round"] == last_round]
+        
+        # Build confusion matrix
+        n = N_CLASSES
+        cm = np.zeros((n, n), dtype=np.int64)
+        for _, row in df_round.iterrows():
+            i, j = int(row["true"]), int(row["pred"])
+            cm[i, j] = int(row["count"])
+        
+        # Normalize to percentages
+        with np.errstate(invalid="ignore", divide="ignore"):
+            cm_norm = np.nan_to_num(cm / cm.sum(axis=1, keepdims=True)) * 100
+        
+        # Create plot
+        fig, ax = plt.subplots(figsize=(10, 8))
+        im = ax.imshow(cm_norm, aspect="auto", cmap="Blues", vmin=0, vmax=100)
+        
+        # Add text annotations
+        for i in range(n):
+            for j in range(n):
+                val = cm_norm[i, j]
+                text_color = "white" if val > 50 else "black"
+                ax.text(j, i, f"{val:.2f}", 
+                       ha="center", va="center",
+                       color=text_color, fontsize=12, weight="bold")
+        
+        # Styling
+        model_name = PRETTY_MODEL.get(model, model.upper())
+        freeze_label = PRETTY_RUN.get(freeze, freeze.title())
+        phase_label = PRETTY_PHASE.get(phase, phase.title())
+        
+        ax.set_title(
+            f"Confusion Matrix - Prediction Percentages\n{model_name} - {freeze_label} - {phase_label} (Round {last_round})", 
+            fontsize=16, pad=20, weight="bold"
+        )
+        ax.set_xlabel("Predicted Labels", fontsize=14, labelpad=10)
+        ax.set_ylabel("True Labels", fontsize=14, labelpad=10)
+        
+        # Set ticks
+        ax.set_xticks(range(n))
+        ax.set_xticklabels(SUPERCLASSES, fontsize=12)
+        ax.set_yticks(range(n))
+        ax.set_yticklabels(SUPERCLASSES, fontsize=12)
+        
+        # Colorbar
+        cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+        cbar.set_label("%", fontsize=14, rotation=0, labelpad=20)
+        cbar.ax.tick_params(labelsize=11)
+        
+        # Save to model-specific directory
+        outdir = _out_dir_for(model)
+        filename = f"confusion_{freeze}_{phase}_r{last_round:02d}.png"
+        save_path = outdir / filename
+        
+        plt.tight_layout()
+        fig.savefig(save_path, dpi=300, bbox_inches="tight", facecolor="white")
+        plt.close(fig)
+        
+        print(f"✓ Saved: {save_path}")
+        generated += 1
+    
+    print(f"\n✓ Generated {generated} confusion matrices across all phases")
+    
+    if missing:
+        print(f"\n⚠  Missing {len(missing)} CM CSV files:")
+        for m in missing:
+            print(f"  - {m}")
+    
+    print("="*70 + "\n")
+
+
+# Call the additional function
+generate_all_phase_confusion_matrices()
 
 print("Saved plots to:")
 for d in sorted(_saved_dirs):
