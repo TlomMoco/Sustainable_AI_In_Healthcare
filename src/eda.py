@@ -691,6 +691,178 @@ def plot_strat_fold_grouped(meta_df: pd.DataFrame, outdir: Path):
     savefig(fig, outdir, "eda_fold_class_counts_grouped_pretty.png")
 
 
+def plot_feature_target_violins(feature_df: pd.DataFrame, outdir: Path, top_k: int = 6):
+    """
+    Show class-conditional distributions for the top-K discriminative features
+    (ranked by ANOVA F-score). Saves a grid of violin plots.
+
+    Saves:
+      - eda_feature_target_violin_top{K}.png
+      - tables/table_anova_topK_for_violin.csv (the selected features)
+    """
+    if feature_df.empty or "label" not in feature_df.columns:
+        return
+
+    tables_dir = (outdir / "tables")
+    # Try to reuse ANOVA ranking if available
+    topk_csv = tables_dir / "table_anova_fscores_topK.csv"
+    top_feats = None
+    if topk_csv.exists():
+        try:
+            top_feats = pd.read_csv(topk_csv)["feature"].astype(str).tolist()
+        except Exception:
+            top_feats = None
+
+    # Otherwise compute a quick ANOVA ranking inline
+    if not top_feats:
+        try:
+            from sklearn.feature_selection import f_classif, VarianceThreshold
+            from sklearn.impute import SimpleImputer
+            from sklearn.preprocessing import LabelEncoder
+        except Exception:
+            print("(sklearn not available — skipping feature-target violins)")
+            return
+
+        X_num = feature_df.drop(columns=["label"], errors="ignore").select_dtypes(include=[np.number]).copy()
+        if X_num.shape[1] == 0:
+            print("(violins) No numeric features — skipping")
+            return
+
+        X_num = X_num.replace([np.inf, -np.inf], np.nan)
+        y_all = feature_df["label"].astype(str).copy()
+
+        vt = VarianceThreshold(threshold=1e-12)
+        try:
+            X_vt = vt.fit_transform(X_num)
+        except Exception:
+            print("(violins) VarianceThreshold removed all features — skipping")
+            return
+        cols_vt = X_num.columns[vt.get_support()]
+
+        imp = SimpleImputer(strategy="median")
+        X_imp = imp.fit_transform(X_vt)
+
+        le = LabelEncoder()
+        y_enc = le.fit_transform(y_all.values)
+
+        F, p = f_classif(X_imp, y_enc)
+        F = np.nan_to_num(np.clip(F, 0, None))
+        order = np.argsort(-F)
+        top_feats = [str(cols_vt[i]) for i in order[:max(1, int(top_k))]]
+
+    # Persist the exact list used
+    try:
+        Path(tables_dir).mkdir(parents=True, exist_ok=True)
+        pd.DataFrame({"feature": top_feats}).to_csv(tables_dir / "table_anova_topK_for_violin.csv", index=False)
+    except Exception:
+        pass
+
+    # Prepare plotting
+    K = min(len(top_feats), int(top_k))
+    feats = top_feats[:K]
+    labels = feature_df["label"].astype(str)
+
+    # Preferred class order if defined globally (ORDER_5), else data-driven
+    try:
+        g_order = [g for g in ORDER_5 if g in set(labels)]
+    except NameError:
+        g_order = sorted(labels.unique())
+
+    ncols = min(3, K)
+    nrows = int(np.ceil(K / ncols))
+    fig, axes = plt.subplots(nrows, ncols, figsize=(5*ncols, 3.6*nrows), squeeze=False)
+
+    for ax, feat in zip(axes.ravel(), feats):
+        if feat not in feature_df.columns:
+            ax.axis("off"); continue
+        vals = pd.to_numeric(feature_df[feat], errors="coerce")
+        groups = []
+        for g in g_order:
+            v = vals[labels == g].dropna().values
+            if v.size == 0:
+                v = np.array([np.nan])  # keep slot to align labels
+            groups.append(v)
+        ax.violinplot(groups, showmeans=False, showextrema=True, showmedians=True)
+        ax.set_xticks(range(1, len(g_order)+1))
+        ax.set_xticklabels(g_order, rotation=20, ha="right")
+        ax.set_title(feat)
+        ax.grid(True, alpha=0.2, linestyle="--")
+
+    # Hide any unused subplots
+    for i in range(K, nrows*ncols):
+        axes.ravel()[i].axis("off")
+
+    fig.suptitle(f"Class-conditional distributions for top-{K} ANOVA features", y=1.02, fontsize=12)
+    fig.tight_layout()
+    try:
+        savefig(fig, outdir, f"eda_feature_target_violin_top{K}.png")
+    except Exception:
+        Path(outdir).mkdir(parents=True, exist_ok=True)
+        fp = Path(outdir) / f"eda_feature_target_violin_top{K}.png"
+        fig.savefig(fp, dpi=300, bbox_inches="tight")
+        plt.close(fig)
+        print(f"Saved: {fp}")
+
+def plot_pca_scatter(feature_df: pd.DataFrame, outdir: Path, max_points: int = 20000):
+    """
+    2D PCA of engineered features, colored by target label.
+    Gives a global view of feature-target separability.
+
+    Saves:
+      - eda_pca_scatter.png
+    """
+    if feature_df.empty or "label" not in feature_df.columns:
+        return
+    try:
+        from sklearn.decomposition import PCA
+        from sklearn.impute import SimpleImputer
+        from sklearn.preprocessing import StandardScaler
+    except Exception:
+        print("(sklearn not available — skipping PCA scatter)")
+        return
+
+    X = feature_df.drop(columns=["label"], errors="ignore").select_dtypes(include=[np.number]).copy()
+    if X.shape[1] < 2:
+        print("(PCA) Not enough numeric features — skipping")
+        return
+    X = X.replace([np.inf, -np.inf], np.nan)
+
+    # Downsample rows for speed/visual clarity
+    if X.shape[0] > max_points:
+        idx = np.random.RandomState(42).choice(X.index.values, size=max_points, replace=False)
+        X = X.loc[idx]
+        y = feature_df.loc[idx, "label"].astype(str)
+    else:
+        y = feature_df["label"].astype(str)
+
+    imp = SimpleImputer(strategy="median")
+    X_imp = imp.fit_transform(X.values)
+    X_std = StandardScaler(with_mean=True, with_std=True).fit_transform(X_imp)
+
+    p = PCA(n_components=2, random_state=42).fit_transform(X_std)
+
+    try:
+        g_order = [g for g in ORDER_5 if g in set(y)]
+    except NameError:
+        g_order = sorted(y.unique())
+
+    fig, ax = plt.subplots(figsize=(7, 5.5))
+    for g in g_order:
+        m = (y.values == g)
+        ax.scatter(p[m,0], p[m,1], s=6, alpha=0.6, label=g)
+    ax.set_xlabel("PC1"); ax.set_ylabel("PC2")
+    ax.set_title("PCA (2D) of engineered features")
+    ax.legend(markerscale=2, frameon=True)
+    ax.grid(True, alpha=0.2, linestyle="--")
+    try:
+        savefig(fig, outdir, "eda_pca_scatter.png")
+    except Exception:
+        Path(outdir).mkdir(parents=True, exist_ok=True)
+        fp = Path(outdir) / "eda_pca_scatter.png"
+        fig.savefig(fp, dpi=300, bbox_inches="tight")
+        plt.close(fig)
+        print(f"Saved: {fp}")
+
 # --------------------------------------------------------------------------------------
 # Engineered-features EDA: correlation heatmaps & pruning
 # --------------------------------------------------------------------------------------
@@ -1031,6 +1203,8 @@ def run_eda_and_optional_fl(args):
         plot_feature_correlations(feature_df, eda_dir)
         plot_hrv_boxes(feature_df, eda_dir / "hrv")
         run_anova_selectkbest(feature_df, eda_dir, top_k=int(args.anova_top_k))
+        plot_feature_target_violins(features_df, eda_dir, top_k=min(6, int(args.anova_top_k)))
+        plot_pca_scatter(features_df, eda_dir)
 
     # 4) Confusion matrices from CSVs (if present)
     SUPERCLASSES = [c for c in ORDER_5]
