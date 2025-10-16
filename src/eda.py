@@ -1258,9 +1258,7 @@ def run_eda_and_optional_fl(args):
         plot_feature_correlations(feature_df, eda_dir)
         plot_hrv_boxes(feature_df, eda_dir / "hrv")
         run_anova_selectkbest(feature_df, eda_dir, top_k=int(args.anova_top_k))
-        # ✅ FIX #1: Use feature_df instead of features_df
         plot_feature_target_violins(feature_df, eda_dir, top_k=min(6, int(args.anova_top_k)))
-        # ✅ FIX #2: Use feature_df instead of features_df
         plot_pca_scatter(feature_df, eda_dir)
 
     # 4) Confusion matrices from CSVs (if present)
