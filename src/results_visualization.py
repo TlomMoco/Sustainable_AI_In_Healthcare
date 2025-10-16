@@ -108,6 +108,16 @@ def perclass_columns(df):
             mapping[key] = df[c]
     return mapping
 
+# Phase styles (for line plots)
+def _unique_phase_styles():
+    """Return (phase, linestyle) pairs with duplicates removed, in order."""
+    seen = set()
+    out = []
+    for ph, style in [(PHASE_DISABLED, "-"), (PHASE_CACHED, ":"), (PHASE_ENABLED, "--")]:
+        if ph and ph not in seen:
+            out.append((ph, style))
+            seen.add(ph)
+    return out
 
 # Smoothing (rolling mean)
 SMOOTH = int(os.getenv("SMOOTH", "1"))  # 1 = off; 3/5 for presentation
@@ -413,7 +423,7 @@ for model in dfs_by_model.keys():
         plt.figure()
         g = df[df["client_id"] == "GLOBAL"].copy()
         lines = []
-        for ph, style in [(PHASE_DISABLED, "-"), (PHASE_CACHED, ":"), (PHASE_ENABLED, "--")]:
+        for ph, style in _unique_phase_styles():
             sub = g[g["phase"].eq(ph)].sort_values(by="round")
             if not sub.empty:
                 plt.plot(sub["round"], smooth(sub["accuracy"]), linestyle=style,
@@ -437,7 +447,7 @@ for model in dfs_by_model.keys():
             continue
         plt.figure()
         base = df[df["client_id"] != "GLOBAL"].copy()
-        for phase, style in [(PHASE_DISABLED, "-"), (PHASE_CACHED, ":"), (PHASE_ENABLED, "--")]:
+        for phase, style in _unique_phase_styles():
             grp = _collapse_rows(base[base["phase"].eq(phase)].copy(), ["client_id", "round"])
             if grp is None or grp.empty:
                 continue
