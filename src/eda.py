@@ -543,7 +543,7 @@ def plot_sex_overall_and_by_class(meta_df: pd.DataFrame, outdir: Path):
         ax.set_xticks(x)
         ax.set_xticklabels(_wrap(ct.index, 10))
         ax.set_ylabel("Count")
-        ax.set_title("Class × Sex (counts)")
+        ax.set_title("Class × Sex Distribution")
         ax.legend()
         _prettify_axes(ax)
         plt.tight_layout()
@@ -592,7 +592,7 @@ def plot_age_distributions(meta_df: pd.DataFrame, outdir: Path):
         mu, med = float(np.mean(a)), float(np.median(a))
         ax.axvline(mu, linestyle="--", linewidth=1.4, color="k", label=f"Mean {mu:.1f}")
         ax.axvline(med, linestyle=":", linewidth=1.6, color="k", label=f"Median {med:.1f}")
-        ax.set_title("Age distribution", fontsize=14)
+        ax.set_title("Overall Age Distribution", fontsize=14)
         ax.set_xlabel("Age")
         ax.set_ylabel("Count")
         _prettify_axes(ax)
@@ -652,7 +652,7 @@ def plot_age_distributions(meta_df: pd.DataFrame, outdir: Path):
             if am.size:
                 ax.hist(am, bins=bins, rwidth=0.90, alpha=0.55, label="male", color=SEX_COLORS.get("male"),
                         edgecolor="white", linewidth=0.6)
-            ax.set_title("Age distribution by sex (overlay)", fontsize=14)
+            ax.set_title("Age Distribution by Sex (Overlay Histogram)", fontsize=14)
             ax.set_xlabel("Age")
             ax.set_ylabel("Count")
             _prettify_axes(ax)
@@ -675,7 +675,7 @@ def plot_age_distributions(meta_df: pd.DataFrame, outdir: Path):
                     bp["medians"][i].set_color(c)
                     ax.text(i+1, np.percentile(data[i], 75) + 1.5, f"n={len(data[i]):,}\nmed={np.median(data[i]):.1f}",
                             ha="center", va="bottom", fontsize=9)
-                ax.set_title("Age by sex", fontsize=14)
+                ax.set_title("Age by Sex (Boxplot)", fontsize=14)
                 ax.set_ylabel("Age")
                 _prettify_axes(ax)
                 plt.tight_layout()
@@ -738,7 +738,7 @@ def plot_strat_fold_grouped(meta_df: pd.DataFrame, outdir: Path):
     ax.set_xticklabels(folds)
     ax.set_xlabel("strat_fold")
     ax.set_ylabel("Count")
-    ax.set_title("Class counts per strat_fold (grouped)")
+    ax.set_title("Stratified Fold Distribution")
     _prettify_axes(ax)
     ax.set_ylim(0, ymax * 1.30)
     ax.legend(ncol=min(5, len(cols)), frameon=False, loc="upper center", bbox_to_anchor=(0.5, 1.10), handlelength=1.2, columnspacing=1.2)
@@ -959,47 +959,91 @@ def plot_feature_correlations(feature_df: pd.DataFrame, outdir: Path):
     corr = num[order].corr(method="spearman").round(3).abs()
     _savetab(corr, tables_dir, "table_feature_corr_spearman.csv")
 
-    fig, ax = plt.subplots(figsize=(9.5, 8.0))
-    im = ax.imshow(corr.values, vmin=0, vmax=1, cmap="viridis", interpolation="nearest")
-    cb = fig.colorbar(im, ax=ax)
-    cb.set_label("|r|")
-    ax.set_title("Feature correlation heatmap – grouped by family (|r|)")
-    ax.set_xticks([]); ax.set_yticks([])
+    # Figure size
+    n_features = len(order)
+    fig, ax = plt.subplots(figsize=(13, 14))
+
+    # Create heatmap
+    im = ax.imshow(corr.values, vmin=0, vmax=1, cmap="Blues", interpolation="nearest")
+
+    # Colorbar
+    cb = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    cb.set_label("|r|", fontsize=14, rotation=0, labelpad=20)
+    cb.ax.tick_params(labelsize=11)
+
+    # Title
+    ax.set_title("Feature correlation heatmap – grouped by family (|r|)", 
+                fontsize=16, pad=20, weight="bold")
+
+    # Y-axis: Show only lead numbers
+    y_labels = []
+    for label in order:
+        # Extract just the lead number
+        m = _re.match(r"L(\d+)_", label)
+        if m:
+            y_labels.append(m.group(1))  # Just "1", "2", "3", etc.
+        else:
+            y_labels.append("")
+
+    ax.set_yticks(range(n_features))
+    ax.set_yticklabels(y_labels, fontsize=9, family='monospace')
+    ax.set_ylabel("Lead", fontsize=12, weight='bold')
+
+    # X-axis: Show family group labels
+    family_label_display = {
+        ("stat", "mean"): "Mean",
+        ("stat", "std"): "Std",
+        ("stat", "rms"): "RMS",
+        ("stat", "ptp"): "PtP",
+        ("bp", "bp0_5"): "BP 0-5Hz",
+        ("bp", "bp5_15"): "BP 5-15Hz",
+        ("bp", "bp15_40"): "BP 15-40Hz"
+    }
+
+    family_positions = []
+    family_labels = []
+    current_pos = 0
+    for kind, fam in families:
+        count = sum(1 for c, p in zip(cols, parsed) if p[0]==kind and p[1]==fam)
+        if count > 0:
+            family_positions.append(current_pos + count/2 - 0.5)
+            display_label = family_label_display.get((kind, fam), f"{kind}_{fam}")
+            family_labels.append(display_label)
+            current_pos += count
+
+    ax.set_xticks(family_positions)
+    ax.set_xticklabels(family_labels, rotation=45, ha="right", fontsize=12, weight="bold")
+    ax.tick_params(axis='x', length=0)
+
+    # Calculate boundaries between families
+    boundaries = []
+    for kind, fam in families:
+        count = sum(1 for c, p in zip(cols, parsed) if p[0]==kind and p[1]==fam)
+        if boundaries:
+            boundaries.append(boundaries[-1] + count)
+        else:
+            boundaries.append(count)
+
+    # Draw white separator lines between families
+    for boundary in boundaries[:-1]:
+        ax.axhline(boundary - 0.5, color='white', linewidth=2.5, alpha=0.8)
+        ax.axvline(boundary - 0.5, color='white', linewidth=2.5, alpha=0.8)
+
+    # Add family labels on the left side of the plot
+    for i, (kind, fam) in enumerate(families):
+        start_idx = boundaries[i-1] if i > 0 else 0
+        end_idx = boundaries[i]
+        mid_point = (start_idx + end_idx) / 2 - 0.5
+        
+        display_label = family_label_display.get((kind, fam), f"{kind}_{fam}")
+        
+        # Add text annotation to the left of Y-axis
+        ax.text(-3.5, mid_point, display_label, 
+                ha='right', va='center', fontsize=11, weight='bold', 
+                rotation=0, transform=ax.transData)
+
     plt.tight_layout()
     savefig(fig, outdir, "eda_feature_corr_heatmap_grouped_simple.png")
-
-    # Prune highly correlated features
-    C = corr.copy()
-    keep = []
-    dropped = []
-    seen = set()
-    thr = 0.95
-    for c in C.columns:
-        if c in seen:
-            continue
-        keep.append(c)
-        seen.add(c)
-        drop_mask = (C[c] >= thr) & (C.index != c)
-        for d in C.index[drop_mask]:
-            if d not in seen:
-                seen.add(d)
-                dropped.append((d, c, float(C.loc[d, c])))
-
-    num_p = num[keep]
-    corr_p = num_p.corr(method="spearman").round(3).abs()
-    _savetab(pd.DataFrame({"kept_features": keep}), tables_dir, "table_feature_corr_pruned_kept.csv")
-    _savetab(pd.DataFrame(dropped, columns=["dropped","kept_with","|r|"]).sort_values("|r|", ascending=False),
-             tables_dir, "table_feature_corr_pruned_dropped.csv")
-    _savetab(corr_p, tables_dir, "table_feature_corr_pruned_spearman.csv")
-
-    fig, ax = plt.subplots(figsize=(8.5, 7.5))
-    im = ax.imshow(corr_p.values, vmin=0, vmax=1, cmap="viridis", interpolation="nearest")
-    fig.colorbar(im, ax=ax).set_label("|r|")
-    ax.set_title(f"Correlation heatmap after pruning (|r|≥0.95) – {num_p.shape[1]} features kept")
-    ax.set_xticks([]); ax.set_yticks([])
-    plt.tight_layout()
-    savefig(fig, outdir, "eda_feature_corr_heatmap_pruned.png")
-
 
 # --------------------------------------------------------------------------------------
 # HR/HRV boxplots by class/sex (from engineered features table)

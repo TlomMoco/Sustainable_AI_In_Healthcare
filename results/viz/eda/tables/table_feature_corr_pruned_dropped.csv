@@ -4,11 +4,11 @@
 10,L11_rms,L11_std,0.999
 11,L12_rms,L12_std,0.999
 1,L2_rms,L2_std,0.998
-7,L8_rms,L8_std,0.998
-6,L7_rms,L7_std,0.998
 5,L6_rms,L6_std,0.998
+6,L7_rms,L7_std,0.998
+7,L8_rms,L8_std,0.998
 0,L1_rms,L1_std,0.997
-4,L5_rms,L5_std,0.997
-3,L4_rms,L4_std,0.997
 2,L3_rms,L3_std,0.997
+3,L4_rms,L4_std,0.997
+4,L5_rms,L5_std,0.997
 12,HR_bpm,n_beats,0.98
