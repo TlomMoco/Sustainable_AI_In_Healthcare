@@ -21,18 +21,20 @@ Place files like this (example):
 ----------------------------
 - Set DATA_DIR to your dataset folder path, e.g.:
   DATA_DIR = "<project>/dataset/ptbxl"
-- Keep defaults unless you know you need changes.
-  Common edits:
-    SAMPLE_RATE = 100
-    CLIENTS = 4
-    ROUNDS = 15
-    EPOCHS_LOCAL = 2
-    BATCH_SIZE = 64
-    LR = 1e-3
-    FREEZE_ENABLED = False
-    SPLITS = {"train": 0.70, "val": 0.15, "test": 0.15}
-    MODEL["type"] = "cnn"
-    TUNING["enabled"] = False
+  - Keep defaults unless you know you need changes.
+    Common edits:
+      SAMPLE_RATE = 100
+      CLIENTS = 4
+      ROUNDS = 15
+      EPOCHS_LOCAL = 2
+      BATCH_SIZE = 64
+      LR = 1e-3
+      FREEZE_ENABLED = False
+      SPLITS = {"train": 0.70, "val": 0.15, "test": 0.15}
+      MODEL["type"] = "cnn"
+      TUNING["enabled"] = False 
+      ANOVA_FSCORE_THRESHOLD: float = 300.0
+      ANOVA_FALLBACK_LEADS: int = 6
 
 4) Run order (from project root)
 --------------------------------
