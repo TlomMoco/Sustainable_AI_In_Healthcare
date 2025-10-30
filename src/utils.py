@@ -179,3 +179,48 @@ def append_csv_locked(path: Path, row: dict, fieldnames: list[str]) -> None:
         f.flush(); os.fsync(f.fileno())
         if portalocker:
             portalocker.unlock(f)
+
+
+
+# -------------------------------------------------------------------------
+# Class weights helper (for HYP boost)
+# -------------------------------------------------------------------------
+import numpy as np
+from typing import Optional, Dict, Sequence
+from src.config import SUPERCLASSES
+
+def _detect_label_col(df) -> str:
+    """Best-effort detection of the label column if the name is not specified."""
+    for cand in ("y", "label", "target", "class"):
+        if cand in df.columns:
+            return cand
+    # Fallback: first non-numeric column name, else assume 'y'
+    for c in df.columns:
+        try:
+            if not np.issubdtype(df[c].dtype, np.number):
+                return c
+        except Exception:
+            pass
+    return "y"
+
+def class_weights_from_df(
+    df,
+    classes: Sequence[str] = SUPERCLASSES,
+    boost: Optional[Dict[str, float]] = None,
+    label_col: Optional[str] = None,
+) -> np.ndarray:
+    """
+    Compute inverse-frequency class weights normalized around 1.0.
+    Optionally apply a per-class boost (e.g., {'HYP': 2.0}).
+    """
+    col = label_col or _detect_label_col(df)
+    counts = np.array([(df[col] == c).sum() for c in classes], dtype=float)
+    counts = np.maximum(counts, 1.0)
+    inv = 1.0 / counts
+    w = inv / inv.mean()
+    if boost:
+        for cls, fac in boost.items():
+            if cls in classes:
+                i = list(classes).index(cls)
+                w[i] *= float(fac)
+    return w

@@ -96,10 +96,11 @@ ANOVA_FALLBACK_LEADS: int = 6
 # Model Selection & Tuning / CV
 # -------------------------------------------------------------------------
 MODEL = {
-    "type": "cnn",              # "cnn" or "lstm"
+    "type": "cnn_lstm",              # "cnn", "lstm", or "cnn_lstm"
     "lstm_hidden": 128,
     "lstm_layers": 1,
     "bidirectional": True,
+    # "use_attention": False,  # optional toggle for later
 }
 
 EXPERIMENT = {
@@ -107,8 +108,15 @@ EXPERIMENT = {
     "run_name": f"{MODEL['type']}_{'frozen_run' if FREEZE_ENABLED else 'non_frozen_run'}",
 }
 
+# Class weighting and smoothing to help the minority class (HYP)
+CLASS_WEIGHTS = {
+    "enabled": True,                  # turn on weighted CE
+    "boost": {"HYP": 2.0},            # optional extra emphasis on HYP
+    "label_smoothing": 0.05           # mild smoothing for stability
+}
+
 TUNING = {
-    "enabled": False,                   # run CV now?
+    "enabled": True,                   # run CV now?
     "use_cached_best": False,           # if enabled=True, use cached best params if available
     "log_phase": True,                 # log tuning phase in results?
     "log_mode": "same",                # "same" or "separate" CSV for tuning vs non-tuning
@@ -121,11 +129,13 @@ TUNING = {
 GRIDSEARCH = {
     "cv": 5,
     "grid": [
-        {"lr":1e-4,"batch":32,"epochs":1,"fedprox":0.0},
-        {"lr":5e-4,"batch":64,"epochs":2,"fedprox":0.0},
-        {"lr":1e-3,"batch":64,"epochs":2,"fedprox":0.001},
-        {"lr": 1e-3, "batch": 128, "epochs": 4, "fedprox": 0.0},
-        {"lr": 2e-3, "batch": 128, "epochs": 4, "fedprox": 0.001},
+        {"lr": 1e-3, "batch": 64,  "epochs": 2, "fedprox": 0.001},
+        {"lr": 5e-4, "batch": 64,  "epochs": 2, "fedprox": 0.0},
+        {"lr": 1e-3, "batch": 128, "epochs": 2, "fedprox": 0.001},
+
+        # focused candidates (safe with FedProx)
+        {"lr": 1e-3, "batch": 64,  "epochs": 3, "fedprox": 0.01},
+        {"lr": 5e-4, "batch": 128, "epochs": 3, "fedprox": 0.01},
     ],
 }
 

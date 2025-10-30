@@ -38,7 +38,7 @@ def _discover_runs():
 
 
 PRETTY_RUN = {"frozen": "Frozen", "non_frozen": "Unfrozen"}
-PRETTY_MODEL = {"cnn": "CNN", "lstm": "LSTM"}
+PRETTY_MODEL = {"cnn":"CNN","lstm":"LSTM","gru":"GRU","cnn_lstm":"CNN+LSTM","mlp":"MLP"}
 # Show nice labels for both old and new phase names (labels only; filtering uses constants below)
 PRETTY_PHASE = {
     "no_cv": "No tuning/CV",

@@ -11,10 +11,11 @@ import torch.optim as optim
 from sklearn.model_selection import GroupKFold
 
 from src.config import (
-    SAMPLE_RATE, N_CLASSES, MODEL, GRIDSEARCH, SUPERCLASSES
+    SAMPLE_RATE, N_CLASSES, MODEL, GRIDSEARCH, SUPERCLASSES, CLASS_WEIGHTS
 )
 from src.data_loader import compute_perlead_norm_stats, load_waveform, normalize_signal
 from src.models import create_model
+from src.utils import class_weights_from_df
 
 
 # ----------------------------- data utils -------------------------------
@@ -52,7 +53,20 @@ def _train_one_fold(train_df: pd.DataFrame, val_df: pd.DataFrame, hp: Dict, devi
     va = _make_loader(val_df,   mu_tr, sigma_tr, batch_size=max(64, int(hp["batch"])), shuffle=False)
 
     model = _model_ctor().to(device)
-    ce = nn.CrossEntropyLoss()
+
+    # --- Loss function (class-weighted CE with optional smoothing) ---
+    if CLASS_WEIGHTS.get("enabled", False):
+        w_np = class_weights_from_df(
+            train_df,
+            classes=SUPERCLASSES,
+            boost=CLASS_WEIGHTS.get("boost")
+        )
+        w_t = torch.tensor(w_np, dtype=torch.float32, device=device)
+        ls = float(CLASS_WEIGHTS.get("label_smoothing", 0.0))
+        ce = nn.CrossEntropyLoss(weight=w_t, label_smoothing=ls)
+    else:
+        ce = nn.CrossEntropyLoss()
+
     opt = optim.Adam(model.parameters(), lr=float(hp["lr"]), weight_decay=1e-4)
 
     # FedProx proximal term to initial weights

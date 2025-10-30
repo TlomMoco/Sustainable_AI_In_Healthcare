@@ -16,7 +16,8 @@ from sklearn.metrics import confusion_matrix, classification_report
 
 from src.config import (
     RESULTS_DIR, SEED, SAMPLE_RATE, N_CLASSES, SPLITS, MODEL,
-    LR as CFG_LR, ANOVA_FALLBACK_LEADS, ANOVA_FSCORE_THRESHOLD
+    LR as CFG_LR, ANOVA_FALLBACK_LEADS, ANOVA_FSCORE_THRESHOLD,
+    CLASS_WEIGHTS, SUPERCLASSES
 )
 from src.data_loader import (
     load_metadata, map_superclasses, filter_single_label,
@@ -25,7 +26,7 @@ from src.data_loader import (
     compute_anova_lead_mask_by_threshold,
 )
 from src.models import create_model
-from src.utils import set_seed, ensure_dir
+from src.utils import set_seed, ensure_dir, class_weights_from_df
 
 
 def pick_device() -> torch.device:
@@ -186,7 +187,18 @@ def run_deep_models(seed: int | None = None) -> None:
     val_loader   = make_loader(va_df, shuffle=False, batch=max(64, batch))
     test_loader  = make_loader(te_df, shuffle=False, batch=max(64, batch))
 
-    crit = nn.CrossEntropyLoss()
+    # --- Loss function (class-weighted CE with optional smoothing) ---
+    if CLASS_WEIGHTS.get("enabled", False):
+        w_np = class_weights_from_df(
+            tr_df,
+            classes=SUPERCLASSES,
+            boost=CLASS_WEIGHTS.get("boost")
+        )
+        w_t = torch.tensor(w_np, dtype=torch.float32, device=device)
+        ls = float(CLASS_WEIGHTS.get("label_smoothing", 0.0))
+        crit = nn.CrossEntropyLoss(weight=w_t, label_smoothing=ls)
+    else:
+        crit = nn.CrossEntropyLoss()
 
     @torch.no_grad()
     def _eval(model_in: nn.Module, loader) -> Tuple[float, float]:

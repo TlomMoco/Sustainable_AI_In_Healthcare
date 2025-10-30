@@ -145,6 +145,110 @@ class TinyECGLSTM(nn.Module):
 
 
 # -------------------------------------------------------------------------
+# CNN-LSTM hybrid
+# -------------------------------------------------------------------------
+# --- reuse TinyECGLSTM with convolutional stem enabled ---
+class CNNLSTM(TinyECGLSTM):
+    """
+    Thin alias that makes it explicit we are running a CNN+LSTM hybrid.
+    Keeps the same features layout [stem, rnn] for freezing.
+    """
+    def __init__(self, n_classes: int, in_ch: int = 12, **kwargs):
+        # Ensure the convolutional stem is active
+        kwargs.setdefault("use_stem", True)
+        super().__init__(n_classes, in_ch=in_ch, **kwargs)
+
+
+# -------------------------------------------------------------------------
+# GRU architecture (mirrors LSTM; supports optional conv stem)
+# -------------------------------------------------------------------------
+class TinyECGGRU(nn.Module):
+    """
+    Lightweight GRU model for sequential ECG processing.
+
+    Input:  (B, in_ch, T)
+    Output: (B, n_classes)
+
+    Exposes self.features as [stem (or Identity), rnn] to keep freezing logic
+    identical to TinyECGLSTM.
+    """
+    def __init__(
+        self,
+        n_classes: int,
+        in_ch: int = 12,
+        hidden: int = 128,
+        layers: int = 1,
+        bidir: bool = True,
+        use_stem: bool = False,
+    ):
+        super().__init__()
+        self.use_stem = use_stem
+
+        # Optional convolutional stem (same interface as LSTM)
+        if self.use_stem:
+            self.stem = nn.Sequential(
+                nn.Conv1d(in_ch, 32, kernel_size=7, stride=2, padding=3),
+                nn.BatchNorm1d(32),
+                nn.ReLU(),
+                nn.MaxPool1d(2),
+                nn.Conv1d(32, 64, kernel_size=5, stride=1, padding=2),
+                nn.BatchNorm1d(64),
+                nn.ReLU(),
+            )
+            rnn_in = 64
+        else:
+            self.stem = nn.Identity()
+            rnn_in = in_ch
+
+        # GRU encoder
+        self.rnn = nn.GRU(
+            input_size=rnn_in,
+            hidden_size=hidden,
+            num_layers=layers,
+            batch_first=True,
+            bidirectional=bidir,
+        )
+        rnn_out = hidden * (2 if bidir else 1)
+
+        # Classification head
+        self.head = nn.Sequential(
+            nn.Dropout(0.5),
+            nn.Linear(rnn_out, n_classes),
+        )
+
+        # Keep the same freezing handle as LSTM
+        self.features = nn.ModuleList([self.stem, self.rnn])
+
+    def forward(self, x):
+        # x: (B, C, T) -> stem expects (B, C, T)
+        z = self.stem(x)                 # (B, C', T)
+        z = z.permute(0, 2, 1)           # (B, T, C')
+        z, _ = self.rnn(z)               # (B, T, H')
+        z = z.mean(dim=1)                # simple temporal pooling
+        return self.head(z)              # (B, n_classes)
+
+
+# ---- TinyECG-MLP (temporal avg pool + MLP) -----------------------------
+class TinyECGMLP(nn.Module):
+    def __init__(self, n_classes: int, in_ch: int = 12, hidden: int = 128):
+        super().__init__()
+        self.pool = nn.AdaptiveAvgPool1d(1)  # (B,C,T) -> (B,C,1)
+        # Ingen “features” å fryse, men behold grensesnittet:
+        self.features = nn.ModuleList([])
+        self.head = nn.Sequential(
+            nn.Flatten(),              # (B,C)
+            nn.Linear(in_ch, hidden),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(hidden, n_classes),
+        )
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        z = self.pool(x)     # (B,C,1)
+        return self.head(z)  # (B,n_classes)
+
+
+
+# -------------------------------------------------------------------------
 # Model factory
 # -------------------------------------------------------------------------
 def create_model(
@@ -169,5 +273,15 @@ def create_model(
         return TinyECGCNN(n_classes, in_ch=n_leads)
     elif model_type == "lstm":
         return TinyECGLSTM(n_classes, in_ch=n_leads, **kwargs)
+    elif model_type in ("cnn_lstm", "lstm_cnn"):
+        # Explicit CNN-LSTM model (same freezing behavior as TinyECGLSTM with stem)
+        return CNNLSTM(n_classes, in_ch=n_leads, **kwargs)
+    elif model_type == "gru":
+        return TinyECGGRU(n_classes, in_ch=n_leads, **kwargs)
+    elif model_type in ("cnn_gru", "gru_cnn"):
+        kwargs.setdefault("use_stem", True)
+        return TinyECGGRU(n_classes, in_ch=n_leads, **kwargs)
+    elif model_type == "mlp":
+        return TinyECGMLP(n_classes, in_ch=n_leads, hidden=kwargs.get("mlp_hidden", 128))
     else:
         raise ValueError(f"Unknown model_type: {model_type}")

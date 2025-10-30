@@ -15,7 +15,7 @@ from src.config import (
     LR, BATCH_SIZE, EPOCHS_LOCAL, FREEZE_THRESHOLD, FEDPROX_MU,
     SEED, RESULTS_DIR, FREEZE_CFG, SPLITS, NORM, MODEL, EXPERIMENT,
     SAMPLE_RATE, N_CLASSES, TUNING, GRIDSEARCH, tuning_paths, FREEZE_ENABLED,
-    ANOVA_FALLBACK_LEADS, ANOVA_FSCORE_THRESHOLD
+    ANOVA_FALLBACK_LEADS, ANOVA_FSCORE_THRESHOLD, CLASS_WEIGHTS, SUPERCLASSES,
 )
 from src.data_loader import (
     load_metadata, map_superclasses, filter_single_label,
@@ -25,7 +25,7 @@ from src.data_loader import (
 )
 from src.tuning import run_client_cv
 from src.models import create_model
-from src.utils import set_seed, ensure_dir, append_csv_locked
+from src.utils import set_seed, ensure_dir, append_csv_locked, class_weights_from_df
 
 
 @dataclass
@@ -140,7 +140,19 @@ class PTBClient(fl.client.NumPyClient):
             bidir=MODEL.get("bidirectional", True),
         ).to(self.device)
 
-        self.ce = nn.CrossEntropyLoss()
+        # --- Loss function (class-weighted CE with optional label smoothing) ---
+        if CLASS_WEIGHTS.get("enabled", False):
+            w_np = class_weights_from_df(
+                self.train_df,
+                classes=SUPERCLASSES,
+                boost=CLASS_WEIGHTS.get("boost")
+            )
+            w_t = torch.tensor(w_np, dtype=torch.float32, device=self.device)
+            ls = float(CLASS_WEIGHTS.get("label_smoothing", 0.0))
+            self.ce = nn.CrossEntropyLoss(weight=w_t, label_smoothing=ls)
+        else:
+            self.ce = nn.CrossEntropyLoss()
+
         self.state = FreezeState()
 
         # --- Hyperparams -------------------------------------------------
