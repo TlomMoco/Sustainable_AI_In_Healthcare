@@ -6,7 +6,6 @@ matplotlib
 seaborn
 scipy
 pyarrow
-torch
 flwr
 rich
 tqdm

@@ -39,6 +39,7 @@ def _discover_runs():
 
 PRETTY_RUN = {"frozen": "Frozen", "non_frozen": "Unfrozen"}
 PRETTY_MODEL = {"cnn":"CNN","lstm":"LSTM","gru":"GRU","cnn_lstm":"CNN+LSTM","mlp":"MLP"}
+
 # Show nice labels for both old and new phase names (labels only; filtering uses constants below)
 PRETTY_PHASE = {
     "no_cv": "No tuning/CV",
@@ -474,16 +475,10 @@ def generate_all_phase_confusion_matrices():
     print("GENERATING CONFUSION MATRICES FOR ALL PHASES")
     print("=" * 70 + "\n")
 
-    configs = [
-        ("cnn", "frozen", "default"),
-        ("cnn", "frozen", "tuned"),
-        ("cnn", "non_frozen", "default"),
-        ("cnn", "non_frozen", "tuned"),
-        ("lstm", "frozen", "default"),
-        ("lstm", "frozen", "tuned"),
-        ("lstm", "non_frozen", "default"),
-        ("lstm", "non_frozen", "tuned"),
-    ]
+    MODELS = ["lstm", "gru", "cnn_lstm", "mlp"]
+    FREEZES = ["frozen", "non_frozen"]
+    PHASES = ["default", "tuned"]
+    configs = [(m, f, p) for m in MODELS for f in FREEZES for p in PHASES]
 
     generated = 0
     missing = []

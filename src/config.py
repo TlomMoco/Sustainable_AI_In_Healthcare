@@ -64,15 +64,15 @@ EPOCHS_LOCAL = 2            # Local epochs per client per round
 BATCH_SIZE = 64
 LR = 1e-3                   # Learning rate for Adam optimizer
 FEDPROX_MU = 0.01           # FedProx proximal term (0 to disable)
-ROUNDS = 15                 # Total federated training rounds
+ROUNDS = 25                 # Total federated training rounds
 
 # Freezing configuration (sustainability-driven compute reduction)
 FREEZE_THRESHOLD = 600      # Clients with fewer samples freeze early layers
 FREEZE_CFG = {
-    "patience": 2,          # Rounds without improvement before unfreezing
-    "min_delta": 1e-3,      # Minimum improvement to reset patience
-    "unfreeze_after": 10,   # Base schedule factor for gradual unfreezing
-    "freeze_mode": "gated", # "gated" or "static"
+    "patience": 1,          # was 2; react faster to improvements
+    "min_delta": 5e-4,      # was 1e-3; slightly easier to detect gains
+    "unfreeze_after": 6,    # was 10; earlier progressive unfreezing
+    "freeze_mode": "gated",
 }
 # For logging (results/[name].csv) frozen layers vs not (True/False) manually
 FREEZE_ENABLED = True       # toggle this for frozen/non-frozen run
@@ -90,31 +90,32 @@ NORM = {
 # ANOVA / lead-selection knobs
 # -------------------------------------------------------------------------
 ANOVA_FSCORE_THRESHOLD: float = 300.0
-ANOVA_FALLBACK_LEADS: int = 6
+ANOVA_FALLBACK_LEADS: int = 7   # was 6; give the hybrid a bit more morphology
 
 # -------------------------------------------------------------------------
 # Model Selection & Tuning / CV
 # -------------------------------------------------------------------------
 MODEL = {
-    "type": "cnn_lstm",              # "cnn", "lstm", or "cnn_lstm"
+    "type": "cnn_lstm",        # "lstm", "gru", "cnn_lstm", or "mlp"
     "lstm_hidden": 128,
     "lstm_layers": 1,
     "bidirectional": True,
     # "use_attention": False,  # optional toggle for later
 }
+# Disable freezing automatically when using MLP (no backbone to freeze)
+FREEZE_EFFECTIVE = False if MODEL["type"] == "mlp" else FREEZE_ENABLED
 
 EXPERIMENT = {
-    "freeze_enabled": FREEZE_ENABLED,
-    "run_name": f"{MODEL['type']}_{'frozen_run' if FREEZE_ENABLED else 'non_frozen_run'}",
+    "freeze_enabled": FREEZE_EFFECTIVE,
+    "run_name": f"{MODEL['type']}_{'frozen_run' if FREEZE_EFFECTIVE else 'non_frozen_run'}",
 }
 
-# Class weighting and smoothing to help the minority class (HYP)
+# --- Class weighting and smoothing to help the minority class (HYP) ---
 CLASS_WEIGHTS = {
-    "enabled": True,                  # turn on weighted CE
-    "boost": {"HYP": 2.0},            # optional extra emphasis on HYP
-    "label_smoothing": 0.05           # mild smoothing for stability
+    "enabled": True,
+    "boost": {"HYP": 2.0},  # your chosen boost; good starting point
+    "label_smoothing": 0.0  # turn OFF to avoid diluting class-weight signal
 }
-
 TUNING = {
     "enabled": True,                   # run CV now?
     "use_cached_best": False,           # if enabled=True, use cached best params if available
@@ -126,16 +127,17 @@ TUNING = {
         "disabled": "default"          # tuning disabled
     },
 }
+# --- GridSearch (favor a few deeper candidates for RNN/hybrid) ---
 GRIDSEARCH = {
     "cv": 5,
     "grid": [
-        {"lr": 1e-3, "batch": 64,  "epochs": 2, "fedprox": 0.001},
-        {"lr": 5e-4, "batch": 64,  "epochs": 2, "fedprox": 0.0},
-        {"lr": 1e-3, "batch": 128, "epochs": 2, "fedprox": 0.001},
-
-        # focused candidates (safe with FedProx)
-        {"lr": 1e-3, "batch": 64,  "epochs": 3, "fedprox": 0.01},
-        {"lr": 5e-4, "batch": 128, "epochs": 3, "fedprox": 0.01},
+        {"lr": 5e-4, "batch": 64,  "epochs": 4, "fedprox": 0.0},
+        {"lr": 5e-4, "batch": 128, "epochs": 4, "fedprox": 0.0},
+        {"lr": 1e-3, "batch": 64,  "epochs": 4, "fedprox": 0.001},
+        {"lr": 1e-3, "batch": 128, "epochs": 4, "fedprox": 0.001},
+        # Optional a couple of short probes if you want:
+        {"lr": 1e-3, "batch": 96,  "epochs": 2, "fedprox": 0.001},
+        {"lr": 2e-3, "batch": 64,  "epochs": 2, "fedprox": 0.001},
     ],
 }
 

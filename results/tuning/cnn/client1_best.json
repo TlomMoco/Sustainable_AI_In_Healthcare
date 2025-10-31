@@ -1,9 +1,0 @@
-{
-  "best_mean_val_acc": 0.719487771128221,
-  "params": {
-    "lr": 0.001,
-    "batch": 128,
-    "epochs": 4,
-    "fedprox": 0.0
-  }
-}

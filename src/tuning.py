@@ -2,6 +2,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional
 
+import tempfile
 import math, time, json
 import numpy as np
 import pandas as pd
@@ -11,19 +12,30 @@ import torch.optim as optim
 from sklearn.model_selection import GroupKFold
 
 from src.config import (
-    SAMPLE_RATE, N_CLASSES, MODEL, GRIDSEARCH, SUPERCLASSES, CLASS_WEIGHTS
+    SAMPLE_RATE, N_CLASSES, MODEL, GRIDSEARCH, SUPERCLASSES, CLASS_WEIGHTS,
+    ANOVA_FALLBACK_LEADS, ANOVA_FSCORE_THRESHOLD, RESULTS_DIR,
 )
-from src.data_loader import compute_perlead_norm_stats, load_waveform, normalize_signal
+from src.data_loader import (
+    compute_perlead_norm_stats, load_waveform, normalize_signal,
+    compute_anova_lead_mask_by_threshold
+)
 from src.models import create_model
 from src.utils import class_weights_from_df
 
 
 # ----------------------------- data utils -------------------------------
-def _tensor_dataset_from_df(df: pd.DataFrame, mu: np.ndarray, sigma: np.ndarray, eps: float = 1e-6):
+def _tensor_dataset_from_df(
+    df: pd.DataFrame,
+    mu: np.ndarray,
+    sigma: np.ndarray,
+    lead_idx: Optional[List[int]] = None,
+    eps: float = 1e-6
+):
     X, y = [], []
-    # df must already have 'y' as class index; if not, cast via provided mapping.
     for _, row in df.iterrows():
         sig = load_waveform(row, sampling_rate=SAMPLE_RATE)  # (12, T)
+        if lead_idx is not None:
+            sig = sig[lead_idx, :]                           # (K, T)
         sig = normalize_signal(sig, mu, sigma, eps=eps)
         X.append(sig)
         y.append(SUPERCLASSES.index(row["y"]))
@@ -31,76 +43,99 @@ def _tensor_dataset_from_df(df: pd.DataFrame, mu: np.ndarray, sigma: np.ndarray,
     y = torch.tensor(np.array(y), dtype=torch.long) if len(y) else torch.zeros((0,), dtype=torch.long)
     return torch.utils.data.TensorDataset(X, y)
 
-def _make_loader(df: pd.DataFrame, mu: np.ndarray, sigma: np.ndarray, batch_size: int, shuffle: bool):
-    ds = _tensor_dataset_from_df(df, mu, sigma)
+def _make_loader(df: pd.DataFrame, mu: np.ndarray, sigma: np.ndarray,
+                 batch_size: int, shuffle: bool, lead_idx=None):
+    ds = _tensor_dataset_from_df(df, mu, sigma, lead_idx=lead_idx)
     return torch.utils.data.DataLoader(ds, batch_size=int(batch_size), shuffle=shuffle)
 
+def _select_leads_for_tuning(df: pd.DataFrame) -> List[int]:
+    # Same logic as in Client: ANOVA-threshold + fallback-K
+    _, kept, _ = compute_anova_lead_mask_by_threshold(
+        df, RESULTS_DIR, feature_set="engineered",
+        fscore_threshold=float(ANOVA_FSCORE_THRESHOLD),
+        fallback_k=int(ANOVA_FALLBACK_LEADS)
+    )
+    return [int(i) for i in kept]
 
 # --------------------------- model / training ---------------------------
-def _model_ctor():
+def _model_ctor(n_leads: int):
     return create_model(
         n_classes=N_CLASSES,
         model_type=MODEL["type"],
+        n_leads=n_leads,                           # ← Important. Set according to selected leads
         hidden=MODEL.get("lstm_hidden", 128),
         layers=MODEL.get("lstm_layers", 1),
         bidir=MODEL.get("bidirectional", True),
     )
 
 def _train_one_fold(train_df: pd.DataFrame, val_df: pd.DataFrame, hp: Dict, device: torch.device) -> Tuple[float, float]:
-    """Return (val_loss, val_acc). Uses FedProx μ if provided in hp['fedprox']."""
-    mu_tr, sigma_tr = compute_perlead_norm_stats(train_df, sampling_rate=SAMPLE_RATE)
-    tr = _make_loader(train_df, mu_tr, sigma_tr, batch_size=int(hp["batch"]), shuffle=True)
-    va = _make_loader(val_df,   mu_tr, sigma_tr, batch_size=max(64, int(hp["batch"])), shuffle=False)
+    # Use a unique temporary directory per fold/trial to avoid I/O collisions
+    with tempfile.TemporaryDirectory(prefix="cv_anova_") as tmp:
+        tmpdir = Path(tmp)
 
-    model = _model_ctor().to(device)
-
-    # --- Loss function (class-weighted CE with optional smoothing) ---
-    if CLASS_WEIGHTS.get("enabled", False):
-        w_np = class_weights_from_df(
+        # 1) Fold-specific ANOVA on TRAIN fold only
+        _, kept_leads, _ = compute_anova_lead_mask_by_threshold(
             train_df,
-            classes=SUPERCLASSES,
-            boost=CLASS_WEIGHTS.get("boost")
+            outdir=tmpdir,                   # isolated artifacts per fold
+            feature_set="engineered",
+            fscore_threshold=float(ANOVA_FSCORE_THRESHOLD),
+            fallback_k=int(ANOVA_FALLBACK_LEADS)
         )
-        w_t = torch.tensor(w_np, dtype=torch.float32, device=device)
-        ls = float(CLASS_WEIGHTS.get("label_smoothing", 0.0))
-        ce = nn.CrossEntropyLoss(weight=w_t, label_smoothing=ls)
-    else:
-        ce = nn.CrossEntropyLoss()
+        lead_idx = [int(i) for i in kept_leads]
+        n_leads = len(lead_idx)
 
-    opt = optim.Adam(model.parameters(), lr=float(hp["lr"]), weight_decay=1e-4)
+        # 2) Compute per-lead normalization from TRAIN fold and slice to leads
+        mu_tr, sigma_tr = compute_perlead_norm_stats(train_df, sampling_rate=SAMPLE_RATE)
+        mu_sel, sigma_sel = mu_tr[lead_idx], sigma_tr[lead_idx]
 
-    # FedProx proximal term to initial weights
-    w0 = [p.detach().clone() for p in model.parameters()]
-    mu_prox = float(hp.get("fedprox", 0.0))
+        # 3) DataLoaders with identical lead selection for train/val
+        tr = _make_loader(train_df, mu_sel, sigma_sel, batch_size=int(hp["batch"]), shuffle=True,  lead_idx=lead_idx)
+        va = _make_loader(val_df,   mu_sel, sigma_sel, batch_size=max(64, int(hp["batch"])), shuffle=False, lead_idx=lead_idx)
 
-    model.train()
-    for _ in range(int(hp["epochs"])):
-        for xb, yb in tr:
-            xb, yb = xb.to(device), yb.to(device)
-            opt.zero_grad()
-            logits = model(xb)
-            loss = ce(logits, yb)
-            if mu_prox > 0.0:
-                prox = sum(torch.sum((w - w_init) ** 2) for w, w_init in zip(model.parameters(), w0))
-                loss = loss + (mu_prox / 2.0) * prox
-            loss.backward()
-            opt.step()
+        # 4) Create model with correct input channels
+        model = _model_ctor(n_leads=n_leads).to(device)
 
-    # eval
-    model.eval()
-    tot, cor, lsum = 0, 0, 0.0
-    with torch.no_grad():
-        for xb, yb in va:
-            xb, yb = xb.to(device), yb.to(device)
-            logits = model(xb)
-            lsum += float(ce(logits, yb).item()) * len(yb)
-            cor  += int((logits.argmax(1) == yb).sum())
-            tot  += len(yb)
+        # 5) Loss (class weights + optional smoothing)
+        if CLASS_WEIGHTS.get("enabled", False):
+            w_np = class_weights_from_df(train_df, classes=SUPERCLASSES, boost=CLASS_WEIGHTS.get("boost"))
+            w_t  = torch.tensor(w_np, dtype=torch.float32, device=device)
+            ls   = float(CLASS_WEIGHTS.get("label_smoothing", 0.0))
+            ce   = nn.CrossEntropyLoss(weight=w_t, label_smoothing=ls)
+        else:
+            ce   = nn.CrossEntropyLoss()
 
-    vloss = (lsum / tot) if tot else math.inf
-    vacc  = (cor / tot) if tot else 0.0
-    return vloss, vacc
+        opt = optim.Adam(model.parameters(), lr=float(hp["lr"]))
+        w0  = [p.detach().clone() for p in model.parameters()]  # FedProx reference
+        mu_prox = float(hp.get("fedprox", 0.0))
 
+        # 6) Train
+        model.train()
+        for _ in range(int(hp["epochs"])):
+            for xb, yb in tr:
+                xb, yb = xb.to(device), yb.to(device)
+                opt.zero_grad()
+                logits = model(xb)
+                loss = ce(logits, yb)
+                if mu_prox > 0.0:
+                    prox = sum(torch.sum((w - w_init) ** 2) for w, w_init in zip(model.parameters(), w0))
+                    loss = loss + (mu_prox / 2.0) * prox
+                loss.backward()
+                opt.step()
+
+        # 7) Validate
+        model.eval()
+        tot, cor, lsum = 0, 0, 0.0
+        with torch.no_grad():
+            for xb, yb in va:
+                xb, yb = xb.to(device), yb.to(device)
+                logits = model(xb)
+                lsum += float(ce(logits, yb).item()) * len(yb)
+                cor  += int((logits.argmax(1) == yb).sum())
+                tot  += len(yb)
+
+        vloss = (lsum / tot) if tot else math.inf
+        vacc  = (cor  / tot) if tot else 0.0
+        return float(vloss), float(vacc)
 
 # ------------------------------- API ------------------------------------
 def default_grid() -> List[Dict]:

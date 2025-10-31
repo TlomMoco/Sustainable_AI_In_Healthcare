@@ -84,17 +84,11 @@ def generate_summary_table():
     print("\n" + "="*70)
     print("GENERATING EVALUATION TABLES")
     print("="*70 + "\n")
-    
-    configs = [
-        ("cnn", "frozen", "default"),
-        ("cnn", "frozen", "tuned"),
-        ("cnn", "non_frozen", "default"),
-        ("cnn", "non_frozen", "tuned"),
-        ("lstm", "frozen", "default"),
-        ("lstm", "frozen", "tuned"),
-        ("lstm", "non_frozen", "default"),
-        ("lstm", "non_frozen", "tuned"),
-    ]
+
+    MODELS = ["lstm", "gru", "cnn_lstm", "mlp"]
+    FREEZES = ["frozen", "non_frozen"]
+    PHASES = ["default", "tuned"]
+    configs = [(m, f, p) for m in MODELS for f in FREEZES for p in PHASES]
     
     rows = []
     
@@ -138,16 +132,10 @@ def generate_summary_table():
 
 def generate_per_class_table():
     """Generate detailed per-class comparison table."""
-    configs = [
-        ("cnn", "frozen", "default"),
-        ("cnn", "frozen", "tuned"),
-        ("cnn", "non_frozen", "default"),
-        ("cnn", "non_frozen", "tuned"),
-        ("lstm", "frozen", "default"),
-        ("lstm", "frozen", "tuned"),
-        ("lstm", "non_frozen", "default"),
-        ("lstm", "non_frozen", "tuned"),
-    ]
+    MODELS = ["lstm", "gru", "cnn_lstm", "mlp"]
+    FREEZES = ["frozen", "non_frozen"]
+    PHASES = ["default", "tuned"]
+    configs = [(m, f, p) for m in MODELS for f in FREEZES for p in PHASES]
     
     all_rows = []
     
@@ -183,16 +171,10 @@ def generate_per_class_table():
 
 def generate_best_config_table():
     """Generate table showing best configuration per metric."""
-    configs = [
-        ("cnn", "frozen", "default"),
-        ("cnn", "frozen", "tuned"),
-        ("cnn", "non_frozen", "default"),
-        ("cnn", "non_frozen", "tuned"),
-        ("lstm", "frozen", "default"),
-        ("lstm", "frozen", "tuned"),
-        ("lstm", "non_frozen", "default"),
-        ("lstm", "non_frozen", "tuned"),
-    ]
+    MODELS = ["lstm", "gru", "cnn_lstm", "mlp"]
+    FREEZES = ["frozen", "non_frozen"]
+    PHASES = ["default", "tuned"]
+    configs = [(m, f, p) for m in MODELS for f in FREEZES for p in PHASES]
     
     results = {}
     

@@ -291,17 +291,11 @@ def main():
     print("\n" + "="*70)
     print("GENERATING PER-CLASS METRICS VISUALIZATIONS")
     print("="*70 + "\n")
-    
-    configs = [
-        ("cnn", "frozen", "default"),
-        ("cnn", "frozen", "tuned"),
-        ("cnn", "non_frozen", "default"),
-        ("cnn", "non_frozen", "tuned"),
-        ("lstm", "frozen", "default"),
-        ("lstm", "frozen", "tuned"),
-        ("lstm", "non_frozen", "default"),
-        ("lstm", "non_frozen", "tuned"),
-    ]
+
+    MODELS = ["lstm", "gru", "cnn_lstm", "mlp"]
+    FREEZES = ["frozen", "non_frozen"]
+    PHASES = ["default", "tuned"]
+    configs = [(m, f, p) for m in MODELS for f in FREEZES for p in PHASES]
     
     all_metrics = {}
     
