@@ -131,13 +131,13 @@ TUNING = {
 GRIDSEARCH = {
     "cv": 5,
     "grid": [
-        {"lr": 5e-4, "batch": 64,  "epochs": 4, "fedprox": 0.0},
-        {"lr": 5e-4, "batch": 128, "epochs": 4, "fedprox": 0.0},
-        {"lr": 1e-3, "batch": 64,  "epochs": 4, "fedprox": 0.001},
-        {"lr": 1e-3, "batch": 128, "epochs": 4, "fedprox": 0.001},
-        # Optional a couple of short probes if you want:
-        {"lr": 1e-3, "batch": 96,  "epochs": 2, "fedprox": 0.001},
-        {"lr": 2e-3, "batch": 64,  "epochs": 2, "fedprox": 0.001},
+        {"lr": 5e-4, "batch": 32,  "epochs": 5, "fedprox": 0.0},
+        {"lr": 7e-4, "batch": 32,  "epochs": 5, "fedprox": 0.0},
+        {"lr": 1e-3, "batch": 32,  "epochs": 5, "fedprox": 0.001},
+
+        {"lr": 5e-4, "batch": 64,  "epochs": 5, "fedprox": 0.0},
+        {"lr": 7e-4, "batch": 64,  "epochs": 5, "fedprox": 0.0},
+        {"lr": 1e-3, "batch": 64,  "epochs": 5, "fedprox": 0.001},
     ],
 }
 

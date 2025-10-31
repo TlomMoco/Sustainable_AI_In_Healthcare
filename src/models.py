@@ -137,11 +137,26 @@ class TinyECGLSTM(nn.Module):
         self.features = nn.ModuleList([self.stem, self.rnn])
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        z = self.stem(x)          # (B, C, T)
-        z = z.permute(0, 2, 1)    # (B, T, C)
-        z, _ = self.rnn(z)        # (B, T, H)
-        z = z.mean(dim=1)         # Temporal pooling
-        return self.head(z)
+        # x: (B, C, T)
+        z = self.stem(x)  # (B, C, T')
+        z = z.permute(0, 2, 1)  # (B, T', C)
+
+        # LSTM returns (out, (h, c))
+        out, hc = self.rnn(z)
+        if isinstance(hc, tuple):
+            h, c = hc
+        else:
+            # safety fallback, but LSTM returns tuple in PyTorch
+            h = hc
+
+        # h shape: (num_layers * num_directions, B, hidden)
+        if self.rnn.bidirectional:
+            # concat last layer's forward/backward states
+            h_last = torch.cat([h[-2], h[-1]], dim=1)  # (B, 2*hidden)
+        else:
+            h_last = h[-1]  # (B, hidden)
+
+        return self.head(h_last)
 
 
 # -------------------------------------------------------------------------
